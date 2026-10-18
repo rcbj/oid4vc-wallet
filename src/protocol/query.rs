@@ -22,11 +22,15 @@ pub struct QueryError {
 
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "could not decode query {}: {}",
-            self.name_or_value, self.source
-        )
+        let part = match self.name_or_value {
+            "name" => crate::i18n::t("wallet.query.part_name"),
+            "value" => crate::i18n::t("wallet.query.part_value"),
+            other => other.to_string(),
+        };
+        f.write_str(&crate::i18n::t_args(
+            "wallet.query.decode",
+            &[("part", &part), ("error", &self.source.to_string())],
+        ))
     }
 }
 

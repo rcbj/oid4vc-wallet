@@ -49,14 +49,32 @@ pub fn parse(input: &str) -> Result<Invocation, ParseError> {
             let request = from_query(scheme, &uri.query).map_err(request_error)?;
             Ok(Invocation::Presentation(Box::new(request)))
         }
-        other => Err(ParseError::Message(format!(
-            "scheme {other} is not a credential offer or a presentation request this wallet registers for"
+        other => Err(ParseError::Message(crate::i18n::t_args(
+            "wallet.invocation.unknown_scheme",
+            &[("scheme", other)],
         ))),
     }
 }
 
 fn request_error(err: RequestError) -> ParseError {
     ParseError::Message(err.to_string())
+}
+
+/// `ui_locales` from a URI, when the query can be read. A URI that cannot be
+/// read leaves the caller's language alone.
+pub fn ui_locales_of_uri(uri: &str) -> Vec<String> {
+    let Ok(parsed) = parse_uri(uri) else {
+        return Vec::new();
+    };
+    let Some(value) = parsed
+        .query
+        .iter()
+        .find(|param| param.name == "ui_locales")
+        .map(|param| param.value.as_str())
+    else {
+        return Vec::new();
+    };
+    crate::i18n::ui_locales(value)
 }
 
 /// A short report for the terminal the desktop opens.
@@ -76,64 +94,97 @@ fn summarize_offer(scheme: &str, offer: &OfferPassing) -> String {
     let mut lines = Vec::new();
     match offer {
         OfferPassing::ByValue(offer) => {
-            lines.push(format!("Credential offer ({scheme}, by value)"));
-            lines.push(format!("Issuer: {}", offer.credential_issuer));
-            lines.push(format!(
-                "Configurations: {}",
-                offer.credential_configuration_ids.join(", ")
+            lines.push(line(
+                "wallet.summary.offer",
+                &[
+                    ("scheme", scheme),
+                    ("passing", &crate::i18n::t("wallet.summary.by_value")),
+                ],
+            ));
+            lines.push(line(
+                "wallet.summary.issuer",
+                &[("issuer", offer.credential_issuer.as_str())],
+            ));
+            lines.push(line(
+                "wallet.summary.configurations",
+                &[("list", &offer.credential_configuration_ids.join(", "))],
             ));
             if let Some(grant) = &offer.grants.authorization_code {
-                lines.push("Grant: authorization code".to_string());
+                lines.push(crate::i18n::t("wallet.summary.grant_authorization_code"));
                 if let Some(state) = &grant.issuer_state {
-                    lines.push(format!("Issuer state: {state}"));
+                    lines.push(line("wallet.summary.issuer_state", &[("state", state)]));
                 }
                 if let Some(server) = &grant.authorization_server {
-                    lines.push(format!("Authorization server: {server}"));
+                    lines.push(line(
+                        "wallet.summary.authorization_server",
+                        &[("server", server)],
+                    ));
                 }
             }
             if let Some(grant) = &offer.grants.pre_authorized_code {
-                lines.push("Grant: pre-authorized code".to_string());
-                lines.push(format!(
-                    "Pre-authorized code: {}",
-                    grant.pre_authorized_code
+                lines.push(crate::i18n::t("wallet.summary.grant_pre_authorized"));
+                lines.push(line(
+                    "wallet.summary.pre_authorized_code",
+                    &[("code", grant.pre_authorized_code.as_str())],
                 ));
                 if let Some(tx) = &grant.tx_code {
-                    let mode = tx.input_mode.as_deref().unwrap_or("unspecified");
+                    let mode = tx
+                        .input_mode
+                        .clone()
+                        .unwrap_or_else(|| crate::i18n::t("wallet.summary.unspecified"));
                     let length = tx
                         .length
                         .map(|n| n.to_string())
-                        .unwrap_or_else(|| "unspecified".to_string());
-                    lines.push(format!("Transaction code: {mode}, length {length}"));
+                        .unwrap_or_else(|| crate::i18n::t("wallet.summary.unspecified"));
+                    lines.push(line(
+                        "wallet.summary.tx_code",
+                        &[("mode", mode.as_str()), ("length", length.as_str())],
+                    ));
                     if let Some(description) = &tx.description {
-                        lines.push(format!("Transaction code prompt: {description}"));
+                        lines.push(line(
+                            "wallet.summary.tx_prompt",
+                            &[("description", description)],
+                        ));
                     }
                 }
                 if let Some(interval) = grant.interval {
-                    lines.push(format!("Interval: {interval}"));
+                    lines.push(line(
+                        "wallet.summary.interval",
+                        &[("interval", &interval.to_string())],
+                    ));
                 }
             }
             if offer.grants.authorization_code.is_none()
                 && offer.grants.pre_authorized_code.is_none()
             {
-                lines.push("Grant: none".to_string());
+                lines.push(crate::i18n::t("wallet.summary.grant_none"));
             }
             for name in &offer.grants.other {
-                lines.push(format!("Other grant: {name}"));
+                lines.push(line("wallet.summary.other_grant", &[("name", name)]));
             }
             if !offer.unknown_members.is_empty() {
-                lines.push(format!(
-                    "Ignored offer members: {}",
-                    offer.unknown_members.join(", ")
+                lines.push(line(
+                    "wallet.summary.ignored_members",
+                    &[("list", &offer.unknown_members.join(", "))],
                 ));
             }
-            lines.push("This build stores the offer. It does not redeem it yet.".to_string());
+            lines.push(crate::i18n::t("wallet.summary.stores_offer"));
         }
         OfferPassing::ByReference {
             credential_offer_uri,
         } => {
-            lines.push(format!("Credential offer ({scheme}, by reference)"));
-            lines.push(format!("Offer URL: {credential_offer_uri}"));
-            lines.push("This build stores the URL. It does not fetch the offer yet.".to_string());
+            lines.push(line(
+                "wallet.summary.offer",
+                &[
+                    ("scheme", scheme),
+                    ("passing", &crate::i18n::t("wallet.summary.by_reference")),
+                ],
+            ));
+            lines.push(line(
+                "wallet.summary.offer_url",
+                &[("url", credential_offer_uri.as_str())],
+            ));
+            lines.push(crate::i18n::t("wallet.summary.stores_url"));
         }
     }
     lines.join("\n")
@@ -141,66 +192,73 @@ fn summarize_offer(scheme: &str, offer: &OfferPassing) -> String {
 
 fn summarize_request(request: &AuthorizationRequest) -> String {
     let passing = if request.by_reference() {
-        "by reference"
+        crate::i18n::t("wallet.summary.by_reference")
     } else {
-        "by value"
+        crate::i18n::t("wallet.summary.by_value")
     };
     let mut lines = vec![
-        format!(
-            "Presentation request ({}, {passing})",
-            request.scheme.as_str()
+        line(
+            "wallet.summary.request",
+            &[
+                ("scheme", request.scheme.as_str()),
+                ("passing", passing.as_str()),
+            ],
         ),
-        format!("Client: {}", request.client_id),
+        line(
+            "wallet.summary.client",
+            &[("client", request.client_id.as_str())],
+        ),
     ];
     if let Some(uri) = &request.request_uri {
         let method = request.request_uri_method.as_deref().unwrap_or("get");
-        lines.push(format!("Request URI: {uri}"));
-        lines.push(format!("Request URI method: {method}"));
-        lines.push(
-            "This build stores the request URI. It does not fetch the request object yet."
-                .to_string(),
-        );
+        lines.push(line("wallet.summary.request_uri", &[("uri", uri)]));
+        lines.push(line(
+            "wallet.summary.request_uri_method",
+            &[("method", method)],
+        ));
+        lines.push(crate::i18n::t("wallet.summary.stores_request_uri"));
     }
     if let Some(value) = &request.response_type {
-        lines.push(format!("Response type: {value}"));
+        lines.push(line("wallet.summary.response_type", &[("value", value)]));
     }
     if let Some(value) = &request.response_mode {
-        lines.push(format!("Response mode: {value}"));
+        lines.push(line("wallet.summary.response_mode", &[("value", value)]));
     }
     if let Some(value) = &request.response_uri {
-        lines.push(format!("Response URI: {value}"));
+        lines.push(line("wallet.summary.response_uri", &[("value", value)]));
     }
     if let Some(value) = &request.redirect_uri {
-        lines.push(format!("Redirect URI: {value}"));
+        lines.push(line("wallet.summary.redirect_uri", &[("value", value)]));
     }
     if let Some(value) = &request.scope {
-        lines.push(format!("Scope: {value}"));
+        lines.push(line("wallet.summary.scope", &[("value", value)]));
     }
     if let Some(value) = &request.nonce {
-        lines.push(format!("Nonce: {value}"));
+        lines.push(line("wallet.summary.nonce", &[("value", value)]));
     }
     if let Some(value) = &request.state {
-        lines.push(format!("State: {value}"));
+        lines.push(line("wallet.summary.state", &[("value", value)]));
     }
     if request.dcql_query.is_some() {
-        lines.push("DCQL query: present".to_string());
+        lines.push(crate::i18n::t("wallet.summary.dcql"));
     }
     if request.client_metadata.is_some() {
-        lines.push("Client metadata: present".to_string());
+        lines.push(crate::i18n::t("wallet.summary.client_metadata"));
     }
     if !request.unknown_parameters.is_empty() {
-        lines.push(format!(
-            "Ignored parameters: {}",
-            request.unknown_parameters.join(", ")
+        lines.push(line(
+            "wallet.summary.ignored_parameters",
+            &[("list", &request.unknown_parameters.join(", "))],
         ));
     }
     if !request.by_reference() {
-        lines.push(
-            "This build stores the request. It does not build a presentation or an ID Token yet."
-                .to_string(),
-        );
+        lines.push(crate::i18n::t("wallet.summary.stores_request"));
     }
     lines.join("\n")
+}
+
+fn line(key: &str, args: &[(&str, &str)]) -> String {
+    crate::i18n::t_args(key, args)
 }
 
 fn json_value(invocation: &Invocation) -> Json {
@@ -293,6 +351,7 @@ fn json_value(invocation: &Invocation) -> Json {
             push_opt(&mut members, "response_mode", request.response_mode.clone());
             push_opt(&mut members, "nonce", request.nonce.clone());
             push_opt(&mut members, "state", request.state.clone());
+            push_opt(&mut members, "ui_locales", request.ui_locales.clone());
             Json::Object(members)
         }
     }

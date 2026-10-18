@@ -1,0 +1,27 @@
+name: AppImage
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  appimage:
+    name: Build AppImage
+    # Ubuntu 22.04 pins the glibc the AppImage is linked against, so the
+    # artifact runs on Ubuntu 22.04 and newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential curl ca-certificates file
+      - name: Build the AppImage
+        run: sh ./install/appimage.sh
+      - name: Upload the AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: oid4vc-wallet-x86_64
+          path: dist/*.AppImage
+          if-no-files-found: error

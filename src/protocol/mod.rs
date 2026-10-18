@@ -16,7 +16,7 @@ pub mod offer;
 pub mod request;
 
 pub use http_url::is_http_url;
-pub use invocation::{parse, Invocation, ParseError};
+pub use invocation::{parse, ui_locales_of_uri, Invocation, ParseError};
 pub use json::Json;
 pub use percent::{encode_uri_component, form_decode};
 pub use uri::CustomUri;

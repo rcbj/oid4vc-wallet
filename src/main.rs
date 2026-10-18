@@ -1,20 +1,25 @@
 //! `oid4vc-wallet` — a Linux wallet for OpenID4VCI and OpenID4VP.
 //!
 //! The desktop launches this program with the invocation URI as its argument.
-//! `install` registers that launch with the session.
+//! `install` registers that launch with the session. Credentials are sealed
+//! with AES-256-GCM. The key lives in GNOME Keyring, or in KWallet when the
+//! Secret Service is not running. Display text follows the languages iya-sts
+//! ships. `--lang` and `language` choose one.
 
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use oid4vc_wallet::i18n::{self, t, t_args};
 use oid4vc_wallet::linux::{
     install_handlers, uninstall_handlers, InstallReport, Layout, SystemRunner, ALL_SCHEMES,
     DEFAULT_SCHEMES,
 };
-use oid4vc_wallet::wallet::{accept, Inbox};
+use oid4vc_wallet::protocol::{ui_locales_of_uri, Json};
+use oid4vc_wallet::wallet::{accept, Credential, CredentialVault, Inbox, NewCredential};
 
 fn main() -> ExitCode {
     match run() {
@@ -44,39 +49,131 @@ struct Options {
     system: bool,
     haip: bool,
     help: bool,
+    format: Option<String>,
+    issuer: Option<String>,
+    document: Option<String>,
+    document_file: Option<String>,
+    /// Applied by [`activate_language`] before the rest of the command is read.
+    lang: Option<String>,
+    /// `--user` or `--system` was present.
+    saw_scope: bool,
     positionals: Vec<String>,
 }
 
 fn run() -> Result<(), Failure> {
+    activate_language()?;
     let options = options()?;
+    let _applied_lang = options.lang.as_deref();
     if options.help {
-        println!("{USAGE}");
+        println!("{}", usage());
         return Ok(());
     }
     match options.positionals.first().map(String::as_str) {
         None => {
-            println!("{USAGE}");
+            println!("{}", usage());
             Ok(())
         }
         Some("install") => {
             reject_extra(&options, 1)?;
+            reject_credential_fields(&options)?;
             install(&options)
         }
         Some("uninstall") => {
             reject_extra(&options, 1)?;
+            reject_credential_fields(&options)?;
             uninstall(&options)
         }
         Some("inbox") => {
             reject_extra(&options, 1)?;
+            reject_credential_fields(&options)?;
             list_inbox()
         }
-        Some("handle") => handle(&options.positionals[1..], &options),
-        Some(command) if command.contains("://") => handle(&options.positionals, &options),
+        Some("credentials") => {
+            reject_extra(&options, 1)?;
+            reject_credential_fields(&options)?;
+            reject_install_flags(&options)?;
+            list_credentials(options.json)
+        }
+        Some("credential") => credential_command(&options),
+        Some("language") => {
+            reject_credential_fields(&options)?;
+            reject_install_flags(&options)?;
+            language_command(&options)
+        }
+        Some("handle") => {
+            reject_credential_fields(&options)?;
+            handle(&options.positionals[1..], &options)
+        }
+        Some(command) if command.contains("://") => {
+            reject_credential_fields(&options)?;
+            handle(&options.positionals, &options)
+        }
         Some(command) => Err(fail(
-            format!("unknown command {command}. Run `oid4vc-wallet help`."),
+            t_args("wallet.cli.unknown_command", &[("command", command)]),
             1,
         )),
     }
+}
+
+enum LangPeek {
+    Absent,
+    Missing,
+    Value(String),
+}
+
+fn activate_language() -> Result<(), Failure> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut preferences = Vec::new();
+    if let Some(saved) = i18n::saved_tag() {
+        preferences.push(saved);
+    }
+    preferences.extend(i18n::system_tags());
+    match peek_lang(&args) {
+        LangPeek::Absent => i18n::set_active(None, preferences),
+        LangPeek::Missing => {
+            i18n::set_active(None, preferences);
+            return Err(fail(
+                t_args("wallet.cli.flag_needs_value", &[("name", "--lang")]),
+                1,
+            ));
+        }
+        LangPeek::Value(raw) => match i18n::canonical_offered(&raw) {
+            Some(tag) => i18n::set_active(Some(tag), preferences),
+            None => {
+                i18n::set_active(None, preferences);
+                return Err(fail(
+                    t_args("wallet.cli.language_unknown", &[("tag", &raw)]),
+                    1,
+                ));
+            }
+        },
+    }
+    Ok(())
+}
+
+fn peek_lang(args: &[String]) -> LangPeek {
+    let mut found = LangPeek::Absent;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = arg.strip_prefix("--lang=") {
+            found = if value.is_empty() {
+                LangPeek::Missing
+            } else {
+                LangPeek::Value(value.to_string())
+            };
+        } else if arg == "--lang" {
+            match args.get(index + 1) {
+                Some(value) if !value.starts_with('-') || value == "-" => {
+                    found = LangPeek::Value(value.clone());
+                    index += 1;
+                }
+                _ => found = LangPeek::Missing,
+            }
+        }
+        index += 1;
+    }
+    found
 }
 
 fn options() -> Result<Options, Failure> {
@@ -86,31 +183,80 @@ fn options() -> Result<Options, Failure> {
         system: false,
         haip: false,
         help: false,
+        format: None,
+        issuer: None,
+        document: None,
+        document_file: None,
+        lang: None,
+        saw_scope: false,
         positionals: Vec::new(),
     };
-    let mut saw_scope = false;
-    for arg in env::args().skip(1) {
-        match arg.as_str() {
-            "--json" => options.json = true,
-            "--no-save" => options.no_save = true,
-            "--haip" => options.haip = true,
-            "--help" | "-h" | "help" => options.help = true,
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let (name, inline) = split_valued(&arg);
+        match name {
+            "--json" => {
+                reject_inline(inline, "--json")?;
+                options.json = true;
+            }
+            "--no-save" => {
+                reject_inline(inline, "--no-save")?;
+                options.no_save = true;
+            }
+            "--haip" => {
+                reject_inline(inline, "--haip")?;
+                options.haip = true;
+            }
+            "--help" | "-h" | "help" => {
+                reject_inline(inline, name)?;
+                options.help = true;
+            }
             "--system" => {
-                if saw_scope && !options.system {
-                    return Err(fail("pass either --user or --system, not both", 1));
+                reject_inline(inline, "--system")?;
+                if options.saw_scope && !options.system {
+                    return Err(fail(t("wallet.cli.both_scopes"), 1));
                 }
                 options.system = true;
-                saw_scope = true;
+                options.saw_scope = true;
             }
             "--user" => {
-                if saw_scope && options.system {
-                    return Err(fail("pass either --user or --system, not both", 1));
+                reject_inline(inline, "--user")?;
+                if options.saw_scope && options.system {
+                    return Err(fail(t("wallet.cli.both_scopes"), 1));
                 }
                 options.system = false;
-                saw_scope = true;
+                options.saw_scope = true;
             }
+            "--format" => set_once(
+                &mut options.format,
+                "--format",
+                take_value(inline, &mut args, "--format")?,
+            )?,
+            "--issuer" => set_once(
+                &mut options.issuer,
+                "--issuer",
+                take_value(inline, &mut args, "--issuer")?,
+            )?,
+            "--document" => set_once(
+                &mut options.document,
+                "--document",
+                take_value(inline, &mut args, "--document")?,
+            )?,
+            "--document-file" => set_once(
+                &mut options.document_file,
+                "--document-file",
+                take_value(inline, &mut args, "--document-file")?,
+            )?,
+            "--lang" => set_once(
+                &mut options.lang,
+                "--lang",
+                take_value(inline, &mut args, "--lang")?,
+            )?,
             other if other.starts_with('-') => {
-                return Err(fail(format!("unknown option {other}"), 1));
+                return Err(fail(
+                    t_args("wallet.cli.unknown_option", &[("option", other)]),
+                    1,
+                ));
             }
             other => options.positionals.push(other.to_string()),
         }
@@ -118,15 +264,196 @@ fn options() -> Result<Options, Failure> {
     Ok(options)
 }
 
-fn reject_extra(options: &Options, keep: usize) -> Result<(), Failure> {
-    if options.positionals.len() > keep {
+/// `--name=value` is accepted. A bare `--name` takes the next argument.
+fn split_valued(arg: &str) -> (&str, Option<&str>) {
+    match arg.split_once('=') {
+        Some((name, value)) if name.starts_with("--") && name != "--" => (name, Some(value)),
+        _ => (arg, None),
+    }
+}
+
+fn reject_inline(inline: Option<&str>, name: &str) -> Result<(), Failure> {
+    if inline.is_some() {
         Err(fail(
-            format!("unexpected argument {}", options.positionals[keep]),
+            t_args("wallet.cli.flag_no_value", &[("name", name)]),
             1,
         ))
     } else {
         Ok(())
     }
+}
+
+fn take_value(
+    inline: Option<&str>,
+    args: &mut impl Iterator<Item = String>,
+    name: &str,
+) -> Result<String, Failure> {
+    if let Some(value) = inline {
+        return Ok(value.to_string());
+    }
+    match args.next() {
+        Some(value) if !value.starts_with('-') || value == "-" => Ok(value),
+        Some(_) | None => Err(fail(
+            t_args("wallet.cli.flag_needs_value", &[("name", name)]),
+            1,
+        )),
+    }
+}
+
+fn set_once(slot: &mut Option<String>, name: &str, value: String) -> Result<(), Failure> {
+    if slot.is_some() {
+        return Err(fail(t_args("wallet.cli.flag_twice", &[("name", name)]), 1));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn reject_extra(options: &Options, keep: usize) -> Result<(), Failure> {
+    if options.positionals.len() > keep {
+        Err(fail(
+            t_args(
+                "wallet.cli.unexpected_argument",
+                &[("argument", &options.positionals[keep])],
+            ),
+            1,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_credential_fields(options: &Options) -> Result<(), Failure> {
+    if options.format.is_some()
+        || options.issuer.is_some()
+        || options.document.is_some()
+        || options.document_file.is_some()
+    {
+        Err(fail(t("wallet.cli.no_credential_fields"), 1))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_install_flags(options: &Options) -> Result<(), Failure> {
+    if options.saw_scope || options.haip || options.no_save {
+        Err(fail(t("wallet.cli.no_install_flags"), 1))
+    } else {
+        Ok(())
+    }
+}
+
+fn credential_command(options: &Options) -> Result<(), Failure> {
+    reject_install_flags(options)?;
+    match options.positionals.get(1).map(String::as_str) {
+        Some("add") => {
+            reject_extra(options, 2)?;
+            add_credential(options)
+        }
+        Some("show") => {
+            reject_credential_fields(options)?;
+            one_id(options, show_credential)
+        }
+        Some("delete") => {
+            reject_credential_fields(options)?;
+            one_id(options, delete_credential)
+        }
+        Some("list") => {
+            reject_extra(options, 2)?;
+            reject_credential_fields(options)?;
+            list_credentials(options.json)
+        }
+        Some(other) => Err(fail(
+            t_args(
+                "wallet.cli.unknown_credential_command",
+                &[("command", other)],
+            ),
+            1,
+        )),
+        None => Err(fail(t("wallet.cli.credential_command_usage"), 1)),
+    }
+}
+
+fn language_command(options: &Options) -> Result<(), Failure> {
+    match options.positionals.get(1).map(String::as_str) {
+        None => {
+            reject_extra(options, 1)?;
+            list_languages();
+            Ok(())
+        }
+        Some("set") => {
+            reject_extra(options, 3)?;
+            let tag = options
+                .positionals
+                .get(2)
+                .map(String::as_str)
+                .ok_or_else(|| fail(t("wallet.cli.need_language_tag"), 1))?;
+            language_set(tag)
+        }
+        Some("clear") => {
+            reject_extra(options, 2)?;
+            language_clear()
+        }
+        Some(other) => Err(fail(
+            t_args("wallet.cli.unknown_language_command", &[("command", other)]),
+            1,
+        )),
+    }
+}
+
+fn list_languages() {
+    let translator = i18n::current();
+    let name = i18n::endonym(&translator.locale);
+    println!(
+        "{}",
+        t_args(
+            "wallet.cli.language_current",
+            &[("tag", &translator.locale), ("name", &name)],
+        )
+    );
+    let selected = i18n::selected_offered();
+    for offered in i18n::offered() {
+        let mark = if selected.as_deref() == Some(offered.tag.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!("{mark} {}  {}", offered.tag, offered.name);
+    }
+}
+
+fn language_set(tag: &str) -> Result<(), Failure> {
+    let canonical = i18n::canonical_offered(tag)
+        .ok_or_else(|| fail(t_args("wallet.cli.language_unknown", &[("tag", tag)]), 1))?;
+    i18n::store_tag(&canonical).map_err(|err| fail(err, 1))?;
+    let translator = i18n::negotiate_tag(&canonical);
+    let name = i18n::endonym(&canonical);
+    println!(
+        "{}",
+        translator.text_args(
+            "wallet.cli.language_set",
+            &[("tag", &canonical), ("name", &name)],
+        )
+    );
+    Ok(())
+}
+
+fn language_clear() -> Result<(), Failure> {
+    i18n::clear_tag().map_err(|err| fail(err, 1))?;
+    println!("{}", t("wallet.cli.language_cleared"));
+    Ok(())
+}
+
+fn one_id(
+    options: &Options,
+    command: impl FnOnce(&str, bool) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    reject_extra(options, 3)?;
+    let id = options
+        .positionals
+        .get(2)
+        .map(String::as_str)
+        .ok_or_else(|| fail(t("wallet.cli.need_id"), 1))?;
+    command(id, options.json)
 }
 
 fn install(options: &Options) -> Result<(), Failure> {
@@ -146,13 +473,26 @@ fn uninstall(options: &Options) -> Result<(), Failure> {
     let warnings =
         uninstall_handlers(&layout, &mut runner).map_err(|err| fail(err.to_string(), 1))?;
     println!(
-        "Removed {}",
-        layout
-            .applications_dir
-            .join(oid4vc_wallet::linux::DESKTOP_FILE_NAME)
-            .display()
+        "{}",
+        t_args(
+            "wallet.cli.removed",
+            &[(
+                "path",
+                &layout
+                    .applications_dir
+                    .join(oid4vc_wallet::linux::DESKTOP_FILE_NAME)
+                    .display()
+                    .to_string(),
+            )],
+        )
     );
-    println!("Removed {}", layout.binary_path.display());
+    println!(
+        "{}",
+        t_args(
+            "wallet.cli.removed",
+            &[("path", &layout.binary_path.display().to_string())],
+        )
+    );
     print_warnings(&warnings);
     Ok(())
 }
@@ -174,9 +514,27 @@ fn schemes(options: &Options) -> &'static [&'static str] {
 }
 
 fn report_install(report: &InstallReport) {
-    println!("Installed {}", report.binary.display());
-    println!("Desktop file {}", report.desktop_file.display());
-    println!("Registered these protocol handlers:");
+    println!(
+        "{}",
+        t_args(
+            "wallet.cli.installed",
+            &[("path", &report.binary.display().to_string())],
+        )
+    );
+    println!(
+        "{}",
+        t_args(
+            "wallet.cli.desktop_file",
+            &[("path", &report.desktop_file.display().to_string())],
+        )
+    );
+    println!(
+        "{}",
+        t_args(
+            "wallet.cli.registered",
+            &[("count", &report.schemes.len().to_string())],
+        )
+    );
     for scheme in &report.schemes {
         println!("  {scheme}://");
     }
@@ -185,40 +543,92 @@ fn report_install(report: &InstallReport) {
 
 fn print_warnings(warnings: &[String]) {
     for warning in warnings {
-        let _ = writeln!(io::stderr(), "warning: {warning}");
+        let _ = writeln!(
+            io::stderr(),
+            "{}",
+            t_args("wallet.cli.warning", &[("warning", warning)])
+        );
     }
 }
 
 fn place_binary(dest: &Path) -> Result<(), Failure> {
-    let source =
-        env::current_exe().map_err(|err| fail(format!("could not find this binary: {err}"), 1))?;
+    let current = env::current_exe().map_err(|err| {
+        fail(
+            t_args("wallet.cli.binary_missing", &[("error", &err.to_string())]),
+            1,
+        )
+    })?;
+    let appimage = env::var_os("APPIMAGE").map(PathBuf::from);
+    let source = installed_binary(appimage.as_deref(), &current);
     if same_file(&source, dest) {
         return Ok(());
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| fail(format!("{}: {err}", parent.display()), 1))?;
+        fs::create_dir_all(parent).map_err(|err| {
+            fail(
+                t_args(
+                    "wallet.cli.path_error",
+                    &[
+                        ("path", &parent.display().to_string()),
+                        ("error", &err.to_string()),
+                    ],
+                ),
+                1,
+            )
+        })?;
     }
     let temporary = dest.with_extension("new");
     fs::copy(&source, &temporary).map_err(|err| {
         fail(
-            format!("could not copy the wallet to {}: {err}", dest.display()),
+            t_args(
+                "wallet.cli.copy_failed",
+                &[
+                    ("path", &dest.display().to_string()),
+                    ("error", &err.to_string()),
+                ],
+            ),
             1,
         )
     })?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755)).map_err(|err| {
         fail(
-            format!("could not mark {} executable: {err}", dest.display()),
+            t_args(
+                "wallet.cli.chmod_failed",
+                &[
+                    ("path", &dest.display().to_string()),
+                    ("error", &err.to_string()),
+                ],
+            ),
             1,
         )
     })?;
     fs::rename(&temporary, dest).map_err(|err| {
         fail(
-            format!("could not install the wallet at {}: {err}", dest.display()),
+            t_args(
+                "wallet.cli.install_failed",
+                &[
+                    ("path", &dest.display().to_string()),
+                    ("error", &err.to_string()),
+                ],
+            ),
             1,
         )
     })?;
     Ok(())
+}
+
+/// The file `install` copies into place.
+///
+/// An AppImage sets `APPIMAGE` to its own path. That file is the
+/// self-contained program, so it is what gets registered. The mounted
+/// payload inside the image is only the inner binary.
+fn installed_binary(appimage: Option<&Path>, current_exe: &Path) -> PathBuf {
+    if let Some(path) = appimage {
+        if path.is_file() {
+            return path.to_path_buf();
+        }
+    }
+    current_exe.to_path_buf()
 }
 
 fn same_file(left: &Path, right: &Path) -> bool {
@@ -230,11 +640,20 @@ fn same_file(left: &Path, right: &Path) -> bool {
 
 fn list_inbox() -> Result<(), Failure> {
     let inbox = Inbox::default_location().map_err(|err| fail(err, 1))?;
-    let entries = inbox
-        .list()
-        .map_err(|err| fail(format!("could not read the inbox: {err}"), 1))?;
+    let entries = inbox.list().map_err(|err| {
+        fail(
+            t_args("wallet.cli.inbox_read", &[("error", &err.to_string())]),
+            1,
+        )
+    })?;
     if entries.is_empty() {
-        println!("Inbox is empty ({})", inbox.root().display());
+        println!(
+            "{}",
+            t_args(
+                "wallet.cli.inbox_empty",
+                &[("path", &inbox.root().display().to_string())],
+            )
+        );
         return Ok(());
     }
     for entry in entries {
@@ -245,7 +664,7 @@ fn list_inbox() -> Result<(), Failure> {
 
 fn handle(uris: &[String], options: &Options) -> Result<(), Failure> {
     if uris.is_empty() {
-        return Err(fail("pass the invocation URI", 1));
+        return Err(fail(t("wallet.cli.need_uri"), 1));
     }
     let inbox = if options.no_save {
         None
@@ -254,21 +673,39 @@ fn handle(uris: &[String], options: &Options) -> Result<(), Failure> {
     };
     let mut errors = Vec::new();
     for uri in uris {
-        match accept(uri, inbox.as_ref()) {
+        let locales = ui_locales_of_uri(uri);
+        let outcome = i18n::with_ui_locales(&locales, || match accept(uri, inbox.as_ref()) {
             Ok(accepted) => {
                 if options.json {
                     println!("{}", accepted.json);
                     if let Some(path) = &accepted.saved {
-                        let _ = writeln!(io::stderr(), "saved {}", path.display());
+                        let _ = writeln!(
+                            io::stderr(),
+                            "{}",
+                            t_args(
+                                "wallet.cli.saved_note",
+                                &[("path", &path.display().to_string())],
+                            )
+                        );
                     }
                 } else {
                     println!("{}", accepted.summary);
                     if let Some(path) = &accepted.saved {
-                        println!("\nSaved: {}", path.display());
+                        println!(
+                            "\n{}",
+                            t_args("wallet.cli.saved", &[("path", &path.display().to_string())])
+                        );
                     }
                 }
+                Ok(())
             }
-            Err(err) => errors.push(format!("{uri}: {err}")),
+            Err(err) => Err(t_args(
+                "wallet.cli.handled",
+                &[("uri", uri), ("error", &err.to_string())],
+            )),
+        });
+        if let Err(err) = outcome {
+            errors.push(err);
         }
     }
     if errors.is_empty() {
@@ -278,34 +715,200 @@ fn handle(uris: &[String], options: &Options) -> Result<(), Failure> {
     }
 }
 
-const USAGE: &str = "\
-OID4VC Wallet
+fn open_vault() -> Result<CredentialVault<oid4vc_wallet::wallet::DesktopKeyStore>, Failure> {
+    CredentialVault::open_default().map_err(|err| fail(err.to_string(), 1))
+}
 
-A Linux wallet for OpenID4VCI credential offers and OpenID4VP / SIOPv2
-presentation requests. Protocol messages are implemented in this program.
-It does not use an OpenID library.
+fn add_credential(options: &Options) -> Result<(), Failure> {
+    let format = options
+        .format
+        .clone()
+        .ok_or_else(|| fail(t("wallet.cli.pass_format"), 1))?;
+    let issuer = options
+        .issuer
+        .clone()
+        .ok_or_else(|| fail(t("wallet.cli.pass_issuer"), 1))?;
+    let document = document_text(options)?;
+    let stored = open_vault()?
+        .put(NewCredential {
+            format,
+            issuer,
+            document,
+        })
+        .map_err(|err| fail(err.to_string(), 1))?;
+    if options.json {
+        println!("{}", stored.to_json());
+    } else {
+        println!("{}", t_args("wallet.cli.stored", &[("id", &stored.id)]));
+        println!(
+            "{}",
+            t_args("wallet.cli.format", &[("format", &stored.format)])
+        );
+        println!(
+            "{}",
+            t_args("wallet.cli.issuer", &[("issuer", &stored.issuer)])
+        );
+        println!(
+            "{}",
+            t_args("wallet.cli.received", &[("time", &stored.received_at)])
+        );
+    }
+    Ok(())
+}
 
-The desktop starts the wallet with the URI as its argument. Until then:
+fn document_text(options: &Options) -> Result<String, Failure> {
+    match (&options.document, &options.document_file) {
+        (Some(_), Some(_)) => Err(fail(t("wallet.cli.either_document"), 1)),
+        (None, None) => Err(fail(t("wallet.cli.pass_document"), 1)),
+        (Some(text), None) => Ok(text.clone()),
+        (None, Some(path)) => read_document_file(path),
+    }
+}
 
-  oid4vc-wallet install [--user | --system] [--haip]
-      Copy this binary and register it for
-      openid-credential-offer://, siopv2:// and openid4vp://.
-      --user is the default and writes under your home directory.
-      --system writes /usr/share/applications and /etc/xdg/mimeapps.list.
-      --haip also registers haip-vci:// and haip-vp://.
+fn read_document_file(path: &str) -> Result<String, Failure> {
+    if path == "-" {
+        let mut text = String::new();
+        io::stdin().read_to_string(&mut text).map_err(|err| {
+            fail(
+                t_args("wallet.cli.stdin", &[("error", &err.to_string())]),
+                1,
+            )
+        })?;
+        return Ok(text);
+    }
+    fs::read_to_string(path).map_err(|err| {
+        fail(
+            t_args(
+                "wallet.cli.read_file",
+                &[("path", path), ("error", &err.to_string())],
+            ),
+            1,
+        )
+    })
+}
 
-  oid4vc-wallet uninstall [--user | --system]
-      Remove that registration and the copied binary.
+fn list_credentials(json: bool) -> Result<(), Failure> {
+    let vault = open_vault()?;
+    let credentials = vault.list().map_err(|err| fail(err.to_string(), 1))?;
+    if json {
+        let value = Json::Array(credentials.iter().map(Credential::to_json).collect());
+        println!("{value}");
+        return Ok(());
+    }
+    if credentials.is_empty() {
+        println!(
+            "{}",
+            t_args(
+                "wallet.cli.no_credentials",
+                &[("path", &vault.root().display().to_string())],
+            )
+        );
+        return Ok(());
+    }
+    for credential in &credentials {
+        println!(
+            "{}  {}  {}  {}",
+            credential.id, credential.received_at, credential.format, credential.issuer
+        );
+    }
+    Ok(())
+}
 
-  oid4vc-wallet <uri>
-  oid4vc-wallet handle <uri>
-      Parse an invocation, print it, and store it in the inbox.
-      --json prints one JSON object. --no-save does not write the inbox.
+fn show_credential(id: &str, json: bool) -> Result<(), Failure> {
+    let credential = open_vault()?
+        .get(id)
+        .map_err(|err| fail(err.to_string(), 1))?;
+    if json {
+        println!("{}", credential.to_json());
+    } else {
+        println!("{}", t_args("wallet.cli.id", &[("id", &credential.id)]));
+        println!(
+            "{}",
+            t_args("wallet.cli.format", &[("format", &credential.format)])
+        );
+        println!(
+            "{}",
+            t_args("wallet.cli.issuer", &[("issuer", &credential.issuer)])
+        );
+        println!(
+            "{}",
+            t_args("wallet.cli.received", &[("time", &credential.received_at)])
+        );
+        println!();
+        println!("{}", credential.document);
+    }
+    Ok(())
+}
 
-  oid4vc-wallet inbox
-      List stored invocations.
+fn delete_credential(id: &str, json: bool) -> Result<(), Failure> {
+    open_vault()?
+        .delete(id)
+        .map_err(|err| fail(err.to_string(), 1))?;
+    if json {
+        println!(
+            "{}",
+            Json::Object(vec![("deleted".to_string(), Json::String(id.to_string()))])
+        );
+    } else {
+        println!("{}", t_args("wallet.cli.deleted", &[("id", id)]));
+    }
+    Ok(())
+}
 
-iya-sts hands an offer to openid-credential-offer://, a presentation request
-to openid4vp://, and an ID Token request to siopv2://. This build parses and
-stores those invocations. It does not redeem an offer or send a presentation yet.
-";
+fn usage() -> String {
+    [
+        t("wallet.usage.title"),
+        String::new(),
+        t("wallet.usage.intro"),
+        String::new(),
+        t("wallet.usage.crypto"),
+        String::new(),
+        t("wallet.usage.desktop"),
+        String::new(),
+        t("wallet.usage.install"),
+        String::new(),
+        t("wallet.usage.uninstall"),
+        String::new(),
+        t("wallet.usage.handle"),
+        String::new(),
+        t("wallet.usage.inbox"),
+        String::new(),
+        t("wallet.usage.add"),
+        String::new(),
+        t("wallet.usage.list"),
+        String::new(),
+        t("wallet.usage.language"),
+        String::new(),
+        t("wallet.usage.footer"),
+    ]
+    .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::installed_binary;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn install_copies_the_appimage_when_that_is_what_was_run() {
+        let root = std::env::temp_dir().join(format!(
+            "oid4vc-wallet-appimage-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let appimage = root.join("OID4VC_Wallet.AppImage");
+        let current = root.join("oid4vc-wallet");
+        fs::write(&appimage, b"appimage").unwrap();
+        fs::write(&current, b"inner").unwrap();
+        assert_eq!(installed_binary(Some(&appimage), &current), appimage);
+        let missing = root.join("missing.AppImage");
+        assert_eq!(installed_binary(Some(&missing), &current), current);
+        assert_eq!(installed_binary(None, &current), current);
+        let _ = fs::remove_dir_all(&root);
+    }
+}

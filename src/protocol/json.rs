@@ -26,7 +26,11 @@ pub struct JsonError {
 
 impl std::fmt::Display for JsonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "JSON at byte {}: {}", self.at, self.message)
+        let at = self.at.to_string();
+        f.write_str(&crate::i18n::t_args(
+            "wallet.json.at",
+            &[("at", &at), ("message", &self.message)],
+        ))
     }
 }
 
@@ -43,7 +47,7 @@ impl Json {
         let value = parser.value()?;
         parser.skip();
         if parser.index != parser.bytes.len() {
-            return Err(parser.error("trailing text after the JSON value"));
+            return Err(parser.error(crate::i18n::t("wallet.json.trailing")));
         }
         Ok(value)
     }
@@ -188,7 +192,9 @@ impl<'a> Parser<'a> {
     }
 
     fn bump(&mut self) -> Result<u8, JsonError> {
-        let byte = self.peek().ok_or_else(|| self.error("unexpected end"))?;
+        let byte = self
+            .peek()
+            .ok_or_else(|| self.error(crate::i18n::t("wallet.json.unexpected_end")))?;
         self.index += 1;
         Ok(byte)
     }
@@ -202,8 +208,8 @@ impl<'a> Parser<'a> {
             Some(b'[') => self.array(),
             Some(b'{') => self.object(),
             Some(b'-') | Some(b'0'..=b'9') => self.number(),
-            Some(_) => Err(self.error("expected a JSON value")),
-            None => Err(self.error("unexpected end")),
+            Some(_) => Err(self.error(crate::i18n::t("wallet.json.expected_value"))),
+            None => Err(self.error(crate::i18n::t("wallet.json.unexpected_end"))),
         }
     }
 
@@ -213,9 +219,12 @@ impl<'a> Parser<'a> {
             let byte = self.bump()?;
             if byte != *expected_byte {
                 self.index = at;
-                return Err(self.error(format!(
-                    "expected {}",
-                    std::str::from_utf8(expected).unwrap_or("literal")
+                return Err(self.error(crate::i18n::t_args(
+                    "wallet.json.expected_literal",
+                    &[(
+                        "literal",
+                        std::str::from_utf8(expected).unwrap_or("literal"),
+                    )],
                 )));
             }
         }
@@ -233,12 +242,12 @@ impl<'a> Parser<'a> {
             }
             if !items.is_empty() {
                 if self.peek() != Some(b',') {
-                    return Err(self.error("expected ',' or ']' in an array"));
+                    return Err(self.error(crate::i18n::t("wallet.json.expected_array")));
                 }
                 self.index += 1;
                 self.skip();
                 if self.peek() == Some(b']') {
-                    return Err(self.error("trailing comma in an array"));
+                    return Err(self.error(crate::i18n::t("wallet.json.trailing_comma_array")));
                 }
             }
             items.push(self.value()?);
@@ -256,21 +265,21 @@ impl<'a> Parser<'a> {
             }
             if !members.is_empty() {
                 if self.peek() != Some(b',') {
-                    return Err(self.error("expected ',' or '}' in an object"));
+                    return Err(self.error(crate::i18n::t("wallet.json.expected_object")));
                 }
                 self.index += 1;
                 self.skip();
                 if self.peek() == Some(b'}') {
-                    return Err(self.error("trailing comma in an object"));
+                    return Err(self.error(crate::i18n::t("wallet.json.trailing_comma_object")));
                 }
             }
             if self.peek() != Some(b'"') {
-                return Err(self.error("expected an object key"));
+                return Err(self.error(crate::i18n::t("wallet.json.expected_key")));
             }
             let name = self.string()?;
             self.skip();
             if self.bump()? != b':' {
-                return Err(self.error("expected ':' after an object key"));
+                return Err(self.error(crate::i18n::t("wallet.json.expected_colon")));
             }
             self.skip();
             let value = self.value()?;
@@ -291,12 +300,12 @@ impl<'a> Parser<'a> {
                     self.index += 1;
                 }
             }
-            _ => return Err(self.error("expected a digit in a number")),
+            _ => return Err(self.error(crate::i18n::t("wallet.json.expected_digit"))),
         }
         if self.peek() == Some(b'.') {
             self.index += 1;
             if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.error("expected a digit after the decimal point"));
+                return Err(self.error(crate::i18n::t("wallet.json.expected_fraction")));
             }
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.index += 1;
@@ -308,7 +317,7 @@ impl<'a> Parser<'a> {
                 self.index += 1;
             }
             if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.error("expected a digit in an exponent"));
+                return Err(self.error(crate::i18n::t("wallet.json.expected_exponent")));
             }
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.index += 1;
@@ -329,19 +338,20 @@ impl<'a> Parser<'a> {
                 b'"' => return Ok(out),
                 b'\\' => out.push(self.escape()?),
                 byte if byte < 0x20 => {
-                    return Err(self.error("unescaped control character in a string"));
+                    return Err(self.error(crate::i18n::t("wallet.json.control")));
                 }
                 byte => {
                     // The source is a `&str`, so a non-ASCII lead byte is the
                     // start of a UTF-8 sequence that is already valid.
-                    let width = utf8_width(byte).ok_or_else(|| self.error("invalid UTF-8"))?;
+                    let width = utf8_width(byte)
+                        .ok_or_else(|| self.error(crate::i18n::t("wallet.json.utf8")))?;
                     let start = self.index - 1;
                     if self.index + width - 1 > self.bytes.len() {
-                        return Err(self.error("truncated UTF-8 in a string"));
+                        return Err(self.error(crate::i18n::t("wallet.json.truncated_utf8")));
                     }
                     self.index += width - 1;
                     let text = std::str::from_utf8(&self.bytes[start..self.index])
-                        .map_err(|_| self.error("invalid UTF-8 in a string"))?;
+                        .map_err(|_| self.error(crate::i18n::t("wallet.json.utf8_string")))?;
                     out.push_str(text);
                 }
             }
@@ -360,7 +370,7 @@ impl<'a> Parser<'a> {
             b'r' => Ok('\r'),
             b't' => Ok('\t'),
             b'u' => self.unicode_escape(),
-            _ => Err(self.error("unknown string escape")),
+            _ => Err(self.error(crate::i18n::t("wallet.json.unknown_escape"))),
         }
     }
 
@@ -370,21 +380,22 @@ impl<'a> Parser<'a> {
             Some(ch) => ch,
             None => {
                 if !(0xD800..=0xDBFF).contains(&unit) {
-                    return Err(self.error("invalid unicode escape"));
+                    return Err(self.error(crate::i18n::t("wallet.json.unicode")));
                 }
                 if self.peek() != Some(b'\\') {
-                    return Err(self.error("lone surrogate in a string"));
+                    return Err(self.error(crate::i18n::t("wallet.json.lone_surrogate")));
                 }
                 self.index += 1;
                 if self.bump()? != b'u' {
-                    return Err(self.error("lone surrogate in a string"));
+                    return Err(self.error(crate::i18n::t("wallet.json.lone_surrogate")));
                 }
                 let low = self.hex4()?;
                 if !(0xDC00..=0xDFFF).contains(&low) {
-                    return Err(self.error("invalid surrogate pair"));
+                    return Err(self.error(crate::i18n::t("wallet.json.surrogate_pair")));
                 }
                 let point = 0x10000 + (((unit - 0xD800) << 10) | (low - 0xDC00));
-                char::from_u32(point).ok_or_else(|| self.error("invalid surrogate pair"))?
+                char::from_u32(point)
+                    .ok_or_else(|| self.error(crate::i18n::t("wallet.json.surrogate_pair")))?
             }
         };
         Ok(ch)
@@ -398,7 +409,7 @@ impl<'a> Parser<'a> {
                 b'0'..=b'9' => byte - b'0',
                 b'a'..=b'f' => byte - b'a' + 10,
                 b'A'..=b'F' => byte - b'A' + 10,
-                _ => return Err(self.error("expected a hex digit in a unicode escape")),
+                _ => return Err(self.error(crate::i18n::t("wallet.json.hex"))),
             };
             value = (value << 4) | u32::from(digit);
         }

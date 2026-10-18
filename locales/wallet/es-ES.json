@@ -1,0 +1,7 @@
+{
+  "desktop.comment": "Aceptar ofertas de credenciales OpenID4VCI y solicitudes OpenID4VP y SIOPv2 en la cartera",
+  "desktop.generic_name": "Cartera de credenciales verificables",
+  "desktop.name": "Cartera OID4VC",
+  "usage.intro": "Una cartera de Linux para ofertas de credenciales OpenID4VCI y solicitudes\nde presentación OpenID4VP / SIOPv2. Los mensajes de protocolo se implementan\nen este programa. No usa una biblioteca OpenID.",
+  "usage.title": "Cartera OID4VC"
+}

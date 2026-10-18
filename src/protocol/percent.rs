@@ -17,12 +17,14 @@ pub enum PercentError {
 impl std::fmt::Display for PercentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BadEscape { at } => {
-                write!(f, "invalid percent-escape at byte {at}")
-            }
-            Self::Utf8 { at } => {
-                write!(f, "percent-decoded bytes are not UTF-8 at byte {at}")
-            }
+            Self::BadEscape { at } => f.write_str(&crate::i18n::t_args(
+                "wallet.percent.bad_escape",
+                &[("at", &at.to_string())],
+            )),
+            Self::Utf8 { at } => f.write_str(&crate::i18n::t_args(
+                "wallet.percent.utf8",
+                &[("at", &at.to_string())],
+            )),
         }
     }
 }

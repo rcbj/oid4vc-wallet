@@ -1,0 +1,7 @@
+{
+  "desktop.comment": "接受 OpenID4VCI 憑證要約以及 OpenID4VP 與 SIOPv2 請求的銀包",
+  "desktop.generic_name": "可驗證憑證銀包",
+  "desktop.name": "OID4VC 銀包",
+  "usage.intro": "用於 OpenID4VCI 憑證要約以及 OpenID4VP / SIOPv2 出示請求的 Linux 銀包。\n協定訊息在本程式中實作。它不使用 OpenID 程式庫。",
+  "usage.title": "OID4VC 銀包"
+}

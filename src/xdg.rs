@@ -8,9 +8,9 @@ use std::path::PathBuf;
 
 /// The user's home directory, from `HOME`.
 pub fn home() -> Result<PathBuf, String> {
-    let value = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let value = std::env::var("HOME").map_err(|_| crate::i18n::t("wallet.xdg.home_unset"))?;
     if value.is_empty() {
-        return Err("HOME is empty".to_string());
+        return Err(crate::i18n::t("wallet.xdg.home_empty"));
     }
     Ok(PathBuf::from(value))
 }

@@ -36,16 +36,14 @@ pub enum UriError {
 impl std::fmt::Display for UriError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Empty => write!(f, "the invocation URI is empty"),
-            Self::TooLong => write!(f, "the invocation URI is longer than {MAX_URI_LEN} bytes"),
-            Self::Whitespace => {
-                write!(
-                    f,
-                    "the invocation URI contains whitespace or a control character"
-                )
-            }
-            Self::MissingScheme => write!(f, "the invocation URI has no scheme"),
-            Self::BadScheme => write!(f, "the invocation URI's scheme is not a valid scheme"),
+            Self::Empty => f.write_str(&crate::i18n::t("wallet.uri.empty")),
+            Self::TooLong => f.write_str(&crate::i18n::t_args(
+                "wallet.uri.too_long",
+                &[("limit", &MAX_URI_LEN.to_string())],
+            )),
+            Self::Whitespace => f.write_str(&crate::i18n::t("wallet.uri.whitespace")),
+            Self::MissingScheme => f.write_str(&crate::i18n::t("wallet.uri.missing_scheme")),
+            Self::BadScheme => f.write_str(&crate::i18n::t("wallet.uri.bad_scheme")),
             Self::Query(err) => write!(f, "{err}"),
         }
     }

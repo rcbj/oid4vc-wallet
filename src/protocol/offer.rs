@@ -97,28 +97,18 @@ impl OfferPassing {
         let by_value = values(params, "credential_offer");
         let by_reference = values(params, "credential_offer_uri");
         if by_value.len() > 1 {
-            return Err(err(
-                "credential_offer appears more than once; the offer must be one parameter",
-            ));
+            return Err(tr("wallet.offer.duplicate_offer"));
         }
         if by_reference.len() > 1 {
-            return Err(err(
-                "credential_offer_uri appears more than once; the offer must be one parameter",
-            ));
+            return Err(tr("wallet.offer.duplicate_uri"));
         }
         match (by_value.first(), by_reference.first()) {
-            (Some(_), Some(_)) => Err(err(
-                "the invocation carries both credential_offer and credential_offer_uri; OpenID4VCI passes the offer one way",
-            )),
-            (None, None) => Err(err(
-                "the invocation has neither credential_offer nor credential_offer_uri",
-            )),
+            (Some(_), Some(_)) => Err(tr("wallet.offer.both")),
+            (None, None) => Err(tr("wallet.offer.neither")),
             (Some(offer), None) => Ok(Self::ByValue(Box::new(parse_offer_json(offer)?))),
             (None, Some(uri)) => {
                 if !is_http_url(uri) {
-                    return Err(err(
-                        "credential_offer_uri must be an absolute http or https URL",
-                    ));
+                    return Err(tr("wallet.offer.offer_uri_http"));
                 }
                 Ok(Self::ByReference {
                     credential_offer_uri: (*uri).to_string(),
@@ -131,11 +121,14 @@ impl OfferPassing {
 /// Parse a Credential Offer object.
 pub fn parse_offer_json(text: &str) -> Result<CredentialOffer, OfferError> {
     let value = Json::parse(text).map_err(|error: JsonError| {
-        err(format!("credential_offer is not a JSON object: {error}"))
+        tra(
+            "wallet.offer.not_object_error",
+            &[("error", &error.to_string())],
+        )
     })?;
     let members = value
         .as_object()
-        .ok_or_else(|| err("credential_offer is not a JSON object"))?;
+        .ok_or_else(|| tr("wallet.offer.not_object"))?;
     let mut unknown_members = Vec::new();
     let mut credential_issuer = None;
     let mut configuration_ids = None;
@@ -153,26 +146,19 @@ pub fn parse_offer_json(text: &str) -> Result<CredentialOffer, OfferError> {
             }
             "grants" => grants = Some(parse_grants(member)?),
             "credentials" => {
-                return Err(err(
-                    "credential_offer uses the old credentials member; this wallet reads OpenID4VCI 1.0 credential_configuration_ids",
-                ));
+                return Err(tr("wallet.offer.old_credentials"));
             }
             other => unknown_members.push(other.to_string()),
         }
     }
-    let credential_issuer =
-        credential_issuer.ok_or_else(|| err("credential_offer is missing credential_issuer"))?;
+    let credential_issuer = credential_issuer.ok_or_else(|| tr("wallet.offer.missing_issuer"))?;
     if !is_http_url(&credential_issuer) {
-        return Err(err(
-            "credential_issuer must be an absolute http or https URL",
-        ));
+        return Err(tr("wallet.offer.issuer_http"));
     }
-    let credential_configuration_ids = configuration_ids
-        .ok_or_else(|| err("credential_offer is missing credential_configuration_ids"))?;
+    let credential_configuration_ids =
+        configuration_ids.ok_or_else(|| tr("wallet.offer.missing_configs"))?;
     if credential_configuration_ids.is_empty() {
-        return Err(err(
-            "credential_configuration_ids must name at least one configuration",
-        ));
+        return Err(tr("wallet.offer.configs_empty"));
     }
     Ok(CredentialOffer {
         credential_issuer,
@@ -189,7 +175,7 @@ pub fn parse_offer_json(text: &str) -> Result<CredentialOffer, OfferError> {
 fn parse_grants(value: &Json) -> Result<Grants, OfferError> {
     let members = value
         .as_object()
-        .ok_or_else(|| err("grants must be a JSON object"))?;
+        .ok_or_else(|| tr("wallet.offer.grants_object"))?;
     let mut authorization_code = None;
     let mut pre_authorized_code = None;
     let mut other = Vec::new();
@@ -214,7 +200,7 @@ fn parse_grants(value: &Json) -> Result<Grants, OfferError> {
 fn parse_authorization_code(value: &Json) -> Result<AuthorizationCodeGrant, OfferError> {
     let members = value
         .as_object()
-        .ok_or_else(|| err("grants.authorization_code must be a JSON object"))?;
+        .ok_or_else(|| tr("wallet.offer.auth_code_object"))?;
     let mut issuer_state = None;
     let mut authorization_server = None;
     let mut unknown_members = Vec::new();
@@ -230,9 +216,7 @@ fn parse_authorization_code(value: &Json) -> Result<AuthorizationCodeGrant, Offe
                 let server =
                     require_string(member, "grants.authorization_code.authorization_server")?;
                 if !is_http_url(&server) {
-                    return Err(err(
-                        "grants.authorization_code.authorization_server must be an absolute http or https URL",
-                    ));
+                    return Err(tr("wallet.offer.auth_server_http"));
                 }
                 authorization_server = Some(server);
             }
@@ -249,7 +233,7 @@ fn parse_authorization_code(value: &Json) -> Result<AuthorizationCodeGrant, Offe
 fn parse_pre_authorized(value: &Json) -> Result<PreAuthorizedCodeGrant, OfferError> {
     let members = value
         .as_object()
-        .ok_or_else(|| err("the pre-authorized_code grant must be a JSON object"))?;
+        .ok_or_else(|| tr("wallet.offer.preauth_object"))?;
     let mut pre_authorized_code = None;
     let mut tx_code = None;
     let mut authorization_server = None;
@@ -260,7 +244,7 @@ fn parse_pre_authorized(value: &Json) -> Result<PreAuthorizedCodeGrant, OfferErr
             "pre-authorized_code" => {
                 let code = require_string(member, "pre-authorized_code")?;
                 if code.is_empty() {
-                    return Err(err("pre-authorized_code is empty"));
+                    return Err(tr("wallet.offer.preauth_empty"));
                 }
                 pre_authorized_code = Some(code);
             }
@@ -268,22 +252,18 @@ fn parse_pre_authorized(value: &Json) -> Result<PreAuthorizedCodeGrant, OfferErr
             "authorization_server" => {
                 let server = require_string(member, "pre-authorized grant authorization_server")?;
                 if !is_http_url(&server) {
-                    return Err(err(
-                        "the pre-authorized grant's authorization_server must be an absolute http or https URL",
-                    ));
+                    return Err(tr("wallet.offer.preauth_server_http"));
                 }
                 authorization_server = Some(server);
             }
             "interval" => {
-                interval = Some(member.as_u64().ok_or_else(|| {
-                    err("the pre-authorized grant's interval must be a non-negative integer")
-                })?);
+                interval = Some(member.as_u64().ok_or_else(|| tr("wallet.offer.interval"))?);
             }
             other => unknown_members.push(other.to_string()),
         }
     }
-    let pre_authorized_code = pre_authorized_code
-        .ok_or_else(|| err("the pre-authorized_code grant is missing pre-authorized_code"))?;
+    let pre_authorized_code =
+        pre_authorized_code.ok_or_else(|| tr("wallet.offer.preauth_missing"))?;
     Ok(PreAuthorizedCodeGrant {
         pre_authorized_code,
         tx_code,
@@ -296,7 +276,7 @@ fn parse_pre_authorized(value: &Json) -> Result<PreAuthorizedCodeGrant, OfferErr
 fn parse_tx_code(value: &Json) -> Result<TxCode, OfferError> {
     let members = value
         .as_object()
-        .ok_or_else(|| err("tx_code must be a JSON object"))?;
+        .ok_or_else(|| tr("wallet.offer.tx_object"))?;
     let mut input_mode = None;
     let mut length = None;
     let mut description = None;
@@ -306,16 +286,16 @@ fn parse_tx_code(value: &Json) -> Result<TxCode, OfferError> {
             "input_mode" => {
                 let mode = require_string(member, "tx_code.input_mode")?;
                 if mode != "numeric" && mode != "text" {
-                    return Err(err("tx_code.input_mode must be \"numeric\" or \"text\""));
+                    return Err(tr("wallet.offer.tx_mode"));
                 }
                 input_mode = Some(mode);
             }
             "length" => {
                 let digits = member
                     .as_u64()
-                    .ok_or_else(|| err("tx_code.length must be a positive integer"))?;
+                    .ok_or_else(|| tr("wallet.offer.tx_length"))?;
                 if digits == 0 {
-                    return Err(err("tx_code.length must be a positive integer"));
+                    return Err(tr("wallet.offer.tx_length"));
                 }
                 length = Some(digits);
             }
@@ -338,22 +318,20 @@ fn require_string(value: &Json, field: &str) -> Result<String, OfferError> {
         .as_str()
         .filter(|text| !text.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| err(format!("{field} must be a non-empty string")))
+        .ok_or_else(|| tra("wallet.offer.field_string", &[("field", field)]))
 }
 
 fn require_string_array(value: &Json, field: &str) -> Result<Vec<String>, OfferError> {
     let items = value
         .as_array()
-        .ok_or_else(|| err(format!("{field} must be an array of strings")))?;
+        .ok_or_else(|| tra("wallet.offer.field_array", &[("field", field)]))?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let text = item
             .as_str()
-            .ok_or_else(|| err(format!("{field} must be an array of non-empty strings")))?;
+            .ok_or_else(|| tra("wallet.offer.field_array_items", &[("field", field)]))?;
         if text.is_empty() {
-            return Err(err(format!(
-                "{field} must be an array of non-empty strings"
-            )));
+            return Err(tra("wallet.offer.field_array_items", &[("field", field)]));
         }
         out.push(text.to_string());
     }
@@ -362,6 +340,14 @@ fn require_string_array(value: &Json, field: &str) -> Result<Vec<String>, OfferE
 
 fn err(message: impl Into<String>) -> OfferError {
     OfferError::Message(message.into())
+}
+
+fn tr(key: &str) -> OfferError {
+    err(crate::i18n::t(key))
+}
+
+fn tra(key: &str, args: &[(&str, &str)]) -> OfferError {
+    err(crate::i18n::t_args(key, args))
 }
 
 #[cfg(test)]

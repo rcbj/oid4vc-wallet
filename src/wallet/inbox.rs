@@ -112,7 +112,7 @@ fn unique_path(root: &Path, name: &str) -> io::Result<PathBuf> {
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "could not choose an inbox file name",
+        crate::i18n::t("wallet.inbox.name"),
     ))
 }
 

@@ -2,7 +2,7 @@
 name = "oid4vc-wallet"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.75"
 description = "Linux native verifiable credential wallet for OpenID4VCI and OpenID4VP"
 license = "Apache-2.0"
 repository = "https://github.com/rcbj/oid4vc-wallet"
@@ -11,10 +11,21 @@ publish = false
 keywords = ["openid", "openid4vci", "openid4vp", "verifiable-credentials", "wallet"]
 categories = ["command-line-utilities"]
 
-# No dependencies. OpenID4VCI, OpenID4VP and SIOPv2 are implemented in this
-# crate. Do not add a crate whose job is to implement those protocols.
-# A future cryptographic primitive or HTTP stack needs its own review; it is
-# not a substitute for the messages in src/protocol.
+# OpenID4VCI, OpenID4VP and SIOPv2 are implemented in this crate. Do not add
+# a crate whose job is to implement those protocols.
+#
+# aes-gcm seals credentials at rest. keyring talks to the Secret Service,
+# which GNOME Keyring provides. KeePassXC provides that service when its
+# integration is on. dbus talks to KWallet on KDE when the Secret Service is
+# not running. crypto-rust encrypts the Secret Service key on the session
+# bus. vendored builds the D-Bus client without a separate libdbus
+# development package.
+
+[dependencies]
+aes-gcm = "0.10"
+dbus = { version = "0.9", features = ["vendored"] }
+keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
+zeroize = "1"
 
 [lib]
 name = "oid4vc_wallet"

@@ -64,6 +64,8 @@ pub struct AuthorizationRequest {
     pub client_metadata: Option<Json>,
     pub presentation_definition: Option<Json>,
     pub presentation_definition_uri: Option<String>,
+    /// OpenID Connect `ui_locales`, space-separated, best first.
+    pub ui_locales: Option<String>,
     /// Parameter names this wallet does not act on yet.
     pub unknown_parameters: Vec<String>,
 }
@@ -111,28 +113,29 @@ pub fn from_query(
     let mut client_metadata = None;
     let mut presentation_definition = None;
     let mut presentation_definition_uri = None;
+    let mut ui_locales = None;
     let mut unknown_parameters = Vec::new();
 
     for param in params {
         if values(params, &param.name).len() > 1 {
-            return Err(err(format!(
-                "parameter {} appears more than once",
-                param.name
-            )));
+            return Err(tra(
+                "wallet.request.duplicate",
+                &[("name", param.name.as_str())],
+            ));
         }
         let value = param.value.as_str();
         match param.name.as_str() {
             "client_id" => client_id = Some(require_token(value, "client_id")?),
             "request_uri" => {
                 if !is_http_url(value) {
-                    return Err(err("request_uri must be an absolute http or https URL"));
+                    return Err(tr("wallet.request.request_uri_http"));
                 }
                 request_uri = Some(value.to_string());
             }
             "request_uri_method" => {
                 let method = value.to_ascii_lowercase();
                 if method != "get" && method != "post" {
-                    return Err(err("request_uri_method must be get or post"));
+                    return Err(tr("wallet.request.request_uri_method"));
                 }
                 request_uri_method = Some(method);
             }
@@ -160,15 +163,14 @@ pub fn from_query(
                 presentation_definition_uri =
                     Some(require_http(value, "presentation_definition_uri")?);
             }
+            "ui_locales" => ui_locales = Some(require_text(value, "ui_locales")?),
             other => unknown_parameters.push(other.to_string()),
         }
     }
 
-    let client_id = client_id.ok_or_else(|| err("the request is missing client_id"))?;
+    let client_id = client_id.ok_or_else(|| tr("wallet.request.missing_client"))?;
     if request_uri.is_none() && response_type.is_none() && request.is_none() {
-        return Err(err(
-            "the request has no request_uri, request, or response_type, so there is nothing to answer",
-        ));
+        return Err(tr("wallet.request.nothing"));
     }
     Ok(AuthorizationRequest {
         scheme,
@@ -187,15 +189,14 @@ pub fn from_query(
         client_metadata,
         presentation_definition,
         presentation_definition_uri,
+        ui_locales,
         unknown_parameters,
     })
 }
 
 fn require_token(value: &str, field: &str) -> Result<String, RequestError> {
     if value.is_empty() || value.chars().any(|c| c.is_ascii_whitespace()) {
-        return Err(err(format!(
-            "{field} must be a non-empty string with no whitespace"
-        )));
+        return Err(tra("wallet.request.token", &[("field", field)]));
     }
     Ok(value.to_string())
 }
@@ -205,31 +206,41 @@ fn require_token(value: &str, field: &str) -> Result<String, RequestError> {
 fn require_text(value: &str, field: &str) -> Result<String, RequestError> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
-        return Err(err(format!("{field} must be a non-empty string")));
+        return Err(tra("wallet.request.text", &[("field", field)]));
     }
     Ok(trimmed.to_string())
 }
 
 fn require_http(value: &str, field: &str) -> Result<String, RequestError> {
     if !is_http_url(value) {
-        return Err(err(format!(
-            "{field} must be an absolute http or https URL"
-        )));
+        return Err(tra("wallet.request.http", &[("field", field)]));
     }
     Ok(value.to_string())
 }
 
 fn require_json_object(value: &str, field: &str) -> Result<Json, RequestError> {
-    let parsed = Json::parse(value)
-        .map_err(|error: JsonError| err(format!("{field} is not JSON: {error}")))?;
+    let parsed = Json::parse(value).map_err(|error: JsonError| {
+        tra(
+            "wallet.request.not_json",
+            &[("field", field), ("error", &error.to_string())],
+        )
+    })?;
     if parsed.as_object().is_none() {
-        return Err(err(format!("{field} must be a JSON object")));
+        return Err(tra("wallet.request.not_json_object", &[("field", field)]));
     }
     Ok(parsed)
 }
 
 fn err(message: impl Into<String>) -> RequestError {
     RequestError::Message(message.into())
+}
+
+fn tr(key: &str) -> RequestError {
+    err(crate::i18n::t(key))
+}
+
+fn tra(key: &str, args: &[(&str, &str)]) -> RequestError {
+    err(crate::i18n::t_args(key, args))
 }
 
 #[cfg(test)]

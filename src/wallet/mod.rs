@@ -1,8 +1,22 @@
-//! The local record of invocations the desktop handed this process.
+//! The inbox of invocations the desktop handed this process, and the
+//! credentials the wallet stores.
+//!
+//! Invocations stay as the raw URI. Credentials are sealed with AES-256-GCM.
+//! The key is read from GNOME Keyring, or from KWallet when the Secret
+//! Service is not running.
 
+mod credentials;
 mod inbox;
+mod key_store;
+mod kwallet;
+mod seal;
+mod secret_service;
 
+pub use credentials::{Credential, CredentialVault, NewCredential, VaultError};
 pub use inbox::{Inbox, InboxEntry};
+pub use key_store::{DesktopKeyStore, EncryptionKeyStore, KeyStoreError};
+pub use seal::SealError;
+pub use secret_service::SecretServiceKeyStore;
 
 use crate::protocol::invocation::{self, Invocation, ParseError};
 
@@ -42,7 +56,10 @@ impl std::fmt::Display for AcceptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parse(err) => write!(f, "{err}"),
-            Self::Store(err) => write!(f, "could not store the invocation: {err}"),
+            Self::Store(err) => f.write_str(&crate::i18n::t_args(
+                "wallet.accept.store",
+                &[("error", &err.to_string())],
+            )),
         }
     }
 }

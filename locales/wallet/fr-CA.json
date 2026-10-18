@@ -1,0 +1,7 @@
+{
+  "desktop.comment": "Accepter les offres de titres de compétences OpenID4VCI et les demandes OpenID4VP et SIOPv2",
+  "desktop.generic_name": "Portefeuille de titres de compétences vérifiables",
+  "desktop.name": "Portefeuille de titres de compétences OID4VC",
+  "usage.intro": "Un portefeuille Linux pour les offres de titres de compétences OpenID4VCI\net les demandes de présentation OpenID4VP / SIOPv2. Les messages de protocole\nsont mis en œuvre dans ce programme. Il n'utilise pas de bibliothèque OpenID.",
+  "usage.title": "Portefeuille de titres de compétences OID4VC"
+}

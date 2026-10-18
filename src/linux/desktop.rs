@@ -82,7 +82,13 @@ pub enum InstallError {
 impl std::fmt::Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::Io { path, source } => f.write_str(&crate::i18n::t_args(
+                "wallet.cli.path_error",
+                &[
+                    ("path", &path.display().to_string()),
+                    ("error", &source.to_string()),
+                ],
+            )),
         }
     }
 }
@@ -99,14 +105,19 @@ pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), String> {
-        let status = Command::new(program)
-            .args(args)
-            .status()
-            .map_err(|err| format!("could not run {program}: {err}"))?;
+        let status = Command::new(program).args(args).status().map_err(|err| {
+            crate::i18n::t_args(
+                "wallet.linux.could_not_run",
+                &[("program", program), ("error", &err.to_string())],
+            )
+        })?;
         if status.success() {
             Ok(())
         } else {
-            Err(format!("{program} exited with {status}"))
+            Err(crate::i18n::t_args(
+                "wallet.linux.exited",
+                &[("program", program), ("status", &status.to_string())],
+            ))
         }
     }
 }
@@ -173,6 +184,16 @@ pub fn desktop_entry(binary: &Path, schemes: &[&str]) -> String {
         mime.push_str(scheme);
         mime.push(';');
     }
+    let mut localized = String::new();
+    for line in crate::i18n::desktop_translations() {
+        localized.push_str(&format!(
+            "Name[{locale}]={name}\nGenericName[{locale}]={generic}\nComment[{locale}]={comment}\n",
+            locale = line.locale,
+            name = line.name,
+            generic = line.generic_name,
+            comment = line.comment,
+        ));
+    }
     format!(
         "[Desktop Entry]\n\
          Version=1.0\n\
@@ -180,6 +201,7 @@ pub fn desktop_entry(binary: &Path, schemes: &[&str]) -> String {
          Name=OID4VC Wallet\n\
          GenericName=Verifiable Credential Wallet\n\
          Comment=Accept OpenID4VCI credential offers and OpenID4VP and SIOPv2 requests\n\
+         {localized}\
          Exec={exec} %u\n\
          Terminal=true\n\
          Categories=Network;Security;\n\
@@ -257,8 +279,9 @@ fn refresh_desktop(
     let mut warnings = Vec::new();
     let dir = applications_dir.to_string_lossy().into_owned();
     if let Err(err) = runner.run("update-desktop-database", &[dir]) {
-        warnings.push(format!(
-            "update-desktop-database did not refresh the desktop cache: {err}"
+        warnings.push(crate::i18n::t_args(
+            "wallet.linux.desktop_database",
+            &[("error", &err)],
         ));
     }
     for scheme in schemes {
@@ -267,8 +290,9 @@ fn refresh_desktop(
             "xdg-mime",
             &["default".to_string(), DESKTOP_FILE_NAME.to_string(), mime],
         ) {
-            warnings.push(format!(
-                "xdg-mime did not set the default for {scheme}: {err}. The mimeapps.list entry was still written."
+            warnings.push(crate::i18n::t_args(
+                "wallet.linux.xdg_mime",
+                &[("scheme", scheme), ("error", &err)],
             ));
         }
     }
@@ -545,6 +569,12 @@ mod tests {
             "MimeType=x-scheme-handler/openid-credential-offer;x-scheme-handler/siopv2;x-scheme-handler/openid4vp;\n"
         ));
         assert!(text.contains("Terminal=true\n"));
+        assert!(text.contains("Name=OID4VC Wallet\n"));
+        assert!(
+            text.contains("GenericName[fr_CA]=Portefeuille de titres de compétences vérifiables\n")
+        );
+        assert!(text.contains("GenericName[es_ES]=Cartera de credenciales verificables\n"));
+        assert!(text.contains("GenericName[zh_HK]=可驗證憑證銀包\n"));
     }
 
     #[test]
