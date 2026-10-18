@@ -2,7 +2,8 @@
 # Build a self-contained x86_64 AppImage of oid4vc-wallet.
 #
 # The image contains the wallet and every library it needs besides the
-# system C library. The result uses the glibc of the machine that builds it.
+# system C library and the host OpenGL loader. The window needs libGL from
+# the desktop. The result uses the glibc of the machine that builds it.
 # GitHub Actions builds on Ubuntu 22.04, so that artifact runs on Ubuntu 22.04
 # and newer.
 set -eu
@@ -61,6 +62,11 @@ ldd "$binary" | while IFS= read -r line; do
         libc.so* | libm.so* | libpthread.so* | libdl.so* | librt.so* | libresolv.so*)
             continue
             ;;
+        # The host OpenGL dispatcher loads the GPU driver. A copy inside the
+        # image points that loader at the wrong place.
+        libGL.so* | libGLX.so* | libGLdispatch.so* | libEGL.so*)
+            continue
+            ;;
     esac
     cp -L "$lib" "$appdir/usr/lib/$base"
 done
@@ -91,9 +97,9 @@ Type=Application
 Name=OID4VC Wallet
 GenericName=Verifiable Credential Wallet
 Comment=Accept OpenID4VCI credential offers and OpenID4VP and SIOPv2 requests
-Exec=oid4vc-wallet %u
+Exec=oid4vc-wallet --ui %u
 Icon=org.rcbj.oid4vc-wallet
-Terminal=true
+Terminal=false
 Categories=Network;Security;System;
 MimeType=x-scheme-handler/openid-credential-offer;x-scheme-handler/siopv2;x-scheme-handler/openid4vp;
 StartupNotify=true

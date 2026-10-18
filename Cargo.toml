@@ -2,14 +2,14 @@
 name = "oid4vc-wallet"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.95"
 description = "Linux native verifiable credential wallet for OpenID4VCI and OpenID4VP"
 license = "Apache-2.0"
 repository = "https://github.com/rcbj/oid4vc-wallet"
 readme = "README.md"
 publish = false
 keywords = ["openid", "openid4vci", "openid4vp", "verifiable-credentials", "wallet"]
-categories = ["command-line-utilities"]
+categories = ["command-line-utilities", "gui"]
 
 # OpenID4VCI, OpenID4VP and SIOPv2 are implemented in this crate. Do not add
 # a crate whose job is to implement those protocols.
@@ -20,10 +20,15 @@ categories = ["command-line-utilities"]
 # not running. crypto-rust encrypts the Secret Service key on the session
 # bus. vendored builds the D-Bus client without a separate libdbus
 # development package.
+#
+# eframe draws the --ui window. image decodes the window icon. Neither crate
+# is used by the protocol code.
 
 [dependencies]
 aes-gcm = "0.10"
 dbus = { version = "0.9", features = ["vendored"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "system_fonts", "glow", "x11", "clipboard"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
 zeroize = "1"
 

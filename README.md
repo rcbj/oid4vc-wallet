@@ -2,7 +2,7 @@
 
 A Linux wallet for [OpenID4VCI](https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html) credential offers and [OpenID4VP](https://openid.net/specs/openid-4-verifiable-presentations-1_0.html) / [SIOPv2](https://openid.net/specs/openid-connect-self-issued-v2-1_0.html) requests. It is a native program. The installer registers it with the desktop, so a browser or an issuer page that opens `openid-credential-offer://` or `siopv2://` starts this wallet.
 
-The OpenID messages are implemented in this repository. `src/protocol` does not use another crate, and the wallet does not use a library that implements OpenID4VCI, OpenID4VP, SIOPv2, SD-JWT or JOSE. AES-256-GCM, the Secret Service client, and the KWallet client are the only dependencies. They seal credentials at rest. They do not implement the protocols.
+The OpenID messages are implemented in this repository. `src/protocol` does not use another crate, and the wallet does not use a library that implements OpenID4VCI, OpenID4VP, SIOPv2, SD-JWT or JOSE. Credentials are sealed with AES-256-GCM. The key is stored through the Secret Service client or the KWallet client. `oid4vc-wallet --ui` opens a window for the same operations as the command line.
 
 This wallet is used to exercise [iya-sts](https://github.com/rcbj/iya-sts). iya-sts hands a wallet three URIs:
 
@@ -16,7 +16,7 @@ This wallet is used to exercise [iya-sts](https://github.com/rcbj/iya-sts). iya-
 
 ## What this version does
 
-It parses an invocation, prints what the issuer or verifier asked, and stores the raw URI in an inbox that only the owner can read. A pre-authorized code is a bearer credential, so the inbox directory is mode `0700` and each file is mode `0600`.
+It parses an invocation, prints what the issuer or verifier asked, and stores the raw URI in an inbox that only the owner can read. A pre-authorized code is a bearer credential, so the inbox directory is mode `0700` and each file is mode `0600`. `oid4vc-wallet --ui` opens a window that lists stored credentials and can accept an invocation, read the inbox, switch language, and register the protocol handlers.
 
 A credential added with `credential add` is sealed with AES-256-GCM before it is written. Each file under `$XDG_DATA_HOME/oid4vc-wallet/credentials` is mode `0600`, and that directory is mode `0700`. The file holds a nonce and ciphertext. The format, issuer, time, and credential document are inside the ciphertext. The inbox stays a separate directory of raw invocation URIs.
 
@@ -42,7 +42,7 @@ cargo build --release
 ./dist/OID4VC_Wallet-0.1.0-x86_64.AppImage --help
 ```
 
-The file contains the wallet and the libraries it needs besides the system C library, including libgcc. The image uses the glibc of the machine that builds it. GitHub Actions builds on Ubuntu 22.04, so that copy runs on Ubuntu 22.04 and newer. The workflow uploads it as an artifact named `oid4vc-wallet-x86_64`.
+The file contains the wallet and the libraries it needs besides the system C library and the host OpenGL loader, including libgcc. The window needs `libGL` from the desktop, which loads the GPU driver. The image uses the glibc of the machine that builds it. GitHub Actions builds on Ubuntu 22.04, so that copy runs on Ubuntu 22.04 and newer. The workflow uploads it as an artifact named `oid4vc-wallet-x86_64`.
 
 ```sh
 ./dist/OID4VC_Wallet-0.1.0-x86_64.AppImage install
@@ -60,7 +60,7 @@ For the current user, which is the usual way to test against iya-sts on the same
 
 That builds the release binary, copies it to `~/.local/bin/oid4vc-wallet`, and registers the protocol handlers. The registration is two files:
 
-* `~/.local/share/applications/org.rcbj.oid4vc-wallet.desktop`, a Desktop Entry whose `MimeType` lists `x-scheme-handler/openid-credential-offer`, `x-scheme-handler/siopv2` and `x-scheme-handler/openid4vp`, and whose `Exec` line receives the URI as `%u`.
+* `~/.local/share/applications/org.rcbj.oid4vc-wallet.desktop`, a Desktop Entry whose `MimeType` lists `x-scheme-handler/openid-credential-offer`, `x-scheme-handler/siopv2` and `x-scheme-handler/openid4vp`, and whose `Exec` line is `oid4vc-wallet --ui` plus the URI as `%u`. `Icon=org.rcbj.oid4vc-wallet` is the hicolor icon name. The installer writes that PNG under `~/.local/share/icons/hicolor/` at the sizes the application grid asks for. GNOME Shell shows a generic icon when `Icon` is a file path.
 * `~/.config/mimeapps.list`, where those types name this desktop file as the default application.
 
 The installer also runs `update-desktop-database` and `xdg-mime default` when those tools are on `PATH`. The files above are the registration either way.
@@ -75,11 +75,12 @@ That writes `/usr/local/bin/oid4vc-wallet`, `/usr/share/applications/org.rcbj.oi
 
 Remove the registration with `oid4vc-wallet uninstall` or `oid4vc-wallet uninstall --system`.
 
-The desktop file sets `Terminal=true`, so accepting an offer opens a terminal with the parsed request. A graphical window is not part of this version.
+The desktop file sets `Terminal=false`. Clicking the application opens the window on the credential list. A protocol link opens that same window and shows the parsed request. The command line is still there when you leave off `--ui`: `oid4vc-wallet help` prints the commands, and a URI on the command line parses it without opening the window.
 
 ## Try an invocation
 
 ```sh
+oid4vc-wallet --ui
 oid4vc-wallet 'openid-credential-offer://?credential_offer=…'
 oid4vc-wallet 'siopv2://?client_id=…&request_uri=…&request_uri_method=get'
 oid4vc-wallet inbox

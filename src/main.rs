@@ -1,14 +1,15 @@
 //! `oid4vc-wallet` — a Linux wallet for OpenID4VCI and OpenID4VP.
 //!
-//! The desktop launches this program with the invocation URI as its argument.
-//! `install` registers that launch with the session. Credentials are sealed
-//! with AES-256-GCM. The key lives in GNOME Keyring, or in KWallet when the
-//! Secret Service is not running. Display text follows the languages iya-sts
-//! ships. `--lang` and `language` choose one.
+//! The desktop launches this program with `--ui` and the invocation URI.
+//! That window lists credentials and runs the same operations as the
+//! command line. `install` registers that launch with the session.
+//! Credentials are sealed with AES-256-GCM. The key lives in GNOME Keyring,
+//! or in KWallet when the Secret Service is not running. Display text
+//! follows the languages iya-sts ships. `--lang` and `language` choose one.
 
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -21,6 +22,8 @@ use oid4vc_wallet::linux::{
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Json};
 use oid4vc_wallet::wallet::{accept, Credential, CredentialVault, Inbox, NewCredential};
 
+mod ui;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -31,6 +34,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Debug)]
 struct Failure {
     message: String,
     code: u8,
@@ -49,6 +53,8 @@ struct Options {
     system: bool,
     haip: bool,
     help: bool,
+    /// Open the window. Extra positionals are invocation URIs.
+    ui: bool,
     format: Option<String>,
     issuer: Option<String>,
     document: Option<String>,
@@ -68,20 +74,30 @@ fn run() -> Result<(), Failure> {
         println!("{}", usage());
         return Ok(());
     }
+    if options.ui {
+        reject_ui_flags(&options)?;
+        require_ui_arguments(&options)?;
+        return ui::run(&options.positionals, options.no_save);
+    }
     match options.positionals.first().map(String::as_str) {
         None => {
             println!("{}", usage());
+            pause_if_interactive();
             Ok(())
         }
         Some("install") => {
             reject_extra(&options, 1)?;
             reject_credential_fields(&options)?;
-            install(&options)
+            let text = install(&options)?;
+            println!("{text}");
+            Ok(())
         }
         Some("uninstall") => {
             reject_extra(&options, 1)?;
             reject_credential_fields(&options)?;
-            uninstall(&options)
+            let text = uninstall(&options)?;
+            println!("{text}");
+            Ok(())
         }
         Some("inbox") => {
             reject_extra(&options, 1)?;
@@ -102,11 +118,15 @@ fn run() -> Result<(), Failure> {
         }
         Some("handle") => {
             reject_credential_fields(&options)?;
-            handle(&options.positionals[1..], &options)
+            handle(&options.positionals[1..], &options)?;
+            pause_if_interactive();
+            Ok(())
         }
         Some(command) if command.contains("://") => {
             reject_credential_fields(&options)?;
-            handle(&options.positionals, &options)
+            handle(&options.positionals, &options)?;
+            pause_if_interactive();
+            Ok(())
         }
         Some(command) => Err(fail(
             t_args("wallet.cli.unknown_command", &[("command", command)]),
@@ -177,12 +197,17 @@ fn peek_lang(args: &[String]) -> LangPeek {
 }
 
 fn options() -> Result<Options, Failure> {
+    options_from(env::args().skip(1))
+}
+
+fn options_from(args: impl IntoIterator<Item = String>) -> Result<Options, Failure> {
     let mut options = Options {
         json: false,
         no_save: false,
         system: false,
         haip: false,
         help: false,
+        ui: false,
         format: None,
         issuer: None,
         document: None,
@@ -191,7 +216,7 @@ fn options() -> Result<Options, Failure> {
         saw_scope: false,
         positionals: Vec::new(),
     };
-    let mut args = env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let (name, inline) = split_valued(&arg);
         match name {
@@ -210,6 +235,10 @@ fn options() -> Result<Options, Failure> {
             "--help" | "-h" | "help" => {
                 reject_inline(inline, name)?;
                 options.help = true;
+            }
+            "--ui" => {
+                reject_inline(inline, "--ui")?;
+                options.ui = true;
             }
             "--system" => {
                 reject_inline(inline, "--system")?;
@@ -342,6 +371,39 @@ fn reject_install_flags(options: &Options) -> Result<(), Failure> {
     }
 }
 
+/// `--ui` is the window. Registration and credential fields are chosen there.
+/// `--no-save` still applies to URIs passed on this launch.
+fn reject_ui_flags(options: &Options) -> Result<(), Failure> {
+    if options.json
+        || options.saw_scope
+        || options.haip
+        || options.format.is_some()
+        || options.issuer.is_some()
+        || options.document.is_some()
+        || options.document_file.is_some()
+    {
+        Err(fail(t("wallet.cli.ui_flags"), 1))
+    } else {
+        Ok(())
+    }
+}
+
+/// A desktop with no URI omits `%u`. An empty argument is that same launch.
+fn require_ui_arguments(options: &Options) -> Result<(), Failure> {
+    for argument in &options.positionals {
+        if argument.is_empty() {
+            continue;
+        }
+        if !argument.contains("://") {
+            return Err(fail(
+                t_args("wallet.cli.ui_argument", &[("argument", argument)]),
+                1,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn credential_command(options: &Options) -> Result<(), Failure> {
     reject_install_flags(options)?;
     match options.positionals.get(1).map(String::as_str) {
@@ -456,24 +518,22 @@ fn one_id(
     command(id, options.json)
 }
 
-fn install(options: &Options) -> Result<(), Failure> {
+fn install(options: &Options) -> Result<String, Failure> {
     let layout = layout(options)?;
     place_binary(&layout.binary_path)?;
     let schemes = schemes(options);
     let mut runner = SystemRunner;
     let report =
         install_handlers(&layout, schemes, &mut runner).map_err(|err| fail(err.to_string(), 1))?;
-    report_install(&report);
-    Ok(())
+    Ok(format_install(&report))
 }
 
-fn uninstall(options: &Options) -> Result<(), Failure> {
+fn uninstall(options: &Options) -> Result<String, Failure> {
     let layout = layout(options)?;
     let mut runner = SystemRunner;
     let warnings =
         uninstall_handlers(&layout, &mut runner).map_err(|err| fail(err.to_string(), 1))?;
-    println!(
-        "{}",
+    let mut lines = vec![
         t_args(
             "wallet.cli.removed",
             &[(
@@ -484,17 +544,16 @@ fn uninstall(options: &Options) -> Result<(), Failure> {
                     .display()
                     .to_string(),
             )],
-        )
-    );
-    println!(
-        "{}",
+        ),
         t_args(
             "wallet.cli.removed",
             &[("path", &layout.binary_path.display().to_string())],
-        )
-    );
-    print_warnings(&warnings);
-    Ok(())
+        ),
+    ];
+    for warning in &warnings {
+        lines.push(t_args("wallet.cli.warning", &[("warning", warning)]));
+    }
+    Ok(lines.join("\n"))
 }
 
 fn layout(options: &Options) -> Result<Layout, Failure> {
@@ -513,42 +572,45 @@ fn schemes(options: &Options) -> &'static [&'static str] {
     }
 }
 
-fn report_install(report: &InstallReport) {
-    println!(
-        "{}",
+fn format_install(report: &InstallReport) -> String {
+    let mut lines = vec![
         t_args(
             "wallet.cli.installed",
             &[("path", &report.binary.display().to_string())],
-        )
-    );
-    println!(
-        "{}",
+        ),
         t_args(
             "wallet.cli.desktop_file",
             &[("path", &report.desktop_file.display().to_string())],
-        )
-    );
-    println!(
-        "{}",
+        ),
+        t_args(
+            "wallet.cli.icon",
+            &[("path", &report.icon.display().to_string())],
+        ),
         t_args(
             "wallet.cli.registered",
             &[("count", &report.schemes.len().to_string())],
-        )
-    );
+        ),
+    ];
     for scheme in &report.schemes {
-        println!("  {scheme}://");
+        lines.push(format!("  {scheme}://"));
     }
-    print_warnings(&report.warnings);
+    for warning in &report.warnings {
+        lines.push(t_args("wallet.cli.warning", &[("warning", warning)]));
+    }
+    lines.join("\n")
 }
 
-fn print_warnings(warnings: &[String]) {
-    for warning in warnings {
-        let _ = writeln!(
-            io::stderr(),
-            "{}",
-            t_args("wallet.cli.warning", &[("warning", warning)])
-        );
+/// A desktop click opens a terminal for this process. The terminal closes
+/// when the process exits, so leave the help or the parsed request on screen
+/// until the user dismisses it. A shell that is already open is not a
+/// problem: one extra Enter returns to the prompt. A pipe is not asked.
+fn pause_if_interactive() {
+    if !io::stdin().is_terminal() {
+        return;
     }
+    println!("\n{}", t("wallet.cli.press_enter"));
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
 }
 
 fn place_binary(dest: &Path) -> Result<(), Failure> {
@@ -879,6 +941,8 @@ fn usage() -> String {
         String::new(),
         t("wallet.usage.language"),
         String::new(),
+        t("wallet.usage.ui"),
+        String::new(),
         t("wallet.usage.footer"),
     ]
     .join("\n")
@@ -910,5 +974,25 @@ mod tests {
         assert_eq!(installed_binary(Some(&missing), &current), current);
         assert_eq!(installed_binary(None, &current), current);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ui_flag_keeps_invocation_uris_and_no_save() {
+        let options = super::options_from([
+            "--ui".to_string(),
+            "--no-save".to_string(),
+            "siopv2://?client_id=abc".to_string(),
+        ])
+        .unwrap();
+        assert!(options.ui);
+        assert!(options.no_save);
+        assert_eq!(options.positionals, vec!["siopv2://?client_id=abc"]);
+    }
+
+    #[test]
+    fn ui_mode_rejects_a_command_name() {
+        let options = super::options_from(["--ui".to_string(), "install".to_string()]).unwrap();
+        let err = super::require_ui_arguments(&options).unwrap_err();
+        assert!(err.message.contains("install"));
     }
 }

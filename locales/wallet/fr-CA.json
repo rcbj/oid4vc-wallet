@@ -2,6 +2,15 @@
   "desktop.comment": "Accepter les offres de titres de compétences OpenID4VCI et les demandes OpenID4VP et SIOPv2",
   "desktop.generic_name": "Portefeuille de titres de compétences vérifiables",
   "desktop.name": "Portefeuille de titres de compétences OID4VC",
+  "ui.add": "Ajouter un titre de compétences",
+  "ui.confirm_delete": "Retirer le titre de compétences {id} ? La clé AES-256 reste dans GNOME Keyring ou KWallet.",
+  "ui.credentials": "Titres de compétences",
+  "ui.credentials_empty": "Aucun titre de compétences n'est enregistré.",
+  "ui.detail_empty": "Sélectionnez un titre de compétences pour le lire.",
+  "ui.need_path": "Indiquez le chemin d'un document de titre de compétences.",
+  "ui.registration_help": "Enregistrez ce programme pour que le bureau ouvre la fenêtre pour les offres de titres de compétences et les demandes de présentation.",
+  "ui.store": "Enregistrer le titre de compétences",
   "usage.intro": "Un portefeuille Linux pour les offres de titres de compétences OpenID4VCI\net les demandes de présentation OpenID4VP / SIOPv2. Les messages de protocole\nsont mis en œuvre dans ce programme. Il n'utilise pas de bibliothèque OpenID.",
-  "usage.title": "Portefeuille de titres de compétences OID4VC"
+  "usage.title": "Portefeuille de titres de compétences OID4VC",
+  "usage.ui": "  oid4vc-wallet --ui [URI]\n      Ouvre la fenêtre. Les titres de compétences, la boîte, les URI d'invocation,\n      la langue et l'enregistrement des protocoles s'y trouvent.\n      Un URI est analysé et enregistré. --no-save n'écrit pas la boîte."
 }

@@ -2,6 +2,10 @@
   "desktop.comment": "接受 OpenID4VCI 憑證要約以及 OpenID4VP 與 SIOPv2 請求的銀包",
   "desktop.generic_name": "可驗證憑證銀包",
   "desktop.name": "OID4VC 銀包",
+  "ui.install": "註冊此銀包",
+  "ui.language_help": "選擇此銀包的語言。這個選擇會儲存，供之後的執行使用。",
+  "ui.uri_help": "貼上 openid-credential-offer://、siopv2:// 或 openid4vp:// URI。銀包會解析它，並把原始 URI 存入收件匣。",
+  "usage.desktop": "桌面開啟此銀包的視窗，並傳入呼叫 URI。",
   "usage.intro": "用於 OpenID4VCI 憑證要約以及 OpenID4VP / SIOPv2 出示請求的 Linux 銀包。\n協定訊息在本程式中實作。它不使用 OpenID 程式庫。",
   "usage.title": "OID4VC 銀包"
 }

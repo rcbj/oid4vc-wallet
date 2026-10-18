@@ -18,6 +18,16 @@ use std::process::Command;
 /// Desktop file id. The file name is what `mimeapps.list` points at.
 pub const DESKTOP_FILE_NAME: &str = "org.rcbj.oid4vc-wallet.desktop";
 
+/// PNG copied into the icon theme and named from the desktop file.
+const ICON_PNG: &[u8] = include_bytes!("../../install/org.rcbj.oid4vc-wallet.png");
+
+/// `Icon=` value. GNOME Shell looks this up in the hicolor theme. An absolute
+/// path is drawn as the generic application icon.
+const ICON_NAME: &str = "org.rcbj.oid4vc-wallet";
+
+/// Sizes the shell and the dock ask for. 256 is the source image.
+const ICON_SIZES: &[u32] = &[48, 64, 72, 96, 128, 256];
+
 /// Schemes a normal install registers. `openid4vp` is included because that
 /// is the scheme iya-sts uses for a presentation request; `siopv2` is the
 /// scheme it uses for an ID Token alone.
@@ -37,6 +47,9 @@ pub struct Layout {
     pub applications_dir: PathBuf,
     pub binary_path: PathBuf,
     pub mimeapps_path: PathBuf,
+    /// `icons/hicolor`. The desktop file names [`ICON_NAME`]; the PNG is
+    /// written under each size in [`ICON_SIZES`].
+    pub icon_theme: PathBuf,
 }
 
 impl Layout {
@@ -48,6 +61,7 @@ impl Layout {
             applications_dir: crate::xdg::data_home()?.join("applications"),
             binary_path: home.join(".local/bin/oid4vc-wallet"),
             mimeapps_path: crate::xdg::config_home()?.join("mimeapps.list"),
+            icon_theme: crate::xdg::data_home()?.join("icons/hicolor"),
         })
     }
 
@@ -59,14 +73,23 @@ impl Layout {
             applications_dir: PathBuf::from("/usr/share/applications"),
             binary_path: PathBuf::from("/usr/local/bin/oid4vc-wallet"),
             mimeapps_path: PathBuf::from("/etc/xdg/mimeapps.list"),
+            icon_theme: PathBuf::from("/usr/share/icons/hicolor"),
         }
     }
+}
+
+fn icon_file(theme: &Path, size: u32) -> PathBuf {
+    theme
+        .join(format!("{size}x{size}"))
+        .join("apps")
+        .join(format!("{ICON_NAME}.png"))
 }
 
 /// What an install changed.
 pub struct InstallReport {
     pub desktop_file: PathBuf,
     pub binary: PathBuf,
+    pub icon: PathBuf,
     pub schemes: Vec<String>,
     /// `update-desktop-database` or `xdg-mime` could not be run. The files
     /// were still written, and those files are the registration.
@@ -140,16 +163,23 @@ pub fn install_handlers(
         })?;
     }
     let desktop_path = layout.applications_dir.join(DESKTOP_FILE_NAME);
+    write_theme_icons(&layout.icon_theme)?;
     write_new(&desktop_path, &desktop_entry(&layout.binary_path, schemes))?;
     let existing = read_optional(&layout.mimeapps_path)?;
     write_new(
         &layout.mimeapps_path,
         &set_scheme_handlers(&existing, DESKTOP_FILE_NAME, schemes),
     )?;
-    let warnings = refresh_desktop(runner, &layout.applications_dir, schemes);
+    let warnings = refresh_desktop(
+        runner,
+        &layout.applications_dir,
+        &layout.icon_theme,
+        schemes,
+    );
     Ok(InstallReport {
         desktop_file: desktop_path,
         binary: layout.binary_path.clone(),
+        icon: icon_file(&layout.icon_theme, 256),
         schemes: schemes.iter().map(|scheme| (*scheme).to_string()).collect(),
         warnings,
     })
@@ -172,11 +202,19 @@ pub fn uninstall_handlers(
     if layout.binary_path.exists() {
         remove_if_present(&layout.binary_path)?;
     }
-    Ok(refresh_desktop(runner, &layout.applications_dir, &[]))
+    for size in ICON_SIZES {
+        remove_if_present(&icon_file(&layout.icon_theme, *size))?;
+    }
+    Ok(refresh_desktop(
+        runner,
+        &layout.applications_dir,
+        &layout.icon_theme,
+        &[],
+    ))
 }
 
-/// The Desktop Entry text. `Exec` is the absolute path of the binary plus
-/// `%u`, the field code the session replaces with the URI.
+/// The Desktop Entry text. `Exec` runs this binary in window mode. `%u` is
+/// the field code the session replaces with the invocation URI.
 pub fn desktop_entry(binary: &Path, schemes: &[&str]) -> String {
     let mut mime = String::new();
     for scheme in schemes {
@@ -202,14 +240,54 @@ pub fn desktop_entry(binary: &Path, schemes: &[&str]) -> String {
          GenericName=Verifiable Credential Wallet\n\
          Comment=Accept OpenID4VCI credential offers and OpenID4VP and SIOPv2 requests\n\
          {localized}\
-         Exec={exec} %u\n\
-         Terminal=true\n\
+         Icon={ICON_NAME}\n\
+         Exec={exec} --ui %u\n\
+         Terminal=false\n\
+         StartupWMClass=oid4vc-wallet\n\
          Categories=Network;Security;\n\
          MimeType={mime}\n\
          StartupNotify=true\n\
          NoDisplay=false\n",
         exec = desktop_quote(binary),
     )
+}
+
+/// Write the launcher icon at each size the shell asks for.
+fn write_theme_icons(theme: &Path) -> Result<(), InstallError> {
+    let source = image::load_from_memory(ICON_PNG).map_err(|err| InstallError::Io {
+        path: icon_file(theme, 256),
+        source: io::Error::new(io::ErrorKind::InvalidData, err.to_string()),
+    })?;
+    for size in ICON_SIZES {
+        let path = icon_file(theme, *size);
+        let bytes = if *size == 256 {
+            ICON_PNG.to_vec()
+        } else {
+            let scaled = source.resize_exact(*size, *size, image::imageops::FilterType::CatmullRom);
+            let mut encoded = Vec::new();
+            scaled
+                .write_to(
+                    &mut std::io::Cursor::new(&mut encoded),
+                    image::ImageFormat::Png,
+                )
+                .map_err(|err| InstallError::Io {
+                    path: path.clone(),
+                    source: io::Error::new(io::ErrorKind::InvalidData, err.to_string()),
+                })?;
+            encoded
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| InstallError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::write(&path, bytes).map_err(|source| InstallError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 /// Quote a path the way the Desktop Entry spec quotes an `Exec` argument.
@@ -274,6 +352,7 @@ pub fn clear_scheme_handlers(existing: &str, desktop_name: &str, schemes: &[&str
 fn refresh_desktop(
     runner: &mut dyn CommandRunner,
     applications_dir: &Path,
+    icon_theme: &Path,
     schemes: &[&str],
 ) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -296,19 +375,58 @@ fn refresh_desktop(
             ));
         }
     }
+    // `-t` lets a per-user hicolor directory work when it has no index.theme.
+    // `-i` is a different switch: it omits the image data.
+    let mut cache_args = vec!["-f".to_string()];
+    if !icon_theme.join("index.theme").exists() {
+        cache_args.push("-t".to_string());
+    }
+    cache_args.push(icon_theme.to_string_lossy().into_owned());
+    if let Err(err) = runner.run("gtk-update-icon-cache", &cache_args) {
+        warnings.push(crate::i18n::t_args(
+            "wallet.linux.desktop_database",
+            &[("error", &err)],
+        ));
+    }
     warnings
 }
 
+/// Replace `path` by renaming a temporary file onto it, so a directory
+/// monitor sees a new file rather than a rewrite of the old one.
 fn write_new(path: &Path, contents: &str) -> Result<(), InstallError> {
-    let mut file = fs::File::create(path).map_err(|source| InstallError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.write_all(contents.as_bytes())
-        .map_err(|source| InstallError::Io {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| InstallError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let mut temporary_name = path.as_os_str().to_owned();
+    temporary_name.push(".tmp");
+    let temporary = PathBuf::from(temporary_name);
+    let write_result = (|| {
+        let mut file = fs::File::create(&temporary).map_err(|source| InstallError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+        file.write_all(contents.as_bytes())
+            .map_err(|source| InstallError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        file.sync_all().map_err(|source| InstallError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+        fs::rename(&temporary, path).map_err(|source| InstallError::Io {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 fn read_optional(path: &Path) -> Result<String, InstallError> {
@@ -564,11 +682,14 @@ mod tests {
             Path::new("/home/rcbj/.local/bin/oid4vc-wallet"),
             DEFAULT_SCHEMES,
         );
-        assert!(text.contains("Exec=/home/rcbj/.local/bin/oid4vc-wallet %u\n"));
+        assert!(text.contains("Icon=org.rcbj.oid4vc-wallet\n"));
+        assert!(text.contains("StartupWMClass=oid4vc-wallet\n"));
+        assert!(text.contains("StartupNotify=true\n"));
+        assert!(text.contains("Exec=/home/rcbj/.local/bin/oid4vc-wallet --ui %u\n"));
         assert!(text.contains(
             "MimeType=x-scheme-handler/openid-credential-offer;x-scheme-handler/siopv2;x-scheme-handler/openid4vp;\n"
         ));
-        assert!(text.contains("Terminal=true\n"));
+        assert!(text.contains("Terminal=false\n"));
         assert!(text.contains("Name=OID4VC Wallet\n"));
         assert!(
             text.contains("GenericName[fr_CA]=Portefeuille de titres de compétences vérifiables\n")
@@ -626,10 +747,17 @@ x-scheme-handler/siopv2=other.desktop;
             applications_dir: root.join("applications"),
             binary_path: PathBuf::from("/tmp/oid4vc-wallet"),
             mimeapps_path: root.join("config/mimeapps.list"),
+            icon_theme: root.join("icons/hicolor"),
         };
         let mut runner = Recorded { calls: Vec::new() };
         let report = install_handlers(&layout, DEFAULT_SCHEMES, &mut runner).unwrap();
         let desktop = fs::read_to_string(&report.desktop_file).unwrap();
+        assert!(desktop.contains("Icon=org.rcbj.oid4vc-wallet\n"));
+        let source_icon = icon_file(&layout.icon_theme, 256);
+        assert_eq!(fs::read(&source_icon).unwrap(), ICON_PNG);
+        let dock_icon = fs::read(icon_file(&layout.icon_theme, 72)).unwrap();
+        assert!(dock_icon.starts_with(b"\x89PNG"));
+        assert_ne!(dock_icon, ICON_PNG);
         assert!(desktop.contains("x-scheme-handler/openid-credential-offer;"));
         assert!(desktop.contains("x-scheme-handler/siopv2;"));
         let mimeapps = fs::read_to_string(&layout.mimeapps_path).unwrap();
@@ -641,6 +769,11 @@ x-scheme-handler/siopv2=other.desktop;
             .calls
             .iter()
             .any(|(program, _)| program == "update-desktop-database"));
+        assert!(runner.calls.iter().any(|(program, args)| {
+            program == "gtk-update-icon-cache"
+                && args.iter().any(|arg| arg == "-t")
+                && args.iter().all(|arg| arg != "-i")
+        }));
         assert!(runner.calls.iter().any(|(program, args)| {
             program == "xdg-mime"
                 && args.get(2).map(String::as_str) == Some("x-scheme-handler/siopv2")
