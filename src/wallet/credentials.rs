@@ -169,6 +169,17 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
         })
     }
 
+    /// Replace the document of one stored credential. The id, the issuer, the
+    /// format, the received time, and the holder key stay as they are.
+    pub fn replace_document(&self, id: &str, document: &str) -> Result<Credential, VaultError> {
+        require_id(id)?;
+        let document = require_document(document)?;
+        let mut credential = self.get(id)?;
+        credential.document = document;
+        self.write(&credential)?;
+        Ok(credential)
+    }
+
     /// Remove one credential file. The AES-256 key stays in the credential store.
     pub fn delete(&self, id: &str) -> Result<(), VaultError> {
         require_id(id)?;
@@ -428,7 +439,7 @@ fn require_issuer(issuer: &str) -> Result<String, VaultError> {
 
 /// RFC 9278 SHA-256 JWK Thumbprint URI. A self-issued credential's issuer is
 /// this, not an https URL.
-fn is_jwk_thumbprint_uri(issuer: &str) -> bool {
+pub(crate) fn is_jwk_thumbprint_uri(issuer: &str) -> bool {
     const PREFIX: &str = "urn:ietf:params:oauth:jwk-thumbprint:sha-256:";
     let Some(rest) = issuer.strip_prefix(PREFIX) else {
         return false;
@@ -600,6 +611,14 @@ mod tests {
         let listed = vault.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, stored.id);
+
+        let replaced = vault
+            .replace_document(&stored.id, "header.payload.sig~added~")
+            .unwrap();
+        assert_eq!(replaced.id, stored.id);
+        assert_eq!(replaced.issuer, stored.issuer);
+        assert_eq!(replaced.document, "header.payload.sig~added~");
+        assert_eq!(vault.get(&stored.id).unwrap().document, replaced.document);
 
         vault.delete(&stored.id).unwrap();
         assert!(vault.list().unwrap().is_empty());

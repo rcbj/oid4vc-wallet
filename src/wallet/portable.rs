@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(err, PortableError::Empty);
         assert_eq!(
             err.to_string(),
-            "Choose a credential, or export all of them."
+            "Check a credential, or export all of them."
         );
     }
 

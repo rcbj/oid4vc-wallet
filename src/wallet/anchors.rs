@@ -121,9 +121,7 @@ fn write_der(dir: &Path, der: &[u8]) -> Result<(), String> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     builder.mode(0o700);
-    builder
-        .create(dir)
-        .map_err(|err| io_err(&err))?;
+    builder.create(dir).map_err(|err| io_err(&err))?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|err| io_err(&err))?;
     let path = dir.join(format!("{}.der", b64::sha256_hex(&cert.spki_der)));
     let mut file = OpenOptions::new()
@@ -143,7 +141,9 @@ fn write_der(dir: &Path, der: &[u8]) -> Result<(), String> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256,
+    };
 
     use super::*;
 

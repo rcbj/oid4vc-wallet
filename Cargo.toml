@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
 description = "Linux native verifiable credential wallet for OpenID4VCI and OpenID4VP"
-license = "Apache-2.0"
+license = "BUSL-1.1"
 repository = "https://github.com/rcbj/oid4vc-wallet"
 readme = "README.md"
 publish = false
@@ -21,7 +21,8 @@ categories = ["command-line-utilities", "gui"]
 # bus. vendored builds the D-Bus client without a separate libdbus
 # development package.
 #
-# eframe draws the --ui window. image decodes the window icon. p256 signs the
+# eframe draws the --ui window. rfd opens the desktop file selector for
+# import and export. image decodes the window icon. p256 signs the
 # OpenID4VCI proof of possession. rustls is the TLS stack. The signature
 # crates (p256, p384, p521, k256, rsa, ed25519-dalek, ed448-goldilocks-plus,
 # fips204, fips205) and x509-parser check credential signatures and
@@ -44,6 +45,7 @@ p384 = "0.14.0"
 p521 = "0.14.0"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rsa = "0.9.10"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 sha2 = { version = "0.10", features = ["oid"] }

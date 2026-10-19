@@ -20,8 +20,11 @@ use oid4vc_wallet::linux::{
     DEFAULT_SCHEMES,
 };
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Json};
-use oid4vc_wallet::wallet::{accept, Credential, CredentialVault, Inbox, NewCredential};
+use oid4vc_wallet::wallet::{
+    accept, signature_algorithm, Credential, CredentialVault, Inbox, NewCredential,
+};
 
+mod browser;
 mod single;
 mod ui;
 
@@ -893,6 +896,12 @@ fn show_credential(id: &str, json: bool) -> Result<(), Failure> {
         println!(
             "{}",
             t_args("wallet.cli.issuer", &[("issuer", &credential.issuer)])
+        );
+        let algorithm = signature_algorithm(&credential.format, &credential.document)
+            .unwrap_or_else(|| t("wallet.cli.algorithm_unknown"));
+        println!(
+            "{}",
+            t_args("wallet.cli.algorithm", &[("algorithm", &algorithm)])
         );
         println!(
             "{}",

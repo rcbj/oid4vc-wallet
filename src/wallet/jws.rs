@@ -11,9 +11,14 @@
 //! R||S for ECDSA and the raw signature for EdDSA. Pure ML-DSA and SLH-DSA
 //! use an empty context.
 
+use sha2::{Digest, Sha256};
+
 use crate::protocol::Json;
 
 use super::b64;
+
+/// RFC 9278 prefix for an RFC 7638 SHA-256 JWK thumbprint.
+pub(crate) const JWK_THUMBPRINT_PREFIX: &str = "urn:ietf:params:oauth:jwk-thumbprint:sha-256:";
 
 /// The issuer JWS, which is the part of an SD-JWT before the first `~`.
 #[derive(Debug)]
@@ -110,6 +115,121 @@ pub(crate) fn supported(alg: &str) -> bool {
             | "ML-DSA-65-Ed25519"
             | "ML-DSA-87-Ed448"
     )
+}
+
+/// The issuer's signature algorithm, as the credential names it.
+///
+/// A JWT or SD-JWT names it with the JWS `alg` header of the issuer part,
+/// the segment before the first `~`. A Data Integrity document names it with
+/// `proof.cryptosuite`, or with `proof.type` when the suite is absent.
+/// Several proofs keep each distinct name, in order. `None` means the
+/// document does not name an algorithm. The signature is not checked.
+pub fn signature_algorithm(format: &str, document: &str) -> Option<String> {
+    let document = document.trim();
+    if document.is_empty() {
+        return None;
+    }
+    if document.starts_with('{') || is_data_integrity_format(format) {
+        return linked_data_algorithm(document);
+    }
+    jws_algorithm(document)
+}
+
+fn is_data_integrity_format(format: &str) -> bool {
+    let format = format.to_ascii_lowercase();
+    format.contains("ldp") || format.contains("json-ld") || format.contains("bbs")
+}
+
+/// DER certificates from the issuer JWS `x5c` header, leaf first.
+/// The signature is not checked. A document without `x5c` yields an empty list.
+pub(crate) fn header_x5c(document: &str) -> Vec<Vec<u8>> {
+    let Some(header) = jws_header(document) else {
+        return Vec::new();
+    };
+    let Some(entries) = header.get("x5c").and_then(Json::as_array) else {
+        return Vec::new();
+    };
+    let mut certificates = Vec::new();
+    for entry in entries {
+        let Some(text) = entry.as_str() else {
+            continue;
+        };
+        if let Some(der) = super::b64::b64_decode(text) {
+            certificates.push(der);
+        }
+    }
+    certificates
+}
+
+fn jws_header(document: &str) -> Option<Json> {
+    let document = document.trim();
+    if document.is_empty() || document.starts_with('{') {
+        return None;
+    }
+    let header = document.split('~').next()?.trim().split('.').next()?;
+    if header.is_empty() {
+        return None;
+    }
+    let header_bytes = super::b64::b64_decode(header)?;
+    let header_text = std::str::from_utf8(&header_bytes).ok()?;
+    Json::parse(header_text).ok()
+}
+
+fn jws_algorithm(document: &str) -> Option<String> {
+    let compact = document.trim().split('~').next()?.trim();
+    let mut parts = compact.split('.');
+    let header = parts.next()?;
+    let payload = parts.next()?;
+    let signature = parts.next()?;
+    if header.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    let header = jws_header(document)?;
+    let alg = header.get("alg").and_then(Json::as_str)?;
+    if alg.is_empty() {
+        None
+    } else {
+        Some(alg.to_string())
+    }
+}
+
+fn linked_data_algorithm(document: &str) -> Option<String> {
+    let value = Json::parse(document).ok()?;
+    let proof = value.get("proof")?;
+    let mut names = Vec::new();
+    match proof {
+        Json::Array(proofs) => {
+            for proof in proofs {
+                push_algorithm(proof, &mut names);
+            }
+        }
+        other => push_algorithm(other, &mut names),
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
+    }
+}
+
+fn push_algorithm(proof: &Json, names: &mut Vec<String>) {
+    let Some(name) = proof
+        .get("cryptosuite")
+        .and_then(Json::as_str)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            proof
+                .get("type")
+                .and_then(Json::as_str)
+                .filter(|name| !name.is_empty())
+        })
+    else {
+        return;
+    };
+    if names.iter().any(|existing| existing == name) {
+        return;
+    }
+    names.push(name.to_string());
 }
 
 /// The issuer compact JWS inside `document`.
@@ -217,6 +337,66 @@ pub(crate) fn key_from_jwk(jwk: &Json) -> Option<PublishedKey> {
         _ => return None,
     };
     Some(PublishedKey { kid, key })
+}
+
+/// RFC 7638 SHA-256 thumbprint URI of a public JWK.
+///
+/// Only the required members are hashed, in lexicographic order, with no
+/// whitespace. A private `d` is left out. `x`, `y`, `n`, and `e` are written
+/// as unpadded base64url, which is the form this wallet stores.
+pub(crate) fn jwk_thumbprint_uri(jwk: &Json) -> Option<String> {
+    let kty = jwk_token(jwk.get("kty")?.as_str()?)?;
+    let canonical = match kty {
+        "EC" => {
+            let crv = jwk_token(jwk.get("crv")?.as_str()?)?;
+            if !matches!(crv, "P-256" | "P-384" | "P-521" | "secp256k1") {
+                return None;
+            }
+            let x = canonical_b64(jwk.get("x")?.as_str()?)?;
+            let y = canonical_b64(jwk.get("y")?.as_str()?)?;
+            format!(r#"{{"crv":"{crv}","kty":"EC","x":"{x}","y":"{y}"}}"#)
+        }
+        "RSA" => {
+            let e = canonical_b64(jwk.get("e")?.as_str()?)?;
+            let n = canonical_b64(jwk.get("n")?.as_str()?)?;
+            format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#)
+        }
+        "OKP" => {
+            let crv = jwk_token(jwk.get("crv")?.as_str()?)?;
+            if !matches!(crv, "Ed25519" | "Ed448") {
+                return None;
+            }
+            let x = canonical_b64(jwk.get("x")?.as_str()?)?;
+            format!(r#"{{"crv":"{crv}","kty":"OKP","x":"{x}"}}"#)
+        }
+        _ => return None,
+    };
+    let digest = Sha256::digest(canonical.as_bytes());
+    Some(format!(
+        "{JWK_THUMBPRINT_PREFIX}{}",
+        b64::b64url_encode(&digest)
+    ))
+}
+
+/// A JWK member that is a short token, so it can sit inside the canonical
+/// JSON without further escaping.
+fn jwk_token(value: &str) -> Option<&str> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn canonical_b64(value: &str) -> Option<String> {
+    let bytes = b64::b64_decode(value)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(b64::b64url_encode(&bytes))
 }
 
 fn ec_jwk(jwk: &Json) -> Option<KeyMaterial> {
@@ -789,7 +969,57 @@ fn copy_integer(dest: &mut [u8], integer: &[u8]) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{open_issuer_jws, verifies, KeyMaterial, OpenError};
+    use super::{
+        jwk_thumbprint_uri, open_issuer_jws, signature_algorithm, verifies, KeyMaterial, OpenError,
+        JWK_THUMBPRINT_PREFIX,
+    };
+
+    fn compact(alg: &str, signature: &str) -> String {
+        let header = crate::wallet::b64::b64url_encode(format!(r#"{{"alg":"{alg}"}}"#).as_bytes());
+        let payload = crate::wallet::b64::b64url_encode(b"{}");
+        format!("{header}.{payload}.{signature}")
+    }
+
+    #[test]
+    fn the_issuer_algorithm_is_named_before_disclosures() {
+        let document = format!(
+            "{}~eyJhbGciOiJFUzM4NCJ9.e30.holder",
+            compact("ES256", "sig")
+        );
+        assert_eq!(
+            signature_algorithm("dc+sd-jwt", &document).as_deref(),
+            Some("ES256")
+        );
+        assert_eq!(
+            signature_algorithm("jwt_vc_json", &compact("HS256", "sig")).as_deref(),
+            Some("HS256")
+        );
+        assert_eq!(signature_algorithm("dc+sd-jwt", "not-a-credential"), None);
+        assert_eq!(signature_algorithm("dc+sd-jwt", ""), None);
+    }
+
+    #[test]
+    fn a_data_integrity_proof_names_its_cryptosuite() {
+        let one = r#"{"type":["VerifiableCredential"],"proof":{"type":"DataIntegrityProof","cryptosuite":"ecdsa-rdfc-2019"}}"#;
+        assert_eq!(
+            signature_algorithm("ldp_vc", one).as_deref(),
+            Some("ecdsa-rdfc-2019")
+        );
+        let typed = r#"{"proof":{"type":"Ed25519Signature2020"}}"#;
+        assert_eq!(
+            signature_algorithm("ldp_vc", typed).as_deref(),
+            Some("Ed25519Signature2020")
+        );
+        let several = r#"{"proof":[{"type":"DataIntegrityProof","cryptosuite":"ecdsa-rdfc-2019"},{"type":"DataIntegrityProof","cryptosuite":"eddsa-rdfc-2022"},{"cryptosuite":"ecdsa-rdfc-2019"}]}"#;
+        assert_eq!(
+            signature_algorithm("ldp_vc", several).as_deref(),
+            Some("ecdsa-rdfc-2019, eddsa-rdfc-2022")
+        );
+        assert_eq!(
+            signature_algorithm("ldp_vc", r#"{"type":"VerifiableCredential"}"#),
+            None
+        );
+    }
 
     fn es256_material(signing: &p256::ecdsa::SigningKey) -> KeyMaterial {
         let point = signing.verifying_key().to_encoded_point(false);
@@ -909,6 +1139,33 @@ mod tests {
         let last = signature.len() - 1;
         signature[last] ^= 0xff;
         assert!(!verifies("ML-DSA-44-ES256", &key, message, &signature));
+    }
+
+    #[test]
+    fn a_jwk_thumbprint_uses_the_required_members() {
+        // RFC 7638 section 3.1.
+        let rsa = crate::protocol::Json::parse(
+            r#"{"kty":"RSA","n":"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw","e":"AQAB"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            jwk_thumbprint_uri(&rsa).as_deref(),
+            Some("urn:ietf:params:oauth:jwk-thumbprint:sha-256:NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs")
+        );
+        let ordered = crate::protocol::Json::parse(
+            r#"{"y":"Ag","x":"AQ","use":"sig","kty":"EC","crv":"P-256","d":"Aw"}"#,
+        )
+        .unwrap();
+        let plain = crate::protocol::Json::parse(r#"{"crv":"P-256","kty":"EC","x":"AQ","y":"Ag"}"#)
+            .unwrap();
+        let thumb = jwk_thumbprint_uri(&ordered).unwrap();
+        assert_eq!(thumb, jwk_thumbprint_uri(&plain).unwrap());
+        assert!(thumb.starts_with(JWK_THUMBPRINT_PREFIX));
+        assert_eq!(thumb.len(), JWK_THUMBPRINT_PREFIX.len() + 43);
+        assert!(jwk_thumbprint_uri(
+            &crate::protocol::Json::parse(r#"{"kty":"oct","k":"YQ"}"#).unwrap()
+        )
+        .is_none());
     }
 
     #[test]

@@ -10,8 +10,10 @@
 //!
 //! An offer by reference is not fetched here. A request whose `response_type`
 //! contains `id_token` and not `vp_token` is answered with a self-issued ID
-//! Token (SIOPv2 section 11). `vp_token id_token` sends both, signed by the
-//! presented credential's holder key. `vp_token` alone is unchanged.
+//! Token (SIOPv2 section 11). The stored credential carries a self-signed
+//! certificate for that key in the JWS `x5c` header. `vp_token id_token`
+//! sends both, signed by the presented credential's holder key. `vp_token`
+//! alone is unchanged.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
@@ -47,6 +49,9 @@ pub struct Presented {
     pub message: String,
     /// `true` when a presentation was accepted by the response endpoint.
     pub ok: bool,
+    /// The verifier answered this request. A later launch must not post again:
+    /// a sign-in is spent by the first answer.
+    pub answered: bool,
 }
 
 fn refused(message: String) -> Box<Presented> {
@@ -61,6 +66,7 @@ impl Presented {
             redirect_uri: None,
             message,
             ok: false,
+            answered: false,
         }
     }
 }
@@ -95,74 +101,136 @@ pub fn present_same_device(uri: &str, credentials: &[Credential]) -> Presented {
     present_with(uri, credentials, &LiveHttp, now_secs())
 }
 
+/// What the window shows about the credential whose key would be used.
+#[derive(Clone)]
+pub struct PresentationSummary {
+    /// Stored credential id. Absent when approval would create a new key.
+    pub credential_id: Option<String>,
+    pub format: String,
+    pub issuer: String,
+    pub received_at: String,
+    /// The verifier's `client_id`.
+    pub verifier: String,
+    /// Approval creates a self-issued credential instead of using a stored one.
+    pub creates_key: bool,
+}
+
+/// A checked request that will use a holder key when it is approved.
+pub struct PendingPresentation {
+    pub summary: PresentationSummary,
+    ready: Ready,
+    action: PendingAction,
+}
+
+enum PendingAction {
+    Present {
+        credential_id: String,
+        query_id: String,
+    },
+    SiopExisting {
+        credential_id: String,
+    },
+    SiopNew,
+}
+
+/// A presentation that finished without waiting, or one that still needs approval.
+pub enum Presentation {
+    Finished(Presented),
+    NeedsApproval(Box<PendingPresentation>),
+}
+
+/// Fetch and check the request. When a holder key would be used and its
+/// credential id is not in `approved`, return [`Presentation::NeedsApproval`]
+/// without signing or posting. A new self-issued key always waits.
+pub fn prepare_presentation(
+    uri: &str,
+    credentials: &[Credential],
+    approved: &[String],
+) -> Presentation {
+    stage(uri, credentials, &LiveHttp, now_secs(), Some(approved))
+}
+
+/// Sign and post a presentation the person approved.
+pub fn approve_presentation(pending: PendingPresentation, credentials: &[Credential]) -> Presented {
+    approve_with(pending, credentials, &LiveHttp, now_secs())
+}
+
+/// Tell the verifier the presentation was declined. The holder key is not used.
+pub fn refuse_presentation(pending: PendingPresentation) -> Presented {
+    refuse_with(pending, &LiveHttp)
+}
+
 fn present_with<T: Transport>(
     uri: &str,
     credentials: &[Credential],
     http: &T,
     now: u64,
 ) -> Presented {
+    match stage(uri, credentials, http, now, None) {
+        Presentation::Finished(done) => done,
+        Presentation::NeedsApproval(pending) => approve_with(*pending, credentials, http, now),
+    }
+}
+
+fn stage<T: Transport>(
+    uri: &str,
+    credentials: &[Credential],
+    http: &T,
+    now: u64,
+    approved: Option<&[String]>,
+) -> Presentation {
     let Some(request) = invocation_request(uri) else {
-        return Presented::bare(t("wallet.present.unverified"));
+        return finished(Presented::bare(t("wallet.present.unverified")));
     };
     let fetched = match fetch_jwt(http, &request) {
         Ok(fetched) => fetched,
-        Err(done) => return *done,
+        Err(done) => return finished(*done),
     };
     let ready = match authorize(http, &request, &fetched, now) {
         Ok(ready) => ready,
-        Err(done) => return *done,
+        Err(done) => return finished(*done),
     };
     if !ready.can_respond {
-        return Presented::bare(t("wallet.present.unsupported"));
+        return finished(Presented::bare(t("wallet.present.unsupported")));
     }
     if ready.wants_id && !ready.wants_vp {
-        return answer_self_issued(http, &ready, credentials, now);
+        return stage_self_issued(http, ready, credentials, now, approved);
     }
     if !ready.wants_vp {
-        return respond(http, &ready, None, None, None, None, Answer::Unsupported);
+        return finished(respond(
+            http,
+            &ready,
+            None,
+            None,
+            None,
+            None,
+            Answer::Unsupported,
+        ));
     }
     let verifier_host = host_of(&ready.response_uri);
     match choose(&ready.dcql, credentials, verifier_host.as_deref()) {
         Some(choice) if choice.presentable => {
             let credential = &credentials[choice.index];
-            let id_token = if ready.wants_id {
-                id_token_for(credential, &ready, now)
-            } else {
-                None
-            };
-            if ready.wants_id && id_token.is_none() {
-                return respond(
-                    http,
-                    &ready,
-                    Some(credential.id.clone()),
-                    None,
-                    None,
-                    None,
-                    Answer::Cannot,
-                );
+            if asks(approved, Some(&credential.id)) {
+                let summary = summary_of(credential, &ready.client_id, false);
+                return Presentation::NeedsApproval(Box::new(PendingPresentation {
+                    summary,
+                    action: PendingAction::Present {
+                        credential_id: credential.id.clone(),
+                        query_id: choice.query_id,
+                    },
+                    ready,
+                }));
             }
-            match presentation_for(credential, &choice.query_id, &ready, now) {
-                Some(vp) => respond(
-                    http,
-                    &ready,
-                    Some(credential.id.clone()),
-                    Some(vp),
-                    id_token,
-                    None,
-                    Answer::Sent,
-                ),
-                None => respond(
-                    http,
-                    &ready,
-                    Some(credential.id.clone()),
-                    None,
-                    None,
-                    None,
-                    Answer::Cannot,
-                ),
-            }
+            finished(send_presentation(
+                http,
+                &ready,
+                credential,
+                &choice.query_id,
+                now,
+            ))
         }
-        Some(choice) => respond(
+        Some(choice) => finished(respond(
             http,
             &ready,
             Some(credentials[choice.index].id.clone()),
@@ -170,9 +238,228 @@ fn present_with<T: Transport>(
             None,
             None,
             Answer::Cannot,
-        ),
-        None => respond(http, &ready, None, None, None, None, Answer::Declined),
+        )),
+        None => finished(respond(
+            http,
+            &ready,
+            None,
+            None,
+            None,
+            None,
+            Answer::Declined,
+        )),
     }
+}
+
+fn stage_self_issued<T: Transport>(
+    http: &T,
+    ready: Ready,
+    credentials: &[Credential],
+    now: u64,
+    approved: Option<&[String]>,
+) -> Presentation {
+    if let Some(index) = newest_self_issued(credentials) {
+        let credential = &credentials[index];
+        if asks(approved, Some(&credential.id)) {
+            let summary = summary_of(credential, &ready.client_id, false);
+            return Presentation::NeedsApproval(Box::new(PendingPresentation {
+                summary,
+                action: PendingAction::SiopExisting {
+                    credential_id: credential.id.clone(),
+                },
+                ready,
+            }));
+        }
+        return finished(send_existing_id_token(http, &ready, credential, now));
+    }
+    if asks(approved, None) {
+        return Presentation::NeedsApproval(Box::new(PendingPresentation {
+            summary: PresentationSummary {
+                credential_id: None,
+                format: "dc+sd-jwt".to_string(),
+                issuer: String::new(),
+                received_at: String::new(),
+                verifier: ready.client_id.clone(),
+                creates_key: true,
+            },
+            action: PendingAction::SiopNew,
+            ready,
+        }));
+    }
+    finished(send_new_id_token(http, &ready, now))
+}
+
+fn approve_with<T: Transport>(
+    pending: PendingPresentation,
+    credentials: &[Credential],
+    http: &T,
+    now: u64,
+) -> Presented {
+    let PendingPresentation {
+        summary: _,
+        ready,
+        action,
+    } = pending;
+    match action {
+        PendingAction::Present {
+            credential_id,
+            query_id,
+        } => {
+            let Some(credential) = credentials
+                .iter()
+                .find(|credential| credential.id == credential_id)
+            else {
+                return respond(
+                    http,
+                    &ready,
+                    Some(credential_id),
+                    None,
+                    None,
+                    None,
+                    Answer::Cannot,
+                );
+            };
+            send_presentation(http, &ready, credential, &query_id, now)
+        }
+        PendingAction::SiopExisting { credential_id } => {
+            let Some(credential) = credentials
+                .iter()
+                .find(|credential| credential.id == credential_id)
+            else {
+                return respond(
+                    http,
+                    &ready,
+                    Some(credential_id),
+                    None,
+                    None,
+                    None,
+                    Answer::Cannot,
+                );
+            };
+            send_existing_id_token(http, &ready, credential, now)
+        }
+        PendingAction::SiopNew => send_new_id_token(http, &ready, now),
+    }
+}
+
+fn refuse_with<T: Transport>(pending: PendingPresentation, http: &T) -> Presented {
+    let id = pending.summary.credential_id.clone();
+    respond(http, &pending.ready, id, None, None, None, Answer::Refused)
+}
+
+/// `approved` is `None` when the caller already decided to use the key.
+/// A missing id means a new key, which always waits when approval is required.
+fn asks(approved: Option<&[String]>, id: Option<&str>) -> bool {
+    let Some(approved) = approved else {
+        return false;
+    };
+    match id {
+        Some(id) => !approved.iter().any(|saved| saved == id),
+        None => true,
+    }
+}
+
+fn summary_of(credential: &Credential, verifier: &str, creates_key: bool) -> PresentationSummary {
+    PresentationSummary {
+        credential_id: Some(credential.id.clone()),
+        format: credential.format.clone(),
+        issuer: credential.issuer.clone(),
+        received_at: credential.received_at.clone(),
+        verifier: verifier.to_string(),
+        creates_key,
+    }
+}
+
+fn finished(done: Presented) -> Presentation {
+    Presentation::Finished(done)
+}
+
+fn send_presentation<T: Transport>(
+    http: &T,
+    ready: &Ready,
+    credential: &Credential,
+    query_id: &str,
+    now: u64,
+) -> Presented {
+    let id_token = if ready.wants_id {
+        id_token_for(credential, ready, now)
+    } else {
+        None
+    };
+    if ready.wants_id && id_token.is_none() {
+        return respond(
+            http,
+            ready,
+            Some(credential.id.clone()),
+            None,
+            None,
+            None,
+            Answer::Cannot,
+        );
+    }
+    match presentation_for(credential, query_id, ready, now) {
+        Some(vp) => respond(
+            http,
+            ready,
+            Some(credential.id.clone()),
+            Some(vp),
+            id_token,
+            None,
+            Answer::Sent,
+        ),
+        None => respond(
+            http,
+            ready,
+            Some(credential.id.clone()),
+            None,
+            None,
+            None,
+            Answer::Cannot,
+        ),
+    }
+}
+
+fn send_existing_id_token<T: Transport>(
+    http: &T,
+    ready: &Ready,
+    credential: &Credential,
+    now: u64,
+) -> Presented {
+    let Some(id_token) = id_token_for(credential, ready, now) else {
+        return respond(
+            http,
+            ready,
+            Some(credential.id.clone()),
+            None,
+            None,
+            None,
+            Answer::Cannot,
+        );
+    };
+    respond(
+        http,
+        ready,
+        Some(credential.id.clone()),
+        None,
+        Some(id_token),
+        None,
+        Answer::SiopSent,
+    )
+}
+
+fn send_new_id_token<T: Transport>(http: &T, ready: &Ready, now: u64) -> Presented {
+    let Some(minted) = mint_self_issued(ready, now) else {
+        return Presented::bare(t("wallet.present.unsupported"));
+    };
+    respond(
+        http,
+        ready,
+        None,
+        None,
+        Some(minted.id_token),
+        Some(minted.store),
+        Answer::SiopCreated,
+    )
 }
 
 fn invocation_request(uri: &str) -> Option<AuthorizationRequest> {
@@ -901,51 +1188,6 @@ fn presentation_for(
     })
 }
 
-const THUMBPRINT_PREFIX: &str = "urn:ietf:params:oauth:jwk-thumbprint:sha-256:";
-
-fn answer_self_issued<T: Transport>(
-    http: &T,
-    ready: &Ready,
-    credentials: &[Credential],
-    now: u64,
-) -> Presented {
-    if let Some(index) = newest_self_issued(credentials) {
-        let credential = &credentials[index];
-        let Some(id_token) = id_token_for(credential, ready, now) else {
-            return respond(
-                http,
-                ready,
-                Some(credential.id.clone()),
-                None,
-                None,
-                None,
-                Answer::Cannot,
-            );
-        };
-        return respond(
-            http,
-            ready,
-            Some(credential.id.clone()),
-            None,
-            Some(id_token),
-            None,
-            Answer::SiopSent,
-        );
-    }
-    let Some(minted) = mint_self_issued(ready, now) else {
-        return Presented::bare(t("wallet.present.unsupported"));
-    };
-    respond(
-        http,
-        ready,
-        None,
-        None,
-        Some(minted.id_token),
-        Some(minted.store),
-        Answer::SiopCreated,
-    )
-}
-
 /// The newest stored credential whose holder key is P-256 and whose SD-JWT
 /// `iss` and `sub` are that key's RFC 7638 thumbprint URI.
 fn newest_self_issued(credentials: &[Credential]) -> Option<usize> {
@@ -971,7 +1213,7 @@ fn self_issued_subject(credential: &Credential) -> Option<String> {
     let holder = Json::parse(credential.holder_key.as_deref()?).ok()?;
     let signing = holder_signing(&holder)?;
     let (x, y) = encoded_xy(&signing)?;
-    let subject = thumbprint_uri(&x, &y);
+    let subject = thumbprint_uri(&x, &y)?;
     let parsed = sd_jwt(credential)?;
     let iss = parsed.payload.get("iss").and_then(Json::as_str)?;
     let sub = parsed.payload.get("sub").and_then(Json::as_str)?;
@@ -982,11 +1224,8 @@ fn self_issued_subject(credential: &Credential) -> Option<String> {
     }
 }
 
-fn thumbprint_uri(x: &str, y: &str) -> String {
-    // RFC 7638: required members, lexicographic order, no whitespace.
-    let canonical = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
-    let digest = Sha256::digest(canonical.as_bytes());
-    format!("{THUMBPRINT_PREFIX}{}", b64::b64url_encode(&digest))
+fn thumbprint_uri(x: &str, y: &str) -> Option<String> {
+    jws::jwk_thumbprint_uri(&public_jwk(x, y))
 }
 
 fn public_jwk(x: &str, y: &str) -> Json {
@@ -1042,7 +1281,7 @@ fn id_token_for(credential: &Credential, ready: &Ready, now: u64) -> Option<Stri
 
 fn id_token_from(signing: &SigningKey, ready: &Ready, now: u64) -> Option<String> {
     let (x, y) = encoded_xy(signing)?;
-    let subject = thumbprint_uri(&x, &y);
+    let subject = thumbprint_uri(&x, &y)?;
     let header = object(&[
         ("alg", Json::String("ES256".to_string())),
         ("typ", Json::String("JWT".to_string())),
@@ -1067,10 +1306,16 @@ struct Minted {
 fn mint_self_issued(ready: &Ready, now: u64) -> Option<Minted> {
     let signing = SigningKey::random(&mut OsRng);
     let (x, y) = encoded_xy(&signing)?;
-    let subject = thumbprint_uri(&x, &y);
+    let subject = thumbprint_uri(&x, &y)?;
+    let not_before = i64::try_from(now).unwrap_or(0);
+    let certificate = certs::self_signed_p256(&signing, &subject, not_before)?;
     let header = object(&[
         ("alg", Json::String("ES256".to_string())),
         ("typ", Json::String("dc+sd-jwt".to_string())),
+        (
+            "x5c",
+            Json::Array(vec![Json::String(b64::b64_encode(&certificate))]),
+        ),
     ]);
     let payload = object(&[
         ("iss", Json::String(subject.clone())),
@@ -1096,9 +1341,88 @@ fn mint_self_issued(ready: &Ready, now: u64) -> Option<Minted> {
     })
 }
 
+/// Put a self-signed signer certificate on a self-issued credential that
+/// does not have one. The payload is left as it was. The holder key has to
+/// be the issuer key, and the signature that is already there has to verify.
+/// A credential that already has `x5c`, or that this key did not issue,
+/// is left alone.
+pub fn ensure_self_issued_certificate(document: &str, holder_key: &str) -> Option<String> {
+    let holder = Json::parse(holder_key).ok()?;
+    let signing = holder_signing(&holder)?;
+    let (x, y) = encoded_xy(&signing)?;
+    let subject = thumbprint_uri(&x, &y)?;
+    let (compact, tail) = match document.split_once('~') {
+        Some((compact, tail)) => (compact, Some(tail)),
+        None => (document, None),
+    };
+    let mut parts = compact.split('.');
+    let header_b64 = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let signature_b64 = parts.next()?;
+    if parts.next().is_some()
+        || header_b64.is_empty()
+        || payload_b64.is_empty()
+        || signature_b64.is_empty()
+    {
+        return None;
+    }
+    let header_bytes = b64::b64_decode(header_b64)?;
+    let header = Json::parse(std::str::from_utf8(&header_bytes).ok()?).ok()?;
+    if header
+        .get("x5c")
+        .and_then(Json::as_array)
+        .is_some_and(|entries| !entries.is_empty())
+    {
+        return None;
+    }
+    if header.get("alg").and_then(Json::as_str) != Some("ES256") {
+        return None;
+    }
+    let payload = b64::b64_decode(payload_b64)?;
+    let payload_json = Json::parse(std::str::from_utf8(&payload).ok()?).ok()?;
+    if payload_json.get("iss").and_then(Json::as_str) != Some(subject.as_str()) {
+        return None;
+    }
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature = b64::b64_decode(signature_b64)?;
+    let key = jws::key_from_jwk(&public_jwk(&x, &y))?;
+    if !jws::verifies("ES256", &key.key, signing_input.as_bytes(), &signature) {
+        return None;
+    }
+    let not_before = payload_json
+        .get("iat")
+        .and_then(Json::as_u64)
+        .and_then(|iat| i64::try_from(iat).ok())
+        .unwrap_or(0);
+    let certificate = certs::self_signed_p256(&signing, &subject, not_before)?;
+    let mut members = vec![
+        ("alg", Json::String("ES256".to_string())),
+        (
+            "x5c",
+            Json::Array(vec![Json::String(b64::b64_encode(&certificate))]),
+        ),
+    ];
+    if let Some(typ) = header.get("typ").and_then(Json::as_str) {
+        members.insert(1, ("typ", Json::String(typ.to_string())));
+    }
+    let header_b64 = b64::b64url_encode(object(&members).to_string().as_bytes());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature: p256::ecdsa::Signature = signing.sign(signing_input.as_bytes());
+    let mut updated = format!(
+        "{signing_input}.{}",
+        b64::b64url_encode(signature.to_bytes().as_slice())
+    );
+    if let Some(tail) = tail {
+        updated.push('~');
+        updated.push_str(tail);
+    }
+    Some(updated)
+}
+
 enum Answer {
     Sent,
     Declined,
+    Refused,
     Cannot,
     Unsupported,
     SiopCreated,
@@ -1122,17 +1446,35 @@ fn respond<T: Transport>(
 ) -> Presented {
     let page = match post_response(http, ready, vp.as_ref(), id_token.as_deref()) {
         Ok(page) => page,
-        Err(message) => {
+        Err(PostError::Answered(message)) => {
             return Presented {
                 credential_id,
                 store,
                 redirect_uri: None,
                 message,
                 ok: false,
+                answered: true,
+            }
+        }
+        Err(PostError::Unsent(message)) => {
+            return Presented {
+                credential_id,
+                store,
+                redirect_uri: None,
+                message,
+                ok: false,
+                answered: false,
             }
         }
     };
     narrate(answer, credential_id, page, store)
+}
+
+enum PostError {
+    /// The verifier returned an HTTP status. The sign-in is spent.
+    Answered(String),
+    /// Nothing was delivered. A later launch may try again.
+    Unsent(String),
 }
 
 fn post_response<T: Transport>(
@@ -1140,18 +1482,18 @@ fn post_response<T: Transport>(
     ready: &Ready,
     vp: Option<&Vp>,
     id_token: Option<&str>,
-) -> Result<Page, String> {
+) -> Result<Page, PostError> {
     let response = if ready.jwt_response {
         let recipient = ready
             .recipient
             .as_ref()
-            .ok_or_else(|| t("wallet.present.unsupported"))?;
+            .ok_or_else(|| PostError::Unsent(t("wallet.present.unsupported")))?;
         if ready.enc != "A256GCM" && ready.enc != "A128GCM" {
-            return Err(t("wallet.present.unsupported"));
+            return Err(PostError::Unsent(t("wallet.present.unsupported")));
         }
         let plaintext = response_json(ready, vp, id_token).to_string();
         let compact = encrypt_ecdh_es(plaintext.as_bytes(), recipient, &ready.enc)
-            .ok_or_else(|| t("wallet.present.unsupported"))?;
+            .ok_or_else(|| PostError::Unsent(t("wallet.present.unsupported")))?;
         post_form(http, &ready.response_uri, &[("response", compact.as_str())])?
     } else {
         let vp_body = vp.map(|one| vp_token_json(one).to_string());
@@ -1170,10 +1512,10 @@ fn post_response<T: Transport>(
     };
     if response.status != 200 {
         let status = response.status.to_string();
-        return Err(t_args(
+        return Err(PostError::Answered(t_args(
             "wallet.present.http",
             &[("url", ready.response_uri.as_str()), ("status", &status)],
-        ));
+        )));
     }
     Ok(page_from(&response.body, &ready.response_uri))
 }
@@ -1207,7 +1549,7 @@ fn post_form<T: Transport>(
     http: &T,
     url: &str,
     fields: &[(&str, &str)],
-) -> Result<RawResponse, String> {
+) -> Result<RawResponse, PostError> {
     let mut body = String::new();
     for (index, (name, value)) in fields.iter().enumerate() {
         if index > 0 {
@@ -1223,7 +1565,12 @@ fn post_form<T: Transport>(
         Some("application/x-www-form-urlencoded"),
         body.as_bytes(),
     )
-    .map_err(|err| t_args("wallet.redeem.http", &[("url", url), ("error", &err)]))
+    .map_err(|err| {
+        PostError::Unsent(t_args(
+            "wallet.redeem.http",
+            &[("url", url), ("error", &err)],
+        ))
+    })
 }
 
 fn page_from(body: &[u8], response_uri: &str) -> Page {
@@ -1263,6 +1610,8 @@ fn narrate(
         (Answer::Sent, Page::Nowhere) => t_args("wallet.present.ok_no_page", &[("id", id)]),
         (Answer::Declined, Page::Open(_)) => t("wallet.present.declined"),
         (Answer::Declined, _) => t("wallet.present.declined_no_page"),
+        (Answer::Refused, Page::Open(_)) => t("wallet.present.refused"),
+        (Answer::Refused, _) => t("wallet.present.refused_no_page"),
         (Answer::Cannot, Page::Open(_)) => t("wallet.present.cannot"),
         (Answer::Cannot, _) => t("wallet.present.cannot_no_page"),
         (Answer::Unsupported, _) => t("wallet.present.unsupported"),
@@ -1286,6 +1635,7 @@ fn narrate(
             answer,
             Answer::Sent | Answer::SiopCreated | Answer::SiopSent
         ),
+        answered: true,
     }
 }
 
@@ -2080,7 +2430,7 @@ mod tests {
         assert_eq!(jwk.keys(), vec!["kty", "crv", "x", "y"]);
         let x = jwk.get("x").and_then(Json::as_str).unwrap();
         let y = jwk.get("y").and_then(Json::as_str).unwrap();
-        let subject = thumbprint_uri(x, y);
+        let subject = thumbprint_uri(x, y).unwrap();
         assert_eq!(
             payload.get("iss").and_then(Json::as_str),
             Some(subject.as_str())
@@ -2123,6 +2473,27 @@ mod tests {
         assert!(payload.get("iat").and_then(Json::as_u64).is_some());
         let jwk = payload.get("cnf").and_then(|cnf| cnf.get("jwk")).unwrap();
         assert!(jwk.get("d").is_none());
+        let header = part_json(issuer, 0);
+        let x5c = header.get("x5c").and_then(Json::as_array).unwrap();
+        assert_eq!(x5c.len(), 1);
+        let shown = certs::signer_certificates(document);
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].title.contains("Self-issued"));
+        assert!(shown[0]
+            .fields
+            .iter()
+            .any(|(_, value)| value.contains(subject)));
+        let issuer_name = shown[0]
+            .fields
+            .iter()
+            .find(|(name, _)| name == "Issuer")
+            .map(|(_, value)| value.as_str());
+        let subject_name = shown[0]
+            .fields
+            .iter()
+            .find(|(name, _)| name == "Subject")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(issuer_name, subject_name);
         let holder = holder_signing(&Json::parse(holder_jwk).unwrap()).unwrap();
         let (left, signature) = issuer.rsplit_once('.').unwrap();
         let signature =
@@ -2159,7 +2530,7 @@ mod tests {
         assert!(outcome.message.contains("Created a self-issued credential"));
         let stored = outcome.store.expect("a new credential is returned");
         assert_eq!(stored.format, "dc+sd-jwt");
-        assert!(stored.issuer.starts_with(THUMBPRINT_PREFIX));
+        assert!(stored.issuer.starts_with(jws::JWK_THUMBPRINT_PREFIX));
         assert!(outcome.message.contains(&stored.issuer));
         let holder = stored.holder_key.clone().expect("holder key");
         check_self_issued_document(&stored.document, &stored.issuer, &holder);
@@ -2172,6 +2543,56 @@ mod tests {
         assert_eq!(id_subject(token), stored.issuer);
         assert!(!plain.to_string().contains("\"d\""));
         assert_post_hides_key(&posted_body(&fixture), &holder);
+    }
+
+    #[test]
+    fn an_older_self_issued_credential_gains_a_signer_certificate() {
+        let signing = SigningKey::random(&mut OsRng);
+        let (x, y) = encoded_xy(&signing).unwrap();
+        let subject = thumbprint_uri(&x, &y).unwrap();
+        let header = object(&[
+            ("alg", Json::String("ES256".to_string())),
+            ("typ", Json::String("dc+sd-jwt".to_string())),
+        ]);
+        let payload = object(&[
+            ("iss", Json::String(subject.clone())),
+            ("sub", Json::String(subject.clone())),
+            ("cnf", object(&[("jwk", public_jwk(&x, &y))])),
+            ("iat", Json::Number("1700000000".to_string())),
+        ]);
+        let old = format!("{}~disclosure~", sign_compact(&signing, &header, &payload));
+        assert!(certs::signer_certificates(&old).is_empty());
+        let holder = private_jwk(&signing).unwrap();
+        let updated = ensure_self_issued_certificate(&old, &holder).unwrap();
+        let old_payload = old.split('.').nth(1).unwrap();
+        let new_payload = updated.split('.').nth(1).unwrap();
+        assert_eq!(old_payload, new_payload);
+        assert!(updated.ends_with("~disclosure~"));
+        let shown = certs::signer_certificates(&updated);
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].title.contains("Self-issued"));
+        assert!(shown[0]
+            .fields
+            .iter()
+            .any(|(_, value)| value.contains(&subject)));
+        assert!(ensure_self_issued_certificate(&updated, &holder).is_none());
+
+        let mut broken = old.clone();
+        let at = broken.rfind('.').unwrap() + 1;
+        let next = if broken.as_bytes()[at] == b'A' {
+            "B"
+        } else {
+            "A"
+        };
+        broken.replace_range(at..at + 1, next);
+        assert!(ensure_self_issued_certificate(&broken, &holder).is_none());
+
+        let foreign_payload = object(&[
+            ("iss", Json::String("https://issuer.example".to_string())),
+            ("sub", Json::String(subject)),
+        ]);
+        let foreign = sign_compact(&signing, &header, &foreign_payload);
+        assert!(ensure_self_issued_certificate(&foreign, &holder).is_none());
     }
 
     #[test]
@@ -2361,5 +2782,141 @@ mod tests {
         }
         out.extend_from_slice(body);
         out
+    }
+
+    #[test]
+    fn a_presentation_waits_until_the_key_is_approved() {
+        let now = now_secs();
+        let fixture = fixture("direct_post.jwt", true);
+        let step = stage(
+            &fixture.uri,
+            std::slice::from_ref(&fixture.same),
+            &fixture.script,
+            now,
+            Some(&[]),
+        );
+        assert!(fixture.script.posts.lock().expect("posts").is_empty());
+        let Presentation::NeedsApproval(pending) = step else {
+            panic!("the key was used before approval");
+        };
+        assert_eq!(pending.summary.credential_id.as_deref(), Some("cred-same"));
+        assert_eq!(pending.summary.format, "dc+sd-jwt");
+        assert_eq!(pending.summary.issuer, "https://verifier.example");
+        assert_eq!(pending.summary.received_at, "20261018T120000.000Z");
+        assert_eq!(pending.summary.verifier, fixture.client_id);
+        assert!(!pending.summary.creates_key);
+        let outcome = approve_with(
+            *pending,
+            std::slice::from_ref(&fixture.same),
+            &fixture.script,
+            now,
+        );
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(outcome.credential_id.as_deref(), Some("cred-same"));
+        let plain = posted_plain(&fixture);
+        assert!(plain.get("vp_token").is_some());
+        assert!(plain.get("error").is_none());
+        let body = posted_body(&fixture);
+        assert!(!body.contains(&fixture.holder_secret));
+    }
+
+    #[test]
+    fn refusing_a_presentation_does_not_use_the_key() {
+        let now = now_secs();
+        let fixture = fixture("direct_post", true);
+        let step = stage(
+            &fixture.uri,
+            std::slice::from_ref(&fixture.same),
+            &fixture.script,
+            now,
+            Some(&[]),
+        );
+        let Presentation::NeedsApproval(pending) = step else {
+            panic!("the key was used before approval");
+        };
+        let outcome = refuse_with(*pending, &fixture.script);
+        assert!(!outcome.ok);
+        assert!(outcome.message.contains("declined to present"));
+        let body = posted_body(&fixture);
+        assert_eq!(form_value(&body, "error"), "access_denied");
+        assert!(!body.contains("vp_token="));
+        assert!(!body.contains(&fixture.holder_secret));
+    }
+
+    #[test]
+    fn an_approved_credential_is_sent_without_asking() {
+        let now = now_secs();
+        let fixture = fixture("direct_post.jwt", true);
+        let other = vec!["cred-other".to_string()];
+        let waiting = stage(
+            &fixture.uri,
+            std::slice::from_ref(&fixture.same),
+            &fixture.script,
+            now,
+            Some(&other),
+        );
+        assert!(matches!(waiting, Presentation::NeedsApproval(_)));
+        assert!(fixture.script.posts.lock().expect("posts").is_empty());
+        let approved = vec!["cred-same".to_string()];
+        let step = stage(
+            &fixture.uri,
+            std::slice::from_ref(&fixture.same),
+            &fixture.script,
+            now,
+            Some(&approved),
+        );
+        let Presentation::Finished(outcome) = step else {
+            panic!("an approved credential waited");
+        };
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(fixture.script.posts.lock().expect("posts").len(), 1);
+    }
+
+    #[test]
+    fn a_new_self_issued_key_waits_for_approval() {
+        let now = now_secs();
+        let fixture = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+        let step = stage(&fixture.uri, &[], &fixture.script, now, Some(&[]));
+        assert!(fixture.script.posts.lock().expect("posts").is_empty());
+        let Presentation::NeedsApproval(pending) = step else {
+            panic!("a new key was created before approval");
+        };
+        assert!(pending.summary.creates_key);
+        assert!(pending.summary.credential_id.is_none());
+        assert_eq!(pending.summary.format, "dc+sd-jwt");
+        assert_eq!(pending.summary.verifier, fixture.client_id);
+        let outcome = approve_with(*pending, &[], &fixture.script, now);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.store.is_some());
+        let plain = posted_plain(&fixture);
+        assert!(plain.get("id_token").is_some());
+        assert!(plain.get("vp_token").is_none());
+    }
+
+    #[test]
+    fn an_approved_self_issued_credential_is_sent_without_asking() {
+        let now = now_secs();
+        let first = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+        let created = present_with(&first.uri, &[], &first.script, now);
+        let stored = held(
+            "cred-self",
+            "20261018T120000.000Z",
+            created.store.expect("created"),
+        );
+        let second = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+        let approved = vec!["cred-self".to_string()];
+        let step = stage(
+            &second.uri,
+            std::slice::from_ref(&stored),
+            &second.script,
+            now,
+            Some(&approved),
+        );
+        let Presentation::Finished(outcome) = step else {
+            panic!("an approved credential waited");
+        };
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(outcome.credential_id.as_deref(), Some("cred-self"));
+        assert!(outcome.store.is_none());
     }
 }

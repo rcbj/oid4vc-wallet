@@ -5,23 +5,28 @@
 //! show, delete, and validate a credential, read and delete an inbox entry,
 //! accept an invocation URI, redeem a pre-authorized offer, present a
 //! same-device request from the credential list, answer a self-issued ID
-//! Token request, import and export credentials, and open Settings for the
-//! language, the protocol handlers, trust anchors, and the storage key.
+//! Token request, show the signer certificate chain carried in a credential,
+//! and open Settings for the language, the protocol handlers, trust anchors,
+//! the storage key, and import and export.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use oid4vc_wallet::i18n::{self, t, t_args};
 use oid4vc_wallet::protocol::offer::{CredentialOffer, OfferPassing};
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Invocation, Json};
 use oid4vc_wallet::wallet::{
-    accept, delete_anchor, export_credentials, import_anchors, import_credentials, list_anchors,
-    present_same_device, redeem_pre_authorized, remember_trust, trust_anchors_dir, validate_stored,
-    AnchorInfo, Credential, CredentialVault, Inbox, NewCredential, Outcome, PortableError,
-    Redeemed,
+    accept, approve_presentation, delete_anchor, ensure_self_issued_certificate,
+    export_credentials, import_anchors, import_credentials, list_anchors, prepare_presentation,
+    presentation_approval_path, presentation_approvals, redeem_pre_authorized, refuse_presentation,
+    remember_presentation, remember_trust, signature_algorithm, signer_certificates,
+    trust_anchors_dir, validate_stored, AnchorInfo, Credential, CredentialVault, Inbox,
+    NewCredential, Outcome, PendingPresentation, PortableError, Presentation, Presented, Redeemed,
+    SignerCertificate,
 };
 
 use super::single::Incoming;
@@ -41,12 +46,19 @@ enum SettingsTab {
     Registration,
     Trust,
     Security,
+    ImportExport,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AcceptTab {
     Json,
     Fields,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CertTab {
+    Fields,
+    Raw,
 }
 
 const NAV: &[(Section, &str)] = &[
@@ -205,13 +217,13 @@ struct WalletApp {
     system_scope: bool,
     haip: bool,
     registration_log: String,
-    exporting: bool,
-    export_all: bool,
     export_path: String,
+    /// Credential ids checked on Import and export. This is not the row
+    /// selected on the Credentials page.
+    export_checked: HashSet<String>,
     /// Shown only after the export file is on disk. This is not the storage key.
     export_key: Option<String>,
     export_count: usize,
-    importing: bool,
     import_path: String,
     import_key: String,
     trust_pem: String,
@@ -220,6 +232,33 @@ struct WalletApp {
     trust_selected: Option<String>,
     /// Bound `ui.sock`, when this process owns the window.
     handoff: Option<Incoming>,
+    /// Requests the verifier already answered, keyed by the launch URI.
+    answered: HashMap<String, Recall>,
+    /// A presentation whose holder key is waiting for approval.
+    present_prompt: Option<PresentPrompt>,
+    /// Signer certificates of one credential, when that window is open.
+    cert_view: Option<CertView>,
+}
+
+#[derive(Clone)]
+struct CertView {
+    credential_id: String,
+    certs: Vec<SignerCertificate>,
+    index: usize,
+    tab: CertTab,
+}
+
+struct PresentPrompt {
+    uri: String,
+    pending: PendingPresentation,
+    remember: bool,
+}
+
+#[derive(Clone)]
+struct Recall {
+    ok: bool,
+    message: String,
+    redirect: Option<String>,
 }
 
 impl WalletApp {
@@ -253,12 +292,10 @@ impl WalletApp {
             system_scope: false,
             haip: false,
             registration_log: String::new(),
-            exporting: false,
-            export_all: false,
             export_path: String::new(),
+            export_checked: HashSet::new(),
             export_key: None,
             export_count: 0,
-            importing: false,
             import_path: String::new(),
             import_key: String::new(),
             trust_pem: String::new(),
@@ -266,6 +303,9 @@ impl WalletApp {
             trust_anchors: Vec::new(),
             trust_selected: None,
             handoff,
+            answered: HashMap::new(),
+            present_prompt: None,
+            cert_view: None,
         };
         app.reload_credentials();
         app.reload_inbox();
@@ -326,31 +366,108 @@ impl WalletApp {
     }
 
     fn present_launched(&mut self, uri: &str) {
-        let outcome = present_same_device(uri, &self.credentials);
+        if let Some(prior) = self.answered.get(uri).cloned() {
+            self.show_present(prior.ok, prior.message, prior.redirect.as_deref());
+            return;
+        }
+        if self
+            .present_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.uri == uri)
+        {
+            return;
+        }
+        if self.present_prompt.is_some() {
+            let old = self.present_prompt.take().expect("prompt");
+            self.finish_present(old, false);
+        }
+        match prepare_presentation(uri, &self.credentials, &approved_presentations()) {
+            Presentation::Finished(outcome) => {
+                self.settle_present(uri, outcome);
+            }
+            Presentation::NeedsApproval(pending) => {
+                self.present_prompt = Some(PresentPrompt {
+                    uri: uri.to_string(),
+                    pending: *pending,
+                    remember: false,
+                });
+            }
+        }
+    }
+
+    fn finish_present(&mut self, prompt: PresentPrompt, allow: bool) {
+        let remember = allow && prompt.remember;
+        let known = prompt.pending.summary.credential_id.clone();
+        let outcome = if allow {
+            approve_presentation(prompt.pending, &self.credentials)
+        } else {
+            refuse_presentation(prompt.pending)
+        };
+        let stored = self.settle_present(&prompt.uri, outcome);
+        if remember {
+            if let Some(id) = known.or(stored) {
+                self.remember_presentation_id(&id);
+            }
+        }
+    }
+
+    fn remember_presentation_id(&mut self, id: &str) {
+        let path = match presentation_approval_path() {
+            Ok(path) => path,
+            Err(err) => {
+                self.warn(err);
+                return;
+            }
+        };
+        if let Err(err) = remember_presentation(&path, id) {
+            self.warn(err);
+        }
+    }
+
+    /// Stores a new self-issued credential when the answer created one.
+    /// The id of that credential is returned so a "do not ask again" choice
+    /// can be recorded after the id exists.
+    fn settle_present(&mut self, uri: &str, outcome: Presented) -> Option<String> {
+        let mut stored_id = None;
         if let Some(new) = outcome.store {
             match CredentialVault::open_default().and_then(|vault| vault.put(new)) {
                 Ok(stored) => {
                     let id = stored.id.clone();
+                    stored_id = Some(id.clone());
                     self.reload_credentials();
                     self.selected = Some(id);
                 }
                 Err(err) => {
                     self.fail(err.to_string());
                     if let Some(redirect) = outcome.redirect_uri.as_deref() {
-                        let _ = open_browser(redirect);
+                        let _ = open_return(redirect);
                     }
-                    return;
+                    return None;
                 }
             }
         } else if let Some(id) = outcome.credential_id.clone() {
             self.selected = Some(id);
         }
-        let mut text = outcome.message;
-        if let Some(redirect) = outcome.redirect_uri.as_deref() {
-            if let Err(error) = open_browser(redirect) {
+        if outcome.answered {
+            self.answered.insert(
+                uri.to_string(),
+                Recall {
+                    ok: outcome.ok,
+                    message: outcome.message.clone(),
+                    redirect: outcome.redirect_uri.clone(),
+                },
+            );
+        }
+        self.show_present(outcome.ok, outcome.message, outcome.redirect_uri.as_deref());
+        stored_id
+    }
+
+    fn show_present(&mut self, ok: bool, mut text: String, redirect: Option<&str>) {
+        if let Some(redirect) = redirect {
+            if let Err(error) = open_return(redirect) {
                 text.push(' ');
                 text.push_str(&t_args("wallet.present.open_failed", &[("error", &error)]));
-                if outcome.ok {
+                if ok {
                     self.warn(text);
                 } else {
                     self.fail(text);
@@ -358,7 +475,7 @@ impl WalletApp {
                 return;
             }
         }
-        if outcome.ok {
+        if ok {
             self.note(text);
         } else {
             self.fail(text);
@@ -389,6 +506,10 @@ impl WalletApp {
     fn reload_credentials(&mut self) {
         match load_credentials() {
             Ok(credentials) => {
+                let credentials = credentials
+                    .into_iter()
+                    .map(|credential| self.with_signer_certificate(credential))
+                    .collect::<Vec<_>>();
                 if self
                     .selected
                     .as_ref()
@@ -396,11 +517,13 @@ impl WalletApp {
                 {
                     self.selected = None;
                 }
+                retain_export_checks(&mut self.export_checked, &credentials);
                 self.credentials = credentials;
             }
             Err(err) => {
                 self.credentials.clear();
                 self.selected = None;
+                self.export_checked.clear();
                 self.fail(err);
             }
         }
@@ -543,30 +666,55 @@ impl WalletApp {
         }
     }
 
-    fn store_redeemed(&mut self, redeemed: Redeemed) {
-        let outcome = CredentialVault::open_default().and_then(|vault| {
-            vault.put(NewCredential {
-                format: redeemed.format,
-                issuer: redeemed.issuer,
-                document: redeemed.document,
-                holder_key: Some(redeemed.holder_key),
-            })
-        });
-        match outcome {
-            Ok(credential) => {
-                let id = credential.id.clone();
-                self.redeem = None;
-                self.accept_uri.clear();
-                self.accept_output.clear();
-                self.accept_parsed = None;
-                self.note(t_args("wallet.cli.stored", &[("id", &id)]));
-                self.reload_credentials();
-                self.selected = Some(id);
-                self.show_json = false;
-                self.section = Section::Credentials;
+    fn store_redeemed(&mut self, redeemed: Vec<Redeemed>) {
+        let vault = match CredentialVault::open_default() {
+            Ok(vault) => vault,
+            Err(err) => {
+                self.fail(err.to_string());
+                return;
             }
-            Err(err) => self.fail(err.to_string()),
+        };
+        let mut ids = Vec::new();
+        for one in redeemed {
+            match vault.put(NewCredential {
+                format: one.format,
+                issuer: one.issuer,
+                document: one.document,
+                holder_key: Some(one.holder_key),
+            }) {
+                Ok(stored) => ids.push(stored.id),
+                Err(err) => {
+                    if !ids.is_empty() {
+                        self.reload_credentials();
+                        self.selected = ids.first().cloned();
+                        self.section = Section::Credentials;
+                    }
+                    self.fail(err.to_string());
+                    return;
+                }
+            }
         }
+        let count = ids.len();
+        let first = ids.first().cloned();
+        self.redeem = None;
+        self.accept_uri.clear();
+        self.accept_output.clear();
+        self.accept_parsed = None;
+        if count == 1 {
+            self.note(t_args(
+                "wallet.cli.stored",
+                &[("id", first.as_deref().unwrap_or(""))],
+            ));
+        } else {
+            self.note(t_args(
+                "wallet.redeem.stored",
+                &[("count", &count.to_string())],
+            ));
+        }
+        self.reload_credentials();
+        self.selected = first;
+        self.show_json = false;
+        self.section = Section::Credentials;
     }
 
     fn save_language(&mut self) {
@@ -656,29 +804,6 @@ impl WalletApp {
             if ui
                 .add_enabled(
                     self.selected.is_some(),
-                    egui::Button::new(t("wallet.ui.export")),
-                )
-                .clicked()
-            {
-                self.begin_export(false);
-            }
-            if ui
-                .add_enabled(
-                    !self.credentials.is_empty(),
-                    egui::Button::new(t("wallet.ui.export_all")),
-                )
-                .clicked()
-            {
-                self.begin_export(true);
-            }
-            if ui.button(t("wallet.ui.import")).clicked() {
-                self.importing = true;
-                self.import_path.clear();
-                self.import_key.clear();
-            }
-            if ui
-                .add_enabled(
-                    self.selected.is_some(),
                     egui::Button::new(t("wallet.ui.validate")),
                 )
                 .clicked()
@@ -743,20 +868,20 @@ impl WalletApp {
             ui.label(t("wallet.ui.detail_empty"));
             return;
         };
-        ui.label(t_args("wallet.cli.id", &[("id", &credential.id)]));
-        ui.label(t_args(
-            "wallet.cli.format",
-            &[("format", &credential.format)],
-        ));
-        ui.label(t_args(
-            "wallet.cli.issuer",
-            &[("issuer", &credential.issuer)],
-        ));
-        ui.label(t_args(
-            "wallet.cli.received",
-            &[("time", &credential.received_at)],
-        ));
-        ui.label(t("wallet.ui.document"));
+        detail_lines(
+            ui,
+            &[
+                t_args("wallet.cli.id", &[("id", &credential.id)]),
+                t_args("wallet.cli.format", &[("format", &credential.format)]),
+                t_args("wallet.cli.issuer", &[("issuer", &credential.issuer)]),
+                t_args(
+                    "wallet.cli.algorithm",
+                    &[("algorithm", &algorithm_name(&credential))],
+                ),
+                t_args("wallet.cli.received", &[("time", &credential.received_at)]),
+                t("wallet.ui.document"),
+            ],
+        );
         let id = credential.id.clone();
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_json, t("wallet.ui.json"));
@@ -765,6 +890,9 @@ impl WalletApp {
                 self.note(t_args("wallet.ui.copied", &[("id", &id)]));
             }
         });
+        if ui.button(t("wallet.ui.cert_chain")).clicked() {
+            self.open_cert_chain(&credential);
+        }
         let mut body = if self.show_json {
             credential.to_json().to_string()
         } else {
@@ -992,7 +1120,7 @@ impl WalletApp {
     fn settings_page(&mut self, ui: &mut egui::Ui) {
         ui.heading(t("wallet.ui.settings"));
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(
                 &mut self.settings_tab,
                 SettingsTab::Language,
@@ -1018,6 +1146,16 @@ impl WalletApp {
                 SettingsTab::Security,
                 t("wallet.ui.security"),
             );
+            if ui
+                .selectable_value(
+                    &mut self.settings_tab,
+                    SettingsTab::ImportExport,
+                    t("wallet.ui.import_export"),
+                )
+                .clicked()
+            {
+                self.reload_credentials();
+            }
         });
         ui.separator();
         match self.settings_tab {
@@ -1025,6 +1163,7 @@ impl WalletApp {
             SettingsTab::Registration => self.registration_tab(ui),
             SettingsTab::Trust => self.trust_tab(ui),
             SettingsTab::Security => self.security_tab(ui),
+            SettingsTab::ImportExport => self.import_export_tab(ui),
         }
     }
 
@@ -1157,11 +1296,12 @@ impl WalletApp {
             return;
         };
         self.trust_anchors = list_anchors(&dir);
-        if self
-            .trust_selected
-            .as_ref()
-            .is_some_and(|id| !self.trust_anchors.iter().any(|anchor| &anchor.fingerprint == id))
-        {
+        if self.trust_selected.as_ref().is_some_and(|id| {
+            !self
+                .trust_anchors
+                .iter()
+                .any(|anchor| &anchor.fingerprint == id)
+        }) {
             self.trust_selected = None;
         }
     }
@@ -1221,29 +1361,185 @@ impl WalletApp {
         }
     }
 
-    fn begin_export(&mut self, all: bool) {
-        self.exporting = true;
-        self.export_all = all;
-        self.export_path.clear();
-        self.export_key = None;
-        self.export_count = 0;
+    fn import_export_tab(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("import-export")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.import_export_body(ui));
     }
 
-    fn confirm_export(&mut self) {
+    fn import_export_body(&mut self, ui: &mut egui::Ui) {
+        ui.label(t("wallet.ui.import_export_help"));
+        ui.add_space(8.0);
+        ui.colored_label(
+            egui::Color32::from_rgb(230, 180, 80),
+            t("wallet.export.warning"),
+        );
+        ui.add_space(8.0);
+        self.export_key_field(ui);
+        ui.add_space(8.0);
+        self.export_credential_list(ui);
+        ui.label(t("wallet.ui.import_path"));
+        if ui.button(t("wallet.ui.choose_file")).clicked() {
+            self.choose_export_file();
+        }
+        ui.label(chosen_file_label(&self.export_path));
+        let path_ready = !self.export_path.trim().is_empty();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    path_ready && !self.export_checked.is_empty(),
+                    egui::Button::new(t("wallet.ui.export")),
+                )
+                .clicked()
+            {
+                self.confirm_export(false);
+            }
+            if ui
+                .add_enabled(
+                    path_ready && !self.credentials.is_empty(),
+                    egui::Button::new(t("wallet.ui.export_all")),
+                )
+                .clicked()
+            {
+                self.confirm_export(true);
+            }
+        });
+        ui.add_space(12.0);
+        ui.separator();
+        ui.label(t("wallet.ui.import_file"));
+        if ui.button(t("wallet.ui.choose_file")).clicked() {
+            self.choose_import_file();
+        }
+        ui.label(chosen_file_label(&self.import_path));
+        ui.label(t("wallet.ui.import_key"));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.import_key)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.add_space(8.0);
+        let ready = !self.import_path.trim().is_empty() && !self.import_key.trim().is_empty();
+        if ui
+            .add_enabled(ready, egui::Button::new(t("wallet.ui.import")))
+            .clicked()
+        {
+            self.confirm_import();
+        }
+    }
+
+    /// Stored credentials in a fixed window, with a checkbox on each row.
+    ///
+    /// The window keeps [`EXPORT_LIST_HEIGHT`] so a long list scrolls here
+    /// instead of lengthening the tab. Checking a row does not change the
+    /// credential selected on the Credentials page.
+    fn export_credential_list(&mut self, ui: &mut egui::Ui) {
+        let rows: Vec<(String, String, String)> = self
+            .credentials
+            .iter()
+            .map(|credential| {
+                (
+                    credential.id.clone(),
+                    credential.issuer.clone(),
+                    credential.format.clone(),
+                )
+            })
+            .collect();
+        let mut changes = Vec::new();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            let width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, EXPORT_LIST_HEIGHT),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("export-credentials")
+                        .auto_shrink([false, false])
+                        .max_height(EXPORT_LIST_HEIGHT)
+                        .show(ui, |ui| {
+                            if rows.is_empty() {
+                                ui.label(t("wallet.ui.credentials_empty"));
+                                return;
+                            }
+                            for (id, issuer, format) in &rows {
+                                let mut on = self.export_checked.contains(id);
+                                let label = format!("{issuer}    {format}\n{id}");
+                                if ui.checkbox(&mut on, label).changed() {
+                                    changes.push((id.clone(), on));
+                                }
+                            }
+                        });
+                },
+            );
+        });
+        for (id, on) in changes {
+            if on {
+                self.export_checked.insert(id);
+            } else {
+                self.export_checked.remove(&id);
+            }
+        }
+    }
+
+    /// The key from the latest export, with a button that copies it.
+    ///
+    /// The field stays visible so the key is not left below the window.
+    /// Editing the field does not change the key that Copy uses.
+    fn export_key_field(&mut self, ui: &mut egui::Ui) {
+        let Some(key) = self.export_key.clone() else {
+            return;
+        };
+        ui.label(t_args(
+            "wallet.export.ready",
+            &[("count", &self.export_count.to_string())],
+        ));
+        ui.label(t("wallet.ui.export_key"));
+        let mut shown = key.clone();
+        let mut copy = false;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(t("wallet.ui.copy")).clicked() {
+                    copy = true;
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut shown)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(ui.available_width())
+                        .interactive(false),
+                );
+            });
+        });
+        if copy {
+            ui.ctx().copy_text(key);
+            self.note(t("wallet.ui.export_key_copied"));
+        }
+    }
+
+    /// Opens the desktop save selector. The name starts as
+    /// [`EXPORT_FILE_NAME`] until a file has been chosen.
+    fn choose_export_file(&mut self) {
+        let name = export_dialog_name(&self.export_path);
+        let dialog =
+            portable_dialog(&t("wallet.ui.import_path"), &self.export_path).set_file_name(name);
+        if let Some(path) = dialog.save_file() {
+            self.export_path = path.display().to_string();
+        }
+    }
+
+    /// Opens the desktop open selector for a file written by an export.
+    fn choose_import_file(&mut self) {
+        let dialog = portable_dialog(&t("wallet.ui.import_file"), &self.import_path);
+        if let Some(path) = dialog.pick_file() {
+            self.import_path = path.display().to_string();
+        }
+    }
+
+    fn confirm_export(&mut self, all: bool) {
         let path = self.export_path.trim().to_string();
         if path.is_empty() {
             return;
         }
-        let chosen: Vec<Credential> = if self.export_all {
-            self.credentials.clone()
-        } else {
-            self.credentials
-                .iter()
-                .find(|credential| self.selected.as_deref() == Some(credential.id.as_str()))
-                .cloned()
-                .into_iter()
-                .collect()
-        };
+        let chosen = credentials_for_export(&self.credentials, &self.export_checked, all);
         let exported = match export_credentials(&chosen) {
             Ok(exported) => exported,
             Err(PortableError::Empty) => {
@@ -1293,7 +1589,6 @@ impl WalletApp {
         self.reload_credentials();
         match outcome {
             Ok(stored) => {
-                self.importing = false;
                 self.import_key.clear();
                 self.note(t_args(
                     "wallet.export.imported",
@@ -1304,13 +1599,105 @@ impl WalletApp {
         }
     }
 
+    fn open_cert_chain(&mut self, credential: &Credential) {
+        if self
+            .cert_view
+            .as_ref()
+            .is_some_and(|view| view.credential_id == credential.id)
+        {
+            return;
+        }
+        let credential = self.with_signer_certificate(credential.clone());
+        self.cert_view = Some(CertView {
+            credential_id: credential.id.clone(),
+            certs: signer_certificates(&credential.document),
+            index: 0,
+            tab: CertTab::Fields,
+        });
+    }
+
+    /// A sign-in credential minted before it carried `x5c` gains a self-signed
+    /// certificate here. The payload stays the same. The sealed file is
+    /// rewritten with that certificate.
+    fn with_signer_certificate(&mut self, credential: Credential) -> Credential {
+        let Some(holder) = credential.holder_key.as_deref() else {
+            return credential;
+        };
+        if !signer_certificates(&credential.document).is_empty() {
+            return credential;
+        }
+        let Some(updated) = ensure_self_issued_certificate(&credential.document, holder) else {
+            return credential;
+        };
+        match CredentialVault::open_default()
+            .and_then(|vault| vault.replace_document(&credential.id, &updated))
+        {
+            Ok(stored) => {
+                if let Some(slot) = self
+                    .credentials
+                    .iter_mut()
+                    .find(|item| item.id == stored.id)
+                {
+                    *slot = stored.clone();
+                }
+                stored
+            }
+            Err(err) => {
+                self.fail(err.to_string());
+                credential
+            }
+        }
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.add_dialog(ctx);
         self.delete_dialog(ctx);
         self.inbox_dialog(ctx);
         self.trust_dialog(ctx);
-        self.export_dialog(ctx);
-        self.import_dialog(ctx);
+        self.present_dialog(ctx);
+        self.cert_dialog(ctx);
+    }
+
+    fn cert_dialog(&mut self, ctx: &egui::Context) {
+        let Some(view) = self.cert_view.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut index = view.index;
+        let mut tab = view.tab;
+        let mut copied = None;
+        let certs = view.certs;
+        egui::Window::new(t("wallet.ui.cert_chain"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(780.0, 520.0))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                if certs.is_empty() {
+                    ui.label(t("wallet.ui.cert_none"));
+                    return;
+                }
+                index = index.min(certs.len() - 1);
+                ui.horizontal_top(|ui| {
+                    cert_chain_column(ui, &certs, &mut index);
+                    cert_detail_column(ui, &certs[index], &mut tab);
+                });
+                if ui.button(t("wallet.ui.copy")).clicked() {
+                    copied = Some(certs[index].pem.clone());
+                }
+            });
+        if let Some(view) = self.cert_view.as_mut() {
+            view.index = index;
+            view.tab = tab;
+        }
+        if let Some(pem) = copied {
+            ctx.copy_text(pem);
+            self.note(t("wallet.ui.cert_copied"));
+        }
+        if !open {
+            self.cert_view = None;
+        }
     }
 
     fn add_dialog(&mut self, ctx: &egui::Context) {
@@ -1428,6 +1815,81 @@ impl WalletApp {
         }
     }
 
+    fn present_dialog(&mut self, ctx: &egui::Context) {
+        let Some(summary) = self
+            .present_prompt
+            .as_ref()
+            .map(|prompt| prompt.pending.summary.clone())
+        else {
+            return;
+        };
+        let mut remember = self
+            .present_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.remember);
+        let mut open = true;
+        let mut allow = false;
+        let mut cancel = false;
+        egui::Window::new(t("wallet.ui.present_title"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                wrapped(
+                    ui,
+                    t_args(
+                        "wallet.ui.present_verifier",
+                        &[("verifier", &summary.verifier)],
+                    ),
+                );
+                ui.add_space(6.0);
+                if summary.creates_key {
+                    wrapped(ui, t("wallet.ui.present_new"));
+                } else {
+                    wrapped(ui, t("wallet.ui.present_help"));
+                    if let Some(id) = &summary.credential_id {
+                        wrapped(ui, t_args("wallet.cli.id", &[("id", id)]));
+                    }
+                    wrapped(
+                        ui,
+                        t_args("wallet.cli.format", &[("format", &summary.format)]),
+                    );
+                    wrapped(
+                        ui,
+                        t_args("wallet.cli.issuer", &[("issuer", &summary.issuer)]),
+                    );
+                    if !summary.received_at.is_empty() {
+                        wrapped(
+                            ui,
+                            t_args("wallet.cli.received", &[("time", &summary.received_at)]),
+                        );
+                    }
+                }
+                ui.add_space(8.0);
+                ui.checkbox(&mut remember, t("wallet.ui.present_remember"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t("wallet.ui.present_allow")).clicked() {
+                        allow = true;
+                    }
+                    if ui.button(t("wallet.ui.cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if let Some(prompt) = self.present_prompt.as_mut() {
+            prompt.remember = remember;
+        }
+        if allow || cancel || !open {
+            let Some(prompt) = self.present_prompt.take() else {
+                return;
+            };
+            self.finish_present(prompt, allow && open);
+        }
+    }
+
     fn trust_dialog(&mut self, ctx: &egui::Context) {
         let Some(prompt) = self.trust.clone() else {
             return;
@@ -1512,96 +1974,6 @@ impl WalletApp {
             Err(err) => self.fail(err.to_string()),
         }
     }
-
-    fn export_dialog(&mut self, ctx: &egui::Context) {
-        if !self.exporting {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new(t("wallet.ui.export"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                ui.colored_label(
-                    egui::Color32::from_rgb(230, 180, 80),
-                    t("wallet.export.warning"),
-                );
-                ui.add_space(8.0);
-                ui.label(t("wallet.ui.import_path"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.export_path)
-                        .desired_width(f32::INFINITY),
-                );
-                if let Some(key) = self.export_key.clone() {
-                    ui.add_space(8.0);
-                    ui.label(t_args(
-                        "wallet.export.ready",
-                        &[("count", &self.export_count.to_string())],
-                    ));
-                    ui.label(t("wallet.ui.export_key"));
-                    let mut shown = key;
-                    ui.add(
-                        egui::TextEdit::multiline(&mut shown)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(2)
-                            .interactive(false),
-                    );
-                } else {
-                    ui.add_space(8.0);
-                    let ready = !self.export_path.trim().is_empty();
-                    if ui
-                        .add_enabled(ready, egui::Button::new(t("wallet.ui.export")))
-                        .clicked()
-                    {
-                        self.confirm_export();
-                    }
-                }
-            });
-        if !open {
-            self.exporting = false;
-            self.export_key = None;
-        }
-    }
-
-    fn import_dialog(&mut self, ctx: &egui::Context) {
-        if !self.importing {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new(t("wallet.ui.import"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                ui.label(t("wallet.ui.import_path"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.import_path)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.label(t("wallet.ui.import_key"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.import_key)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.add_space(8.0);
-                let ready = !self.import_path.trim().is_empty() && !self.import_key.trim().is_empty();
-                if ui
-                    .add_enabled(ready, egui::Button::new(t("wallet.ui.import")))
-                    .clicked()
-                {
-                    self.confirm_import();
-                }
-            });
-        if !open {
-            self.importing = false;
-            self.import_key.clear();
-        }
-    }
 }
 
 impl eframe::App for WalletApp {
@@ -1683,18 +2055,37 @@ fn presentation_launch(uri: &str) -> bool {
     )
 }
 
-fn open_browser(url: &str) -> Result<(), String> {
-    let mut child = std::process::Command::new("xdg-open")
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|err| err.to_string())?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
+fn open_return(url: &str) -> Result<(), String> {
+    super::browser::open_return(url)
+}
+
+fn approved_presentations() -> Vec<String> {
+    presentation_approval_path()
+        .map(|path| presentation_approvals(&path))
+        .unwrap_or_default()
+}
+
+fn algorithm_name(credential: &Credential) -> String {
+    signature_algorithm(&credential.format, &credential.document)
+        .unwrap_or_else(|| t("wallet.cli.algorithm_unknown"))
+}
+
+fn wrapped(ui: &mut egui::Ui, text: String) {
+    ui.add(egui::Label::new(text).wrap());
+}
+
+/// Metadata rows on the Credentials detail pane.
+///
+/// `Ui::columns` lays its children out justified. egui then spreads each
+/// wrapped row of a label across the column, so a long issuer value is
+/// drawn with a gap between every letter. A plain vertical layout keeps
+/// the rows left aligned.
+fn detail_lines(ui: &mut egui::Ui, lines: &[String]) {
+    ui.vertical(|ui| {
+        for line in lines {
+            ui.label(line);
+        }
     });
-    Ok(())
 }
 
 fn preauthorized_offer(uri: &str) -> Option<CredentialOffer> {
@@ -1746,6 +2137,85 @@ fn accept_json_tab(ui: &mut egui::Ui, value: &Json) {
                     .font(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY)
                     .desired_rows(12)
+                    .interactive(false),
+            );
+        });
+}
+
+fn cert_chain_column(ui: &mut egui::Ui, certs: &[SignerCertificate], index: &mut usize) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(240.0, 360.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("cert-chain")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (number, cert) in certs.iter().enumerate() {
+                        let label = format!("{}. {}", number + 1, cert.title);
+                        if ui
+                            .add(egui::Button::selectable(number == *index, label).wrap())
+                            .clicked()
+                        {
+                            *index = number;
+                        }
+                    }
+                });
+        },
+    );
+}
+
+fn cert_detail_column(ui: &mut egui::Ui, cert: &SignerCertificate, tab: &mut CertTab) {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 360.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(tab, CertTab::Fields, t("wallet.ui.cert_fields"));
+                ui.selectable_value(tab, CertTab::Raw, t("wallet.ui.cert_raw"));
+            });
+            match tab {
+                CertTab::Fields => cert_fields_tab(ui, &cert.fields),
+                CertTab::Raw => cert_raw_tab(ui, &cert.pem),
+            }
+        },
+    );
+}
+
+fn cert_fields_tab(ui: &mut egui::Ui, rows: &[(String, String)]) {
+    egui::ScrollArea::both()
+        .id_salt("cert-fields")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("cert-field-rows")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong(t("wallet.ui.cert_field"));
+                    ui.strong(t("wallet.ui.cert_value"));
+                    ui.end_row();
+                    for (name, value) in rows {
+                        ui.monospace(name);
+                        ui.monospace(value);
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn cert_raw_tab(ui: &mut egui::Ui, pem: &str) {
+    let mut text = pem.to_string();
+    let rows = pem.lines().count().max(8);
+    egui::ScrollArea::both()
+        .id_salt("cert-raw")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut text)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(rows)
                     .interactive(false),
             );
         });
@@ -1915,12 +2385,207 @@ fn describe_accept(uri: &str, inbox: Option<&Inbox>, json: bool) -> Result<Strin
     Ok(text)
 }
 
+/// The name the export selector offers until a file has been chosen.
+const EXPORT_FILE_NAME: &str = "oid4vc-credentials.oid4vc";
+
+/// Height of the credential list on Import and export. The list scrolls
+/// inside this window.
+const EXPORT_LIST_HEIGHT: f32 = 220.0;
+
+/// Credentials to write, in stored order.
+///
+/// `all` keeps every credential. Otherwise only ids in `checked` are kept.
+fn credentials_for_export(
+    credentials: &[Credential],
+    checked: &HashSet<String>,
+    all: bool,
+) -> Vec<Credential> {
+    if all {
+        return credentials.to_vec();
+    }
+    credentials
+        .iter()
+        .filter(|credential| checked.contains(&credential.id))
+        .cloned()
+        .collect()
+}
+
+/// Drops checks for credentials that are no longer stored.
+fn retain_export_checks(checked: &mut HashSet<String>, credentials: &[Credential]) {
+    checked.retain(|id| credentials.iter().any(|credential| &credential.id == id));
+}
+
+/// The file name the export selector starts with.
+fn export_dialog_name(current: &str) -> String {
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        return EXPORT_FILE_NAME.to_string();
+    }
+    let path = Path::new(trimmed);
+    // A chosen directory is where the selector opens, not the file name.
+    if path.is_dir() {
+        return EXPORT_FILE_NAME.to_string();
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(EXPORT_FILE_NAME)
+        .to_string()
+}
+
+/// The folder the selector opens in, when a path was already chosen.
+fn dialog_directory(current: &str) -> Option<PathBuf> {
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    if dir.as_os_str().is_empty() {
+        None
+    } else {
+        Some(dir)
+    }
+}
+
+/// The path already chosen, or the sentence that none has been.
+fn chosen_file_label(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        t("wallet.ui.no_file")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// A desktop file selector limited to this wallet's export files, with every
+/// file still available. `current` is the path already chosen, if any.
+fn portable_dialog(title: &str, current: &str) -> rfd::FileDialog {
+    let mut dialog = rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter(t("wallet.ui.export_kind"), &["oid4vc"])
+        .add_filter(t("wallet.ui.all_files"), &["*"]);
+    if let Some(dir) = dialog_directory(current) {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog
+}
+
 #[cfg(test)]
 mod tests {
     use super::describe_accept;
+    use eframe::egui;
     use oid4vc_wallet::wallet::Inbox;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_wrapped_issuer_line_is_not_letter_spaced() {
+        let ctx = egui::Context::default();
+        let text = "Issuer: urn:ietf:params:oauth:jwk-thumbprint:sha-256:UfPa-A8nmxIO2EdelUYI5Bw0FH5fibJu-8LpKbfXQ-A";
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(520.0, 360.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            ui.columns(2, |columns| {
+                columns[0].label(text);
+                super::detail_lines(&mut columns[1], &[text.to_string()]);
+            });
+        });
+        let mut gaps = Vec::new();
+        for clipped in &output.shapes {
+            collect_issuer_gaps(&clipped.shape, &mut gaps);
+        }
+        output.drop_without_applying_deltas();
+        assert!(
+            gaps.iter().any(|gap| *gap > 8.0),
+            "the column label should still justify a wrapped issuer, gaps {gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|gap| *gap < 1.5),
+            "the detail issuer line is still letter-spaced, gaps {gaps:?}"
+        );
+    }
+
+    fn widest_extra_gap(galley: &egui::Galley) -> f32 {
+        let mut widest = 0.0_f32;
+        for row in &galley.rows {
+            for pair in row.glyphs.windows(2) {
+                let extra = pair[1].pos.x - pair[0].pos.x - pair[0].advance_width;
+                widest = widest.max(extra);
+            }
+        }
+        widest
+    }
+
+    fn collect_issuer_gaps(shape: &egui::epaint::Shape, gaps: &mut Vec<f32>) {
+        match shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text.contains("urn:ietf") => {
+                gaps.push(widest_extra_gap(&text.galley));
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_issuer_gaps(shape, gaps);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_export_selector_offers_a_default_file_name() {
+        assert_eq!(super::export_dialog_name(""), super::EXPORT_FILE_NAME);
+        assert_eq!(super::export_dialog_name("   "), super::EXPORT_FILE_NAME);
+        assert_eq!(super::export_dialog_name("/tmp/kept.oid4vc"), "kept.oid4vc");
+        assert_eq!(
+            super::dialog_directory("/tmp/kept.oid4vc").as_deref(),
+            Some(std::path::Path::new("/tmp"))
+        );
+        assert!(super::dialog_directory("").is_none());
+        assert!(super::dialog_directory("kept.oid4vc").is_none());
+    }
+
+    #[test]
+    fn export_checks_keep_list_order_and_drop_unknown_ids() {
+        use std::collections::HashSet;
+
+        let credentials = vec![stored("a"), stored("b"), stored("c")];
+        let mut checked = HashSet::new();
+        checked.insert("c".to_string());
+        checked.insert("a".to_string());
+        checked.insert("missing".to_string());
+        let chosen = super::credentials_for_export(&credentials, &checked, false);
+        let ids: Vec<&str> = chosen
+            .iter()
+            .map(|credential| credential.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a", "c"]);
+        let all = super::credentials_for_export(&credentials, &checked, true);
+        assert_eq!(all.len(), 3);
+        assert!(super::credentials_for_export(&credentials, &HashSet::new(), false).is_empty());
+        super::retain_export_checks(&mut checked, &credentials);
+        assert!(checked.contains("a") && checked.contains("c"));
+        assert!(!checked.contains("missing"));
+    }
+
+    fn stored(id: &str) -> oid4vc_wallet::wallet::Credential {
+        oid4vc_wallet::wallet::Credential {
+            id: id.to_string(),
+            format: "dc+sd-jwt".to_string(),
+            issuer: "https://issuer.example".to_string(),
+            received_at: "20260101T000000.000Z".to_string(),
+            document: "doc".to_string(),
+            holder_key: None,
+        }
+    }
 
     #[test]
     fn accepting_a_uri_writes_the_inbox_and_returns_the_summary() {
@@ -1968,13 +2633,15 @@ mod tests {
             super::Section::Credentials
         );
         assert_eq!(super::launch_section(&[]), super::Section::Credentials);
-        let by_value = "openid4vp://?client_id=https%3A%2F%2Fverifier.example&response_type=vp_token";
+        let by_value =
+            "openid4vp://?client_id=https%3A%2F%2Fverifier.example&response_type=vp_token";
         assert!(!super::presentation_launch(by_value));
         assert_eq!(
             super::launch_section(&[by_value.to_string()]),
             super::Section::Accept
         );
-        let offer = "openid-credential-offer://?credential_offer_uri=https%3A%2F%2Fissuer.example%2Foffer";
+        let offer =
+            "openid-credential-offer://?credential_offer_uri=https%3A%2F%2Fissuer.example%2Foffer";
         assert_eq!(
             super::launch_section(&[offer.to_string()]),
             super::Section::Accept

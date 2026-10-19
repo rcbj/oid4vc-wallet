@@ -5,9 +5,7 @@
 # source ./docs. minima is the theme GitHub Pages ships, so this directory
 # does not vendor a theme and does not add a Gemfile.
 title: OID4VC Wallet
-description: >-
-  A Linux wallet for OpenID4VCI credential offers and OpenID4VP / SIOPv2
-  requests.
+description: How to use the OID4VC Wallet on Linux.
 theme: minima
 
 # The published site is https://rcbj.github.io/oid4vc-wallet/. Links in the

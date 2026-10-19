@@ -2,77 +2,196 @@
 title: How to use the wallet
 ---
 
-# OID4VC Wallet
+# How to use the wallet
 
-This guide is for a person using the OID4VC Wallet with iya-sts on the same machine. The wallet stores credentials, accepts credential offers, and answers same-device requests from iya-sts. It is a native Linux program. The window title is OID4VC Wallet.
+This guide is for a person using the OID4VC Wallet with iya-sts on the same computer. The wallet stores credentials, takes a credential the issuer is offering, and answers when a site asks you to sign in or to present a credential.
 
-The installed command is `~/.local/bin/oid4vc-wallet`. Open the window with:
+The window has four pages: **Credentials**, **Inbox**, **Accept**, and **Settings**. A message at the top of the window reports what the last action did.
+
+## Open the wallet {#open}
+
+The installed command is `oid4vc-wallet`. Open the window with:
 
 ```sh
 oid4vc-wallet --ui
 ```
 
-The desktop starts the same window with `oid4vc-wallet --ui %u`. `%u` is the URI the browser or iya-sts page handed over. Clicking the application, with no URI, opens the credential list.
+You can also click **OID4VC Wallet** in the application menu. That opens the credential list.
 
-A command without `--ui` parses an invocation and stores it. It does not fetch anything, and it does not present a credential. `oid4vc-wallet help` lists those commands.
+When a site hands the computer a wallet link, the desktop starts the same window and passes the link in. A pre-authorized offer opens **Accept** and asks for the transaction code. A sign-in or presentation opens **Credentials**.
 
-## After an upgrade
+Close an already-open wallet window and start it again after an update. The window that is already on screen keeps the old program. A new install does not change that copy.
 
-Close an already-open wallet window and start it again after an upgrade. The running process keeps the old program. A new install does not replace the copy that is already on screen.
+A second start does not open a second window. It brings the open window forward and gives it the new link.
 
-## Pages
+## Read a stored credential {#read}
 
-The window has four pages: Credentials, Inbox, Accept, and Settings.
+1. Open **Credentials**.
+2. Click a row in the list. The row shows the issuer, the time the credential arrived, the format, and the id.
+3. The detail on the right shows:
+   - **Id**
+   - **Format**
+   - **Issuer**
+   - **Signature algorithm**, the kind of signature named in the credential. The line says **unknown** when the credential does not name one.
+   - **Received**
+   - **Document**, the credential itself
 
-### Credentials
+**JSON** shows the stored record as JSON. Leave it unchecked to read the credential document.
 
-The list shows each stored credential. Select a row to read that credential. The detail shows the id, the format, the issuer, the time it was received, and the document. A JSON checkbox shows the stored record as JSON. Copy copies the id only.
+**Copy** on this page copies the id only. The message says **Copied** and then the id.
 
-Refresh reloads the list. Add credential stores a document you already have. The dialog asks for the format (for example `dc+sd-jwt`), the issuer URL, and the document. You can type the document or load it from a file, then choose Store credential.
+**Refresh** reloads the list.
 
-Validate checks the issuer signature and the trust chain of the selected credential. When the signature checks and the chain cannot be completed from what the issuer published, a prompt asks before the wallet trusts that unknown chain. Trust this issuer records the decision for that issuer and that key. A different key is asked again. If the wallet used the issuer's TLS certificate because the published anchors could not be retrieved, the message says that this fallback was used. A bad signature, a name mismatch, or a date outside the certificate's validity is an error.
+The private key that belongs to a credential is never shown. You can read the document. You cannot read the key.
 
-Delete asks you to confirm, then removes that credential. The AES-256 storage key stays in the desktop key store.
+The same lines appear when you ask the command line to show one credential: `oid4vc-wallet credential show`, followed by the id. That command prints the id, the format, the issuer, the signature algorithm, the time, and the document.
 
-The holder private key is never shown. A credential received from an issuer keeps that key sealed with the credential. You can read the document. You cannot read the key.
+## Look at the issuer's certificates {#certificates}
 
-You can also export and import from this page. That is described under Import and export.
+The **Certificate chain** button is on the credential detail, under **Copy**.
 
-### Inbox
+1. Select the credential.
+2. Choose **Certificate chain**.
+3. A window opens with the certificates that were included with that credential. They are numbered. Number 1 is the signer's certificate. Each certificate after it is the one that stands behind the one before it.
+4. Click a certificate in the list.
 
-Inbox lists invocations the desktop handed the wallet. Each entry is the raw URI. Select a row to read it. Refresh reloads the list. Delete removes one entry, and only after you confirm.
+The window has two tabs:
 
-An inbox file can contain a pre-authorized code. That code is enough to ask the issuer for the credential, so treat the inbox as private and delete an entry when you no longer need it.
+- **Fields** is a table. **Field** is the name, and **Value** is what the certificate says. The field names stay in English when the rest of the wallet is in another language, because they are the standard certificate names.
+- **Raw** shows that certificate as text.
 
-The command line writes the same inbox when you pass a URI without `--ui`. The window and the command line are looking at one inbox.
+**Copy** puts that certificate text on the clipboard, so you can paste it into a file or another program. The message at the top of the wallet says **Copied the certificate.** The certificate text stays in the certificate window.
 
-### Accept
+Close the certificate window with its close button. You can resize it. Choosing **Certificate chain** again for the same credential keeps the certificate and the tab you were looking at. Choosing it for a different credential starts at the first certificate on **Fields**.
 
-Paste an invocation URI. The schemes iya-sts uses are:
+The window shows the certificates that came inside the credential. It does not go online to fetch another certificate.
 
-| What iya-sts is doing | Scheme |
+A sign-in credential this wallet created includes one certificate for its own key. That certificate is the whole chain, and it is stored in the credential. An older sign-in credential receives that certificate the next time the wallet reads it.
+
+Some other credentials have no signer certificate. The window then says **This credential does not include a signer certificate.** There is no **Copy** button in that case.
+
+## Add a credential you already have {#add}
+
+On **Credentials**, choose **Add credential**. The dialog asks for:
+
+- **Format**, for example `dc+sd-jwt`
+- **Issuer URL**
+- **Document**, which you can type, or load with **Load file** after choosing **Document file**
+
+Choose **Store credential**. **Cancel** closes the dialog without storing.
+
+## Check a credential {#check}
+
+Select a credential and choose **Validate**. The wallet checks the issuer's signature and the chain of trust.
+
+A credential this wallet created for a sign-in names its own key. **Validate** checks the signature against that key. It does not contact a website for that credential.
+
+When the signature checks and the chain cannot be finished from what the issuer published, a prompt asks before the wallet trusts that chain. **Trust this issuer** remembers the decision for that issuer and that key. A different key is asked again.
+
+If the wallet used the issuer's own connection certificate because the published certificates could not be retrieved, the message says that this fallback was used.
+
+A bad signature, a name that does not match, or a date outside the certificate's validity is an error.
+
+## Remove a credential {#remove}
+
+Select a credential and choose **Delete**. Confirm the prompt. The credential is removed. The storage key stays in the desktop key store.
+
+## The inbox {#inbox}
+
+**Inbox** lists the links the desktop handed the wallet. Each entry is the link itself.
+
+1. Click a row to read it.
+2. **Refresh** reloads the list.
+3. **Delete** removes one entry after you confirm.
+
+An inbox entry can contain a transaction code. That code is enough to ask the issuer for the credential, so treat the inbox as private and delete an entry when you no longer need it. Only your user can read those files.
+
+A link you pass on the command line, without `--ui`, is written to this same inbox. The window and the command line are looking at one inbox.
+
+## Accept a link {#accept}
+
+**Accept** is where you paste a link yourself.
+
+1. Paste the link into **Invocation URI**.
+2. **Do not write the inbox** reads the link and leaves the inbox unchanged. Leave it unchecked to save the link in the inbox.
+3. **JSON** writes the summary as JSON. Leave it unchecked for the usual sentences.
+4. Choose **Accept**.
+
+The links iya-sts uses are:
+
+| What iya-sts is doing | What the link starts with |
 |---|---|
-| Credential offer, by value or by reference | `openid-credential-offer://` |
-| Presentation request | `openid4vp://` |
-| ID Token request (SIOPv2) | `siopv2://` |
+| Offering a credential | `openid-credential-offer://` |
+| Asking you to present a credential | `openid4vp://` |
+| Asking you to sign in | `siopv2://` |
 
-Two checkboxes apply to that paste. Do not write the inbox parses the URI and does not store it. JSON applies to that paste as well. Choose Accept when the URI is filled in.
+After the wallet reads the link, the summary appears, and under it two tabs. **JSON** is the full information. **Fields** is a table of name and value.
 
-After a parse, the page has two tabs. One tab is the formatted JSON. The other is a table of field name and field value.
+A link that only points at an offer, and does not contain the offer itself, is saved as a link. The wallet does not go and fetch it.
 
-A by-value pre-authorized offer then asks for the transaction code. Type the code the issuer page is showing and choose Redeem. The wallet takes the code to the issuer, receives the credential, and puts it in the credential list. The holder private key is stored with that credential and is not shown. Use a different invocation leaves the code prompt and returns to the paste box.
+## Receive a credential {#receive}
 
-If the offer does not ask for a transaction code, Redeem is available without one.
+On the issuer page, start the same-device handoff for an offer that is ready to redeem. The desktop opens this wallet on **Accept** and shows **Redeem**.
 
-An offer by reference is not fetched. Pasting that URI only parses and, unless you unchecked the inbox, stores the URI.
+1. Read the issuer and the credential names on that prompt.
+2. If the page asks for a transaction code, type the code the issuer page is showing. The box is labeled **Transaction code**.
+3. Choose **Redeem**.
+4. The wallet stores every credential the issuer returns. When there is one, the message names that credential. When there are several, the message says how many were stored. The first one is selected on **Credentials**.
 
-### Settings
+Some issuers give you several credentials for one code. iya-sts usually gives four. The wallet creates one key for each and stores each credential with the key that belongs to it. Those keys are not shown.
 
-Settings has four tabs: Language, Registration, Trust anchors, and Security.
+If the offer does not ask for a transaction code, **Redeem** is available without one.
 
-**Language.** This is the set of languages iya-sts uses. Pick one and choose Save language. The choice is kept for later runs. Use the session language forgets that choice and follows the language of this desktop session. A `--lang` tag on the command that starts the wallet applies to that run only.
+**Use a different invocation** leaves the code prompt and returns to the paste box.
 
-The languages you can select are:
+You can paste the same offer link yourself on **Accept**. The offer has to be included in the link.
+
+## Approve a sign-in or a presentation {#present}
+
+On iya-sts, **Open your wallet on this device** opens this wallet on the credential list. The wallet fetches the request and selects a stored credential that matches the site, the kind of credential, and the information the site asked for.
+
+Before the key is used, a dialog asks **Use this credential?**
+
+The dialog shows:
+
+- who is asking, next to **Verifier**
+- the credential id, the format, the issuer, and the time you received it
+
+Choose **Allow** to sign and send the answer. Choose **Cancel**, or close the dialog, to stop. The key is not used, and the site is told that you declined.
+
+**Do not ask again for this credential** is unchecked at first. Check it when you want later requests for that same credential to skip the dialog. The first request for a credential always asks. The checkbox is remembered when you choose **Allow**.
+
+After you allow a presentation, the wallet opens the site's next page as a new tab in the browser you were already using for that site. The sign-in stays in that browser. A program outside the browser cannot switch the tab that is already open.
+
+Opening the same link again in this window does not send it a second time. iya-sts answers a sign-in once.
+
+If none of your credentials fit the request, the wallet tells the site, and the browser can still return. The wallet does not invent a credential for an ordinary presentation.
+
+An ordinary presentation sends the presentation. A request that asks for a presentation and a sign-in together sends both, after you allow it, and the sign-in uses the key of the credential you presented.
+
+The command line does not present. A link passed without `--ui` is read and stored only.
+
+## Create a sign-in identity {#identity}
+
+A `siopv2://` link is a sign-in request. The first time, the dialog says that a new self-issued credential will be created and that its key will be used.
+
+1. Choose **Allow** to create the credential, send the sign-in, and store the credential.
+2. Check **Do not ask again for this credential** if a later sign-in with that credential should skip the question.
+3. Choose **Cancel**, or close the dialog, to create nothing.
+
+The sign-in carries the subject and the public key. The private key stays in the wallet. You do not type the subject or the key, and you will not see the private key on **Credentials**.
+
+A later `siopv2://` sign-in sends the same subject, so iya-sts can recognize the person who enrolled that key. The wallet asks again unless you checked the box the first time.
+
+## Settings {#settings}
+
+**Settings** has five tabs: **Language**, **Registration**, **Trust anchors**, **Security**, and **Import and export**.
+
+### Language {#language}
+
+Pick a language and choose **Save language**. The choice is kept for later runs. **Use the session language** forgets that choice and follows the language of this desktop session.
+
+A `--lang` tag on the command that starts the wallet applies to that run only.
 
 | Language | Tags |
 |---|---|
@@ -84,62 +203,83 @@ The languages you can select are:
 | Filipino (Tagalog) | `fil-PH` |
 | Swedish | `sv-SE` |
 
-English is the source. The other catalogs were machine-written and have not been reviewed by a native speaker. Protocol field names, the issuer's own transaction-code text, and operating-system errors stay as they were received.
+English is the source. The other languages were machine-written and have not been reviewed by a native speaker. Names that come from the issuer, the transaction-code text the issuer wrote, and messages from the operating system stay as they were received.
 
-The wallet picks a language in this order: `--lang` for this run, `ui_locales` on the invocation being shown, the saved language, then `LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, and `LANG`, then English.
+The wallet picks a language in this order: `--lang` for this run, the language asked for on the link being shown, the saved language, then the language of this desktop session, then English.
 
-**Registration.** This tab registers or removes the protocol handlers. For this user is the usual choice and matches `./install/install.sh`. For every user on this machine writes the system-wide registration. Also register haip-vci:// and haip-vp:// adds the HAIP schemes iya-sts uses when it is configured for HAIP. Register this wallet writes the desktop file. Remove registration takes it away. The desktop file's launch line is `oid4vc-wallet --ui` plus the URI.
+### Registration {#registration}
 
-**Trust anchors.** Paste a PEM root or CA chain, or load one from a file, then choose Save certificates. After that, validation trusts that chain. Use this when iya-sts, or another issuer you mean to trust, signs with a CA that is not in the system store and is not a public web root. Loopback is separate: see Local iya-sts below. Remove drops one stored certificate by its fingerprint.
+This tab tells the desktop to open this wallet when a site uses a wallet link.
 
-**Security.** Rotate encryption key generates a new AES-256 storage key and re-encrypts every credential. The previous key is kept for 90 days so a rotation that was interrupted can be finished. The new key is the storage key. It is not an export key, and it is not a holder key. The key lives in the desktop key store: GNOME Keyring when the Secret Service is available, KeePassXC when it provides that service, or KWallet on a KDE session that does not. The keyring or wallet needs to be unlocked, which it is in a normal desktop session. The holder private key is still never shown.
+- **For this user** is the usual choice.
+- **For every user on this machine** writes the registration for the whole computer.
+- **Also register haip-vci:// and haip-vp://** adds the extra link types iya-sts uses when it is set up for HAIP.
 
-## Use the wallet with iya-sts
+**Register this wallet** writes the desktop file. **Remove registration** takes it away.
 
-### Receive a credential
+### Trust anchors {#trust}
 
-On the issuer page, start the same-device wallet handoff for a pre-authorized offer. The desktop opens this wallet on Accept and asks for the transaction code that page is showing. Redeem stores the credential and selects it on Credentials.
+Use this when an issuer you mean to trust signs with a certificate that this computer does not already trust.
 
-You can paste the same `openid-credential-offer://` URI yourself on Accept. The offer has to be by value. A by-reference offer is stored as a URI and is not fetched.
+The box is labeled **Certificates (PEM)**. Paste the certificate text there. You can also type a file path under **Certificate file** and choose **Load**. Then choose **Save certificates**. After that, **Validate** can trust a chain that ends at one of those certificates.
 
-### Same-device presentation
+The list shows each saved certificate's name and a long fingerprint. Click one, then choose **Remove**.
 
-On iya-sts, Open your wallet on this device on `/authn/wallet/wait` opens this wallet on the credential list. The wallet fetches the request, selects a stored credential that matches the verifier, the credential type, and the claims, sends the presentation, and returns the browser to the verifier.
+An issuer running on this same computer is covered under [A local iya-sts](#local).
 
-If nothing matches, the verifier is told and the browser still returns. The wallet does not invent a credential for an ordinary presentation. An ID Token is not sent for an ordinary presentation request. When the request asks for both a presentation and an ID Token, the wallet sends both, and the ID Token is signed by the holder key of the credential that was presented.
+### Security {#security}
 
-The command line does not present. A URI passed without `--ui` is parsed and stored only.
+**Rotate encryption key** makes a new storage key and locks every stored credential with it. The previous key is kept for 90 days, so a rotation that was interrupted can be finished.
 
-### Self-issued identity
+The new key is the storage key. It is not the key shown after an export, and it is not a credential's private key. It lives in the desktop key store: GNOME Keyring when that service is available, KeePassXC when KeePassXC provides that service, or KWallet on a KDE session that does not. The key store needs to be unlocked, which it is in a normal desktop session.
 
-A `siopv2://` request is an ID Token request, not an ordinary presentation. The wallet creates a self-issued credential, sends an ID Token back to iya-sts, and stores the credential. The ID Token carries the subject and the public key. The private key stays in the wallet.
+### Move credentials to another computer {#move}
 
-A later `siopv2://` sign-in sends the same subject. iya-sts can then authenticate the person who enrolled that key. You do not type the subject or the key. Do not expect to see the private key on Credentials.
+Open **Settings**, then **Import and export**.
 
-### Import and export
+The stored credentials sit in a fixed box on this tab. The list scrolls inside that box when there are more credentials than the box can show. A checkbox on a row here does not change the credential selected on **Credentials**.
 
-Export writes the selected credential, or all of them, to a file you can move to another device. Each export generates a new encryption key. The screen warns that if that key is lost the file cannot be read. Keep the key with the file only as carefully as you would keep the credentials themselves. Copy it somewhere you can get it back. The wallet does not store that export key for you.
+The tab warns: **This encryption key opens the export. If the key is lost, the file cannot be read.**
 
-Import asks for the file and that key. It opens the file with the export key and stores the credentials in this wallet under this wallet's own storage key. The export key is not the wallet's storage key. Rotating the AES-256 key does not rotate keys inside old export files. An export file is read with the key that was shown when that file was written.
+To write a file:
 
-### One window
+1. Check the credentials you want to take with you. Skip this step if you want every credential.
+2. Next to **Export file**, choose **Choose file**. The save window suggests the name `oid4vc-credentials.oid4vc`. You can change it. The file types are **OID4VC export** and **All files**.
+3. Choose **Export** to write the checked credentials. **Export** stays unavailable until a file is chosen and at least one box is checked.
+4. Choose **Export all** to write every stored credential. That button stays unavailable until a file is chosen and the wallet has at least one credential.
 
-Starting the UI again focuses the window that is already open and hands it the new URI. A second window is not opened. A presentation URI is handled from the credential list of that window. A pre-authorized offer is handled on Accept in that window.
+Each export makes a new encryption key. After the file is written, that key appears at the top of the tab in **Encryption key**, with **Copy** beside it. The message says **Encryption key copied.** The key is not written into that message. The wallet does not store the export key. Copy it and keep it with the same care you would give the credentials.
 
-The command line without `--ui` does not do this. It does not look for an open window, and it does not present.
+To bring a file onto this computer:
 
-## What this wallet will not do
+1. Next to **Import file**, choose **Choose file** and pick the export file.
+2. Type the export key into **Encryption key for this file**.
+3. Choose **Import**. The button stays unavailable until both the file and the key are filled in.
 
-- It does not fetch an offer by reference.
-- It does not send an ID Token for an ordinary presentation request. A `siopv2://` ID Token request, and a request that asks for both a presentation and an ID Token, are the exceptions described above.
-- The command line does not present, and it does not redeem an offer. Redemption and presentation run in the window.
-- It does not show the holder private key.
+The wallet opens the file with that export key and stores the credentials under this computer's own storage key. After a successful import, the key box is emptied.
 
-## Local iya-sts
+The export key is not the storage key. **Rotate encryption key** does not change the key inside an export file you already wrote. An old file still opens with the key that was shown when that file was written.
 
-Loopback TLS (localhost) is accepted for a local iya-sts. The issuer's certificate does not have to be in the system trust store when the host is localhost. Any other host must chain to a CA the system store trusts, a public web root, or a chain you added on the Trust anchors tab.
+## One window {#one-window}
 
-## Command line, short
+Starting the wallet window again brings the open window forward and hands it the new link. A presentation link is handled from **Credentials** in that window. An offer that is ready to redeem is handled on **Accept** in that window.
+
+The command line without `--ui` does not look for an open window, and it does not present a credential or redeem an offer.
+
+## What the wallet leaves alone {#limits}
+
+- A link that only points at an offer is saved. The offer itself has to be inside the link before the wallet can redeem it.
+- An ordinary presentation sends the presentation. A sign-in link, and a request that asks for both a presentation and a sign-in, also send the sign-in. Those cases are described above.
+- Redeem and present run in the window. A command without `--ui` reads a link and can store it.
+- The private key of a credential is never shown.
+
+## A local iya-sts {#local}
+
+When iya-sts is on this same computer, at `localhost`, the wallet accepts its certificate.
+
+An issuer on another computer needs a certificate the system already trusts, a public certificate the wallet already knows, or a certificate you added on **Trust anchors**.
+
+## Commands, if you were asked to type one {#commands}
 
 These do not open the window:
 
@@ -147,10 +287,11 @@ These do not open the window:
 oid4vc-wallet 'openid-credential-offer://?credential_offer=…'
 oid4vc-wallet inbox
 oid4vc-wallet credentials
+oid4vc-wallet credential show <id>
 oid4vc-wallet language
 oid4vc-wallet language set fr-FR
 ```
 
-`--json` prints one JSON object. `--no-save` parses without writing the inbox. `credential add` seals a document you already have. `credential delete` removes one credential and leaves the AES-256 storage key in place.
+`--json` prints one JSON object. `--no-save` reads a link without writing the inbox. `credential add` stores a document you already have. `credential delete` removes one credential and leaves the storage key in place.
 
-None of those commands fetch an offer, redeem one, or present a credential.
+`oid4vc-wallet help` lists the commands. None of those commands fetch an offer, redeem one, or present a credential.

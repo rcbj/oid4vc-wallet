@@ -6,8 +6,10 @@
 //! Service is not running. [`validate_stored`] checks an issued credential's
 //! signature. One inbox entry can be removed with [`Inbox::delete`].
 //! [`present_same_device`] fetches a same-device presentation request,
-//! selects a stored credential, and posts the answer. An `id_token` request
-//! is answered with a self-issued ID Token.
+//! selects a stored credential, and posts the answer. [`prepare_presentation`]
+//! stops before a holder key is used so the window can ask first.
+//! [`remember_presentation`] records a credential that should not be asked
+//! again. An `id_token` request is answered with a self-issued ID Token.
 //! [`export_credentials`] copies credentials into a file sealed with a new
 //! AES-256 key, so they can move to another device. [`import_credentials`]
 //! opens that file. The new key is not the wallet's storage key.
@@ -15,6 +17,7 @@
 mod anchors;
 mod b64;
 mod certs;
+mod consent;
 mod credentials;
 mod http;
 mod inbox;
@@ -34,11 +37,21 @@ pub use anchors::{
     default_dir as trust_anchors_dir, install_pem as import_anchors, list as list_anchors,
     remove as delete_anchor, StoredAnchor as AnchorInfo,
 };
+pub use certs::{signer_certificates, SignerCertificate};
+pub use consent::{
+    approved_ids as presentation_approvals, default_path as presentation_approval_path,
+    remember as remember_presentation,
+};
 pub use credentials::{Credential, CredentialVault, NewCredential, RotateReport, VaultError};
 pub use inbox::{Inbox, InboxEntry};
+pub use jws::signature_algorithm;
 pub use key_store::{DesktopKeyStore, EncryptionKeyStore, KeyStoreError, RetiredKey};
 pub use portable::{export_credentials, import_credentials, PortableError, PortableExport};
-pub use present::{present_same_device, Presented};
+pub use present::{
+    approve_presentation, ensure_self_issued_certificate, prepare_presentation,
+    present_same_device, refuse_presentation, PendingPresentation, Presentation,
+    PresentationSummary, Presented,
+};
 pub use redeem::{redeem_pre_authorized, RedeemError, Redeemed};
 pub use seal::{Aes256Key, SealError};
 pub use secret_service::SecretServiceKeyStore;

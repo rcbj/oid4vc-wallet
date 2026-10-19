@@ -1,6 +1,11 @@
 //! Check an issued credential's signature and the chain behind it.
 //!
-//! Published keys come from JWT VC Issuer Metadata
+//! A self-issued credential names its issuer with an RFC 9278 JWK thumbprint
+//! URI. That signature is checked against `cnf.jwk` in the credential. The
+//! thumbprint of that key has to be the issuer. This check does not use the
+//! network.
+//!
+//! Published keys for any other issuer come from JWT VC Issuer Metadata
 //! (`/.well-known/jwt-vc-issuer`, draft-ietf-oauth-sd-jwt-vc). That document
 //! carries a JWKS or a `jwks_uri`. A certificate chain in the JWS `x5c`
 //! header is completed from the RFC 5280 Authority Information Access
@@ -84,7 +89,8 @@ impl std::fmt::Display for ValidateError {
 
 impl std::error::Error for ValidateError {}
 
-/// Check the stored credential against the issuer on the network.
+/// Check the stored credential. A self-issued issuer is checked against the
+/// key named in the credential. Any other issuer is checked on the network.
 pub fn validate_stored(
     format: &str,
     issuer: &str,
@@ -188,6 +194,9 @@ pub(crate) fn validate_anchored<F: Fetch>(
     if issuer.is_empty() {
         return Err(ValidateError::NoIssuer);
     }
+    if super::credentials::is_jwk_thumbprint_uri(&issuer) {
+        return validate_self_issued(&jws, &issuer);
+    }
     let session = Session {
         fetch,
         issuer_host: url_host(&issuer).unwrap_or_default(),
@@ -256,6 +265,45 @@ pub(crate) fn validate_anchored<F: Fetch>(
         }
     }
     Err(ValidateError::NoKey)
+}
+
+/// The issuer is the thumbprint of the confirmation key, so the signature is
+/// checked with that key. A mismatch or a missing key is not a metadata
+/// lookup.
+fn validate_self_issued(jws: &jws::IssuerJws, issuer: &str) -> Result<Outcome, ValidateError> {
+    let Some(named) = confirmation_key(&jws.payload) else {
+        return Err(ValidateError::NoKey);
+    };
+    if named.thumbprint != issuer {
+        return Err(ValidateError::NoKey);
+    }
+    if !compatible(&jws.alg, &named.key) {
+        return Err(ValidateError::NoKey);
+    }
+    if jws::verifies(&jws.alg, &named.key, &jws.signing_input, &jws.signature) {
+        return Ok(Outcome::Accepted(t_args(
+            "wallet.validate.ok_self",
+            &[("algorithm", &jws.alg)],
+        )));
+    }
+    Err(ValidateError::BadSignature)
+}
+
+struct ConfirmationKey {
+    key: KeyMaterial,
+    thumbprint: String,
+}
+
+fn confirmation_key(payload: &[u8]) -> Option<ConfirmationKey> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let json = Json::parse(text).ok()?;
+    let jwk = json.get("cnf")?.get("jwk")?;
+    let key = jws::key_from_jwk(jwk)?;
+    let thumbprint = jws::jwk_thumbprint_uri(jwk)?;
+    Some(ConfirmationKey {
+        key: key.key,
+        thumbprint,
+    })
 }
 
 fn user_anchor(certs: &[OwnedCert], anchors: &[Vec<u8>]) -> Option<String> {
@@ -541,6 +589,14 @@ mod tests {
         }
     }
 
+    struct PanicFetch;
+
+    impl Fetch for PanicFetch {
+        fn get(&self, url: &str) -> Result<RawResponse, String> {
+            panic!("validation fetched {url}");
+        }
+    }
+
     fn meta() -> String {
         format!("{ISSUER}/.well-known/jwt-vc-issuer")
     }
@@ -718,6 +774,120 @@ mod tests {
             }
             other => panic!("expected a published key, got {other:?}"),
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn p256_jwk(signing: &p256::ecdsa::SigningKey) -> (String, String) {
+        let point = signing.verifying_key().to_encoded_point(false);
+        let bytes = point.as_bytes();
+        let x = b64::b64url_encode(&bytes[1..33]);
+        let y = b64::b64url_encode(&bytes[33..65]);
+        let jwk = format!(r#"{{"kty":"EC","crv":"P-256","x":"{x}","y":"{y}"}}"#);
+        let issuer = jws::jwk_thumbprint_uri(&Json::parse(&jwk).unwrap()).unwrap();
+        (jwk, issuer)
+    }
+
+    fn signed_sd_jwt(signing: &p256::ecdsa::SigningKey, issuer: &str, cnf_jwk: &str) -> String {
+        let payload = format!(
+            r#"{{"iss":"{issuer}","sub":"{issuer}","cnf":{{"jwk":{cnf_jwk}}},"iat":{NOW}}}"#
+        );
+        let header = r#"{"alg":"ES256","typ":"dc+sd-jwt"}"#;
+        let input = format!(
+            "{}.{}",
+            b64::b64url_encode(header.as_bytes()),
+            b64::b64url_encode(payload.as_bytes())
+        );
+        let signature: p256::ecdsa::Signature = signing.sign(input.as_bytes());
+        format!("{input}.{}~", b64::b64url_encode(&signature.to_bytes()))
+    }
+
+    #[test]
+    fn a_self_issued_credential_matches_the_key_it_names() {
+        let root = scratch("self");
+        let signing = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+        let (jwk, issuer) = p256_jwk(&signing);
+        let document = signed_sd_jwt(&signing, &issuer, &jwk);
+        let certificate = certs::self_signed_p256(&signing, &issuer, NOW).unwrap();
+        let with_certificate = signed_with_x5c(&signing, &issuer, &jwk, &certificate);
+        assert_eq!(certs::signer_certificates(&with_certificate).len(), 1);
+        for document in [document, with_certificate] {
+            let outcome = validate_with(
+                "dc+sd-jwt",
+                &issuer,
+                &document,
+                &PanicFetch,
+                &root.join("trust"),
+                NOW,
+            )
+            .unwrap();
+            match outcome {
+                Outcome::Accepted(text) => {
+                    assert!(text.contains("ES256"), "{text}");
+                    assert!(text.contains("names as its issuer"), "{text}");
+                    assert!(!text.contains(&issuer), "{text}");
+                }
+                other => panic!("expected the named key, got {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn signed_with_x5c(
+        signing: &p256::ecdsa::SigningKey,
+        issuer: &str,
+        cnf_jwk: &str,
+        certificate: &[u8],
+    ) -> String {
+        let payload = format!(
+            r#"{{"iss":"{issuer}","sub":"{issuer}","cnf":{{"jwk":{cnf_jwk}}},"iat":{NOW}}}"#
+        );
+        let header = format!(
+            r#"{{"alg":"ES256","typ":"dc+sd-jwt","x5c":["{}"]}}"#,
+            b64::b64_encode(certificate)
+        );
+        let input = format!(
+            "{}.{}",
+            b64::b64url_encode(header.as_bytes()),
+            b64::b64url_encode(payload.as_bytes())
+        );
+        let signature: p256::ecdsa::Signature = signing.sign(input.as_bytes());
+        format!("{input}.{}~", b64::b64url_encode(&signature.to_bytes()))
+    }
+
+    #[test]
+    fn a_self_issued_credential_rejects_a_bad_signature_or_a_different_key() {
+        let root = scratch("self-bad");
+        let trust = root.join("trust");
+        let signing = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+        let (jwk, issuer) = p256_jwk(&signing);
+        let document = signed_sd_jwt(&signing, &issuer, &jwk);
+        let broken = flip_signature(&document);
+        let err =
+            validate_with("dc+sd-jwt", &issuer, &broken, &PanicFetch, &trust, NOW).unwrap_err();
+        assert!(matches!(err, ValidateError::BadSignature), "{err}");
+        assert!(!err.to_string().contains("jwt-vc-issuer"));
+
+        let other = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+        let (other_jwk, _) = p256_jwk(&other);
+        let mismatched = signed_sd_jwt(&signing, &issuer, &other_jwk);
+        let err =
+            validate_with("dc+sd-jwt", &issuer, &mismatched, &PanicFetch, &trust, NOW).unwrap_err();
+        assert!(matches!(err, ValidateError::NoKey), "{err}");
+        assert!(!err.to_string().contains("jwt-vc-issuer"));
+
+        let payload = format!(r#"{{"iss":"{issuer}","sub":"{issuer}"}}"#);
+        let header = r#"{"alg":"ES256"}"#;
+        let input = format!(
+            "{}.{}",
+            b64::b64url_encode(header.as_bytes()),
+            b64::b64url_encode(payload.as_bytes())
+        );
+        let signature: p256::ecdsa::Signature = signing.sign(input.as_bytes());
+        let unnamed = format!("{input}.{}", b64::b64url_encode(&signature.to_bytes()));
+        let err =
+            validate_with("dc+sd-jwt", &issuer, &unnamed, &PanicFetch, &trust, NOW).unwrap_err();
+        assert!(matches!(err, ValidateError::NoKey), "{err}");
+        assert!(!err.to_string().contains("jwt-vc-issuer"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

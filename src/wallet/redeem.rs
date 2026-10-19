@@ -3,7 +3,10 @@
 //! The wallet reads the credential-issuer metadata and the authorization
 //! server metadata, sends the transaction code to the token endpoint with no
 //! `client_id`, fetches a `c_nonce`, and asks for the credential with an
-//! ES256 proof of possession. The messages are built in this crate.
+//! ES256 proof of possession. When the issuer advertises
+//! `batch_credential_issuance.batch_size`, one proof is sent for each copy
+//! and every returned credential is kept with the key it is bound to. The
+//! messages are built in this crate.
 
 use crate::i18n::{t, t_args};
 use crate::protocol::offer::{CredentialOffer, PRE_AUTHORIZED_CODE_GRANT};
@@ -58,11 +61,12 @@ pub trait IssuerHttp {
 }
 
 /// Redeem `offer` at its issuer. `tx_code` is what the person typed. Pass
-/// `None` only when the offer did not ask for one.
+/// `None` only when the offer did not ask for one. One entry is returned
+/// for each credential the issuer issued.
 pub fn redeem_pre_authorized(
     offer: &CredentialOffer,
     tx_code: Option<&str>,
-) -> Result<Redeemed, RedeemError> {
+) -> Result<Vec<Redeemed>, RedeemError> {
     redeem_with(offer, tx_code, &LiveIssuer, now_seconds())
 }
 
@@ -71,7 +75,7 @@ pub(crate) fn redeem_with(
     tx_code: Option<&str>,
     http: &dyn IssuerHttp,
     now: u64,
-) -> Result<Redeemed, RedeemError> {
+) -> Result<Vec<Redeemed>, RedeemError> {
     let grant = offer
         .grants
         .pre_authorized_code
@@ -150,7 +154,9 @@ pub(crate) fn redeem_with(
         token.get("c_nonce"),
     )?;
     let identifier = granted_identifier(&token, &configuration)?;
-    let proof = proof::sign_proof(&credential_issuer, &nonce, now);
+    let proofs: Vec<proof::Proof> = (0..proof_count(&issuer_metadata))
+        .map(|_| proof::sign_proof(&credential_issuer, &nonce, now))
+        .collect();
     let mut body = Vec::new();
     if let Some(identifier) = identifier {
         body.push((
@@ -167,7 +173,12 @@ pub(crate) fn redeem_with(
         "proofs".to_string(),
         Json::Object(vec![(
             "jwt".to_string(),
-            Json::Array(vec![Json::String(proof.jwt)]),
+            Json::Array(
+                proofs
+                    .iter()
+                    .map(|proof| Json::String(proof.jwt.clone()))
+                    .collect(),
+            ),
         )]),
     ));
     let credential_http = http.post(
@@ -184,13 +195,12 @@ pub(crate) fn redeem_with(
         credential_http,
         "wallet.redeem.credential",
     )?;
-    let document = credential_document(&credential_json)?;
-    Ok(Redeemed {
+    bind_issued(
         format,
-        issuer: credential_issuer,
-        document,
-        holder_key: proof.private_jwk,
-    })
+        credential_issuer,
+        credential_documents(&credential_json)?,
+        proofs,
+    )
 }
 
 fn checked_tx_code(
@@ -296,27 +306,129 @@ fn configuration_format(metadata: &Json, configuration: &str) -> Result<String, 
     Ok(format.to_string())
 }
 
-fn credential_document(body: &Json) -> Result<String, RedeemError> {
+/// How many proofs one request carries. The issuer's
+/// `batch_credential_issuance.batch_size` is the number of keys it will
+/// bind. A missing or empty advertisement is one key. The ceiling keeps a
+/// metadata document from asking for an unbounded number of keys.
+const MAX_PROOFS: u64 = 32;
+
+fn proof_count(metadata: &Json) -> usize {
+    let size = metadata
+        .get("batch_credential_issuance")
+        .and_then(|batch| batch.get("batch_size"))
+        .and_then(Json::as_u64)
+        .unwrap_or(1);
+    size.clamp(1, MAX_PROOFS) as usize
+}
+
+fn credential_documents(body: &Json) -> Result<Vec<String>, RedeemError> {
+    let mut documents = Vec::new();
     if let Some(credentials) = body.get("credentials").and_then(|value| value.as_array()) {
-        if let Some(first) = credentials.first() {
-            if let Some(document) = first.get("credential").and_then(|value| value.as_str()) {
+        for credential in credentials {
+            if let Some(document) = credential
+                .get("credential")
+                .and_then(|value| value.as_str())
+                .or_else(|| credential.as_str())
+            {
                 if !document.is_empty() {
-                    return Ok(document.to_string());
-                }
-            }
-            if let Some(document) = first.as_str() {
-                if !document.is_empty() {
-                    return Ok(document.to_string());
+                    documents.push(document.to_string());
                 }
             }
         }
     }
-    if let Some(document) = body.get("credential").and_then(|value| value.as_str()) {
-        if !document.is_empty() {
-            return Ok(document.to_string());
+    if documents.is_empty() {
+        if let Some(document) = body.get("credential").and_then(|value| value.as_str()) {
+            if !document.is_empty() {
+                documents.push(document.to_string());
+            }
         }
     }
-    Err(err(t("wallet.redeem.no_credential")))
+    if documents.is_empty() {
+        return Err(err(t("wallet.redeem.no_credential")));
+    }
+    Ok(documents)
+}
+
+fn bind_issued(
+    format: String,
+    issuer: String,
+    documents: Vec<String>,
+    proofs: Vec<proof::Proof>,
+) -> Result<Vec<Redeemed>, RedeemError> {
+    if documents.len() == 1 && proofs.len() == 1 {
+        let proof = proofs.into_iter().next().expect("one proof");
+        let document = documents.into_iter().next().expect("one credential");
+        return Ok(vec![Redeemed {
+            format,
+            issuer,
+            document,
+            holder_key: proof.private_jwk,
+        }]);
+    }
+    let mut unused: Vec<Option<proof::Proof>> = proofs.into_iter().map(Some).collect();
+    let mut issued = Vec::with_capacity(documents.len());
+    for document in documents {
+        let Some(point) = bound_point(&document) else {
+            return Err(err(t("wallet.redeem.key_match")));
+        };
+        let index = unused.iter().position(|proof| {
+            proof
+                .as_ref()
+                .and_then(proof_point)
+                .is_some_and(|candidate| candidate == point)
+        });
+        let Some(index) = index else {
+            return Err(err(t("wallet.redeem.key_match")));
+        };
+        let proof = unused[index].take().expect("unused proof");
+        issued.push(Redeemed {
+            format: format.clone(),
+            issuer: issuer.clone(),
+            document,
+            holder_key: proof.private_jwk,
+        });
+    }
+    Ok(issued)
+}
+
+/// The P-256 point a credential names as its holder, from `cnf.jwk` or from
+/// a `did:jwk` subject id.
+fn bound_point(document: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let jwt = document.split('~').next().unwrap_or(document).trim();
+    if let Some(payload) = jwt.split('.').nth(1) {
+        if let Some(point) = payload_point(payload) {
+            return Some(point);
+        }
+    }
+    let json = Json::parse(document.trim()).ok()?;
+    let id = json
+        .get("credentialSubject")
+        .and_then(|subject| subject.get("id"))
+        .and_then(Json::as_str)?;
+    let encoded = id.strip_prefix("did:jwk:")?.split('#').next()?;
+    let bytes = super::b64::b64_decode(encoded)?;
+    let jwk = Json::parse(std::str::from_utf8(&bytes).ok()?).ok()?;
+    jwk_point(&jwk)
+}
+
+fn payload_point(payload: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let bytes = super::b64::b64_decode(payload)?;
+    let json = Json::parse(std::str::from_utf8(&bytes).ok()?).ok()?;
+    jwk_point(json.get("cnf")?.get("jwk")?)
+}
+
+fn proof_point(proof: &proof::Proof) -> Option<(Vec<u8>, Vec<u8>)> {
+    jwk_point(&Json::parse(&proof.private_jwk).ok()?)
+}
+
+fn jwk_point(jwk: &Json) -> Option<(Vec<u8>, Vec<u8>)> {
+    let x = super::b64::b64_decode(jwk.get("x")?.as_str()?)?;
+    let y = super::b64::b64_decode(jwk.get("y")?.as_str()?)?;
+    if x.is_empty() || y.is_empty() {
+        None
+    } else {
+        Some((x, y))
+    }
 }
 
 fn json_ok(url: &str, fetched: Fetched, error_key: &str) -> Result<Json, RedeemError> {
@@ -555,6 +667,8 @@ mod tests {
             },
         ]);
         let redeemed = redeem_with(&offer(), Some("12345"), &script, 1_700_000_000).unwrap();
+        assert_eq!(redeemed.len(), 1);
+        let redeemed = &redeemed[0];
         assert_eq!(redeemed.format, "dc+sd-jwt");
         assert_eq!(redeemed.issuer, "https://issuer.example");
         assert_eq!(redeemed.document, "header.payload.sig");
@@ -585,16 +699,15 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("IdentityCredential")
         );
-        let jwt = request
+        let jwts = request
             .get("proofs")
             .unwrap()
             .get("jwt")
             .unwrap()
             .as_array()
-            .unwrap()[0]
-            .as_str()
             .unwrap();
-        assert_eq!(jwt.split('.').count(), 3);
+        assert_eq!(jwts.len(), 1);
+        assert_eq!(jwts[0].as_str().unwrap().split('.').count(), 3);
         assert!(script.steps.lock().unwrap().is_empty());
     }
 
@@ -640,7 +753,8 @@ mod tests {
             Fetched { status: 200, body: r#"{"credential":"one"}"#.to_string() },
         ]);
         let redeemed = redeem_with(&offer(), Some("12345"), &script, 1).unwrap();
-        assert_eq!(redeemed.document, "one");
+        assert_eq!(redeemed.len(), 1);
+        assert_eq!(redeemed[0].document, "one");
         let body = Json::parse(&script.seen.lock().unwrap()[4].2).unwrap();
         assert!(body.get("credential_configuration_id").is_none());
         assert_eq!(
@@ -692,5 +806,239 @@ mod tests {
             url,
             "https://issuer.example/.well-known/oauth-authorization-server/realm/acme"
         );
+    }
+
+    /// Answers the credential request from the proofs that were just sent.
+    struct BatchIssuer {
+        steps: Mutex<Vec<Fetched>>,
+        seen: Mutex<Vec<(String, String, String, String)>>,
+        returned: usize,
+        mismatch: bool,
+    }
+
+    impl IssuerHttp for BatchIssuer {
+        fn get(&self, url: &str) -> Result<Fetched, RedeemError> {
+            self.seen.lock().unwrap().push((
+                "GET".to_string(),
+                url.to_string(),
+                String::new(),
+                String::new(),
+            ));
+            Ok(self.steps.lock().unwrap().remove(0))
+        }
+
+        fn post(
+            &self,
+            url: &str,
+            content_type: &str,
+            authorization: Option<&str>,
+            body: &str,
+        ) -> Result<Fetched, RedeemError> {
+            self.seen.lock().unwrap().push((
+                format!("POST {content_type}"),
+                url.to_string(),
+                body.to_string(),
+                authorization.unwrap_or("").to_string(),
+            ));
+            if url.ends_with("/oid4vci/credential") {
+                return Ok(Fetched {
+                    status: 200,
+                    body: credentials_for(body, self.returned, self.mismatch),
+                });
+            }
+            Ok(self.steps.lock().unwrap().remove(0))
+        }
+    }
+
+    fn issuer_meta_batch(size: u64) -> String {
+        format!(
+            r#"{{"credential_issuer":"https://issuer.example","credential_endpoint":"https://issuer.example/oid4vci/credential","nonce_endpoint":"https://issuer.example/oid4vci/nonce","authorization_servers":["https://issuer.example"],"batch_credential_issuance":{{"batch_size":{size}}},"credential_configurations_supported":{{"IdentityCredential":{{"format":"dc+sd-jwt"}}}}}}"#
+        )
+    }
+
+    fn public_jwk(jwt: &str) -> Json {
+        let header = jwt.split('.').next().unwrap();
+        let bytes = crate::wallet::b64::b64_decode(header).unwrap();
+        let json = Json::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        let jwk = json.get("jwk").unwrap();
+        Json::Object(vec![
+            ("kty".to_string(), jwk.get("kty").unwrap().clone()),
+            ("crv".to_string(), jwk.get("crv").unwrap().clone()),
+            ("x".to_string(), jwk.get("x").unwrap().clone()),
+            ("y".to_string(), jwk.get("y").unwrap().clone()),
+        ])
+    }
+
+    fn credential_bound_to(jwk: &Json) -> String {
+        let payload = Json::Object(vec![(
+            "cnf".to_string(),
+            Json::Object(vec![("jwk".to_string(), jwk.clone())]),
+        )]);
+        let encoded = crate::wallet::b64::b64url_encode(payload.to_string().as_bytes());
+        format!("e30.{encoded}.c2ln~")
+    }
+
+    fn credentials_for(body: &str, returned: usize, mismatch: bool) -> String {
+        let request = Json::parse(body).unwrap();
+        let jwts = request
+            .get("proofs")
+            .unwrap()
+            .get("jwt")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let mut documents = Vec::new();
+        if mismatch {
+            let jwk = Json::Object(vec![
+                ("kty".to_string(), Json::String("EC".to_string())),
+                ("crv".to_string(), Json::String("P-256".to_string())),
+                (
+                    "x".to_string(),
+                    Json::String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+                ),
+                (
+                    "y".to_string(),
+                    Json::String("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string()),
+                ),
+            ]);
+            documents.push(Json::Object(vec![(
+                "credential".to_string(),
+                Json::String(credential_bound_to(&jwk)),
+            )]));
+        } else {
+            for jwt in jwts.iter().rev().take(returned) {
+                let jwk = public_jwk(jwt.as_str().unwrap());
+                documents.push(Json::Object(vec![(
+                    "credential".to_string(),
+                    Json::String(credential_bound_to(&jwk)),
+                )]));
+            }
+        }
+        Json::Object(vec![("credentials".to_string(), Json::Array(documents))]).to_string()
+    }
+
+    fn coordinate(jwk_text: &str, name: &str) -> String {
+        Json::parse(jwk_text)
+            .unwrap()
+            .get(name)
+            .and_then(Json::as_str)
+            .unwrap()
+            .to_string()
+    }
+
+    fn document_coordinate(document: &str, name: &str) -> String {
+        let payload = document
+            .split('~')
+            .next()
+            .unwrap()
+            .split('.')
+            .nth(1)
+            .unwrap();
+        let bytes = crate::wallet::b64::b64_decode(payload).unwrap();
+        let json = Json::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        json.get("cnf")
+            .unwrap()
+            .get("jwk")
+            .unwrap()
+            .get(name)
+            .and_then(Json::as_str)
+            .unwrap()
+            .to_string()
+    }
+
+    fn batch_steps(size: u64) -> Vec<Fetched> {
+        vec![
+            Fetched {
+                status: 200,
+                body: issuer_meta_batch(size),
+            },
+            Fetched {
+                status: 200,
+                body: as_meta(),
+            },
+            Fetched {
+                status: 200,
+                body: r#"{"access_token":"access-1","token_type":"Bearer"}"#.to_string(),
+            },
+            Fetched {
+                status: 200,
+                body: r#"{"c_nonce":"nonce-9"}"#.to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_batch_stores_every_credential_with_its_own_key() {
+        let http = BatchIssuer {
+            steps: Mutex::new(batch_steps(4)),
+            seen: Mutex::new(Vec::new()),
+            returned: 4,
+            mismatch: false,
+        };
+        let redeemed = redeem_with(&offer(), Some("12345"), &http, 1_700_000_000).unwrap();
+        assert_eq!(redeemed.len(), 4);
+        let mut seen_x = Vec::new();
+        for one in &redeemed {
+            assert_eq!(
+                coordinate(&one.holder_key, "x"),
+                document_coordinate(&one.document, "x")
+            );
+            assert_eq!(
+                coordinate(&one.holder_key, "y"),
+                document_coordinate(&one.document, "y")
+            );
+            assert!(one.holder_key.contains("\"d\""));
+            seen_x.push(coordinate(&one.holder_key, "x"));
+        }
+        seen_x.sort();
+        seen_x.dedup();
+        assert_eq!(seen_x.len(), 4);
+        let request = Json::parse(&http.seen.lock().unwrap()[4].2).unwrap();
+        let jwts = request
+            .get("proofs")
+            .unwrap()
+            .get("jwt")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(jwts.len(), 4);
+        let body = &http.seen.lock().unwrap()[4].2;
+        for one in &redeemed {
+            let secret = coordinate(&one.holder_key, "d");
+            assert!(!body.contains(&secret));
+        }
+    }
+
+    #[test]
+    fn a_short_batch_keeps_only_the_credentials_the_issuer_returned() {
+        let http = BatchIssuer {
+            steps: Mutex::new(batch_steps(4)),
+            seen: Mutex::new(Vec::new()),
+            returned: 2,
+            mismatch: false,
+        };
+        let redeemed = redeem_with(&offer(), Some("12345"), &http, 1_700_000_000).unwrap();
+        assert_eq!(redeemed.len(), 2);
+        for one in &redeemed {
+            assert_eq!(
+                coordinate(&one.holder_key, "x"),
+                document_coordinate(&one.document, "x")
+            );
+        }
+    }
+
+    #[test]
+    fn a_credential_bound_to_another_key_is_refused() {
+        let http = BatchIssuer {
+            steps: Mutex::new(batch_steps(4)),
+            seen: Mutex::new(Vec::new()),
+            returned: 1,
+            mismatch: true,
+        };
+        let error = match redeem_with(&offer(), Some("12345"), &http, 1_700_000_000) {
+            Err(error) => error,
+            Ok(_) => panic!("an unmatched credential must not be stored"),
+        };
+        assert!(error.message.contains("not bound"), "{}", error.message);
     }
 }
