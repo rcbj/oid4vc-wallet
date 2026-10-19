@@ -41,6 +41,29 @@ pub fn open_return(url: &str) -> Result<(), String> {
     spawn("xdg-open", &[url.to_string()])
 }
 
+/// Open a documentation page with the desktop browser.
+///
+/// A page that is not `https`, or that names a user or `localhost`, is refused
+/// before any program is started. Verifier returns use `open_return`.
+pub fn open_https(url: &str) -> Result<(), String> {
+    if !https_page(url) {
+        return Err("refused".to_string());
+    }
+    spawn("xdg-open", &[url.to_string()])
+}
+
+pub(crate) fn https_page(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.split(':').next().unwrap_or("");
+    !host.is_empty() && !host.contains('@') && !host.eq_ignore_ascii_case("localhost")
+}
+
 fn caller_of(url: &str) -> Option<Launch> {
     let endpoint = endpoint_of(url)?;
     let peers = peers_of(&endpoint);
@@ -374,6 +397,20 @@ mod tests {
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
             start,
         }
+    }
+
+    #[test]
+    fn an_https_page_is_opened_and_other_urls_are_refused() {
+        assert!(https_page("https://rcbj.github.io/oid4vc-wallet/"));
+        assert!(https_page(
+            "https://github.com/rcbj/oid4vc-wallet/blob/main/LICENSE"
+        ));
+        assert!(!https_page("http://rcbj.github.io/oid4vc-wallet/"));
+        assert!(!https_page("https://"));
+        assert!(!https_page("https://user@github.com/rcbj/oid4vc-wallet"));
+        assert!(!https_page("https://localhost/oid4vc-wallet"));
+        assert!(!https_page("https://rcbj.github.io/oid4vc-wallet/\n"));
+        assert!(open_https("http://example.com").is_err());
     }
 
     #[test]

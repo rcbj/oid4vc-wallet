@@ -185,7 +185,7 @@ A later `siopv2://` sign-in sends the same subject, so iya-sts can recognize the
 
 ## Settings {#settings}
 
-**Settings** has five tabs: **Language**, **Registration**, **Trust anchors**, **Security**, and **Import and export**.
+**Settings** has six tabs: **Language**, **Registration**, **Trust anchors**, **Security**, **Import and export**, and **About**.
 
 ### Language {#language}
 
@@ -259,6 +259,10 @@ To bring a file onto this computer:
 The wallet opens the file with that export key and stores the credentials under this computer's own storage key. After a successful import, the key box is emptied.
 
 The export key is not the storage key. **Rotate encryption key** does not change the key inside an export file you already wrote. An old file still opens with the key that was shown when that file was written.
+
+### About {#about}
+
+**About** shows Copyright 2026 Iya CyberSecurity Solutions, LLC. It also opens the documentation for this wallet, the GitHub page where you can ask for help, and the Business Source License.
 
 ## One window {#one-window}
 

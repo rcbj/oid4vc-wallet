@@ -7,7 +7,7 @@
 //! same-device request from the credential list, answer a self-issued ID
 //! Token request, show the signer certificate chain carried in a credential,
 //! and open Settings for the language, the protocol handlers, trust anchors,
-//! the storage key, and import and export.
+//! the storage key, import and export, and About.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -47,7 +47,23 @@ enum SettingsTab {
     Trust,
     Security,
     ImportExport,
+    About,
 }
+
+const ABOUT_PAGES: &[(&str, &str)] = &[
+    (
+        "wallet.ui.about_docs",
+        "https://rcbj.github.io/oid4vc-wallet/",
+    ),
+    (
+        "wallet.ui.about_help",
+        "https://github.com/rcbj/oid4vc-wallet/issues",
+    ),
+    (
+        "wallet.ui.about_license",
+        "https://github.com/rcbj/oid4vc-wallet/blob/main/LICENSE",
+    ),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AcceptTab {
@@ -1156,6 +1172,11 @@ impl WalletApp {
             {
                 self.reload_credentials();
             }
+            ui.selectable_value(
+                &mut self.settings_tab,
+                SettingsTab::About,
+                t("wallet.ui.about"),
+            );
         });
         ui.separator();
         match self.settings_tab {
@@ -1164,6 +1185,40 @@ impl WalletApp {
             SettingsTab::Trust => self.trust_tab(ui),
             SettingsTab::Security => self.security_tab(ui),
             SettingsTab::ImportExport => self.import_export_tab(ui),
+            SettingsTab::About => self.about_tab(ui),
+        }
+    }
+
+    fn about_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(t("wallet.ui.about_copyright"));
+        ui.add_space(8.0);
+        ui.label(t("wallet.ui.about_license_note"));
+        ui.add_space(8.0);
+        for (key, url) in ABOUT_PAGES {
+            self.about_link(ui, key, url);
+        }
+    }
+
+    fn about_link(&mut self, ui: &mut egui::Ui, key: &str, url: &str) {
+        ui.add_space(6.0);
+        if ui.link(t(key)).clicked() {
+            self.open_about(url);
+        }
+        if ui
+            .link(egui::RichText::new(url).small().monospace())
+            .clicked()
+        {
+            self.open_about(url);
+        }
+    }
+
+    fn open_about(&mut self, url: &str) {
+        if !crate::browser::https_page(url) {
+            self.fail(t("wallet.ui.about_refused"));
+            return;
+        }
+        if let Err(err) = crate::browser::open_https(url) {
+            self.fail(t_args("wallet.ui.about_open_failed", &[("error", &err)]));
         }
     }
 
@@ -2482,6 +2537,26 @@ mod tests {
     use oid4vc_wallet::wallet::Inbox;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn about_pages_are_public_https_links() {
+        let mut keys = Vec::new();
+        for (key, url) in super::ABOUT_PAGES {
+            assert!(crate::browser::https_page(url), "{url}");
+            keys.push(*key);
+        }
+        assert_eq!(
+            keys,
+            [
+                "wallet.ui.about_docs",
+                "wallet.ui.about_help",
+                "wallet.ui.about_license",
+            ]
+        );
+        assert!(crate::browser::https_page(
+            "https://rcbj.github.io/oid4vc-wallet/"
+        ));
+    }
 
     #[test]
     fn a_wrapped_issuer_line_is_not_letter_spaced() {
