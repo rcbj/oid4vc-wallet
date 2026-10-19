@@ -1,0 +1,32 @@
+# Jekyll configuration for the wallet documentation site.
+#
+# GitHub's Pages workflow builds this directory. See
+# ../.github/workflows/pages.yml, which runs actions/jekyll-build-pages with
+# source ./docs. minima is the theme GitHub Pages ships, so this directory
+# does not vendor a theme and does not add a Gemfile.
+title: OID4VC Wallet
+description: >-
+  A Linux wallet for OpenID4VCI credential offers and OpenID4VP / SIOPv2
+  requests.
+theme: minima
+
+# The published site is https://rcbj.github.io/oid4vc-wallet/. Links in the
+# markdown are relative paths such as guide.md, which read correctly in the
+# repository. jekyll-relative-links turns those into guide.html on the site.
+# configure-pages supplies the base URL in the workflow. This value is the
+# fallback for a local `jekyll serve`.
+baseurl: "/oid4vc-wallet"
+
+header_pages:
+  - guide.md
+
+# GitHub Pages loads jekyll-default-layout and jekyll-relative-links. A local
+# `jekyll build` does not, unless they are named here. The published site is
+# unchanged either way.
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+plugins:
+  - jekyll-relative-links

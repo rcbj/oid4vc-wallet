@@ -5,7 +5,13 @@
 //! are sealed with AES-256-GCM. The key is kept in GNOME Keyring, or in
 //! KWallet when the Secret Service is not running. Display text uses the
 //! languages iya-sts ships. [`i18n`] is that catalog. The
-//! `oid4vc-wallet --ui` command opens a window for the same operations.
+//! `oid4vc-wallet --ui` command opens a window for the same operations. A
+//! pre-authorized offer in that window asks for the transaction code and
+//! redeems the credential from the issuer. A same-device presentation request
+//! opens the credential list, selects a matching stored credential, and
+//! returns the browser to the verifier. Validate checks the issuer signature
+//! on a stored credential, including the published key and certificate chain.
+//! An inbox entry can be deleted on its own.
 
 pub mod i18n;
 pub mod linux;

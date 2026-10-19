@@ -1,0 +1,90 @@
+# Publishes docs/ as a Jekyll site on GitHub Pages.
+#
+# This is the same arrangement as iya-sts (.github/workflows/pages.yml there):
+# actions/configure-pages, actions/jekyll-build-pages, actions/deploy-pages.
+# The token below can deploy to a Pages site. It cannot create one. Creating
+# the site is an admin call, done once:
+#
+#   gh api -X POST repos/rcbj/oid4vc-wallet/pages -f build_type=workflow
+#
+# Settings → Pages → Source: GitHub Actions is the same step. Until that exists,
+# configure-pages fails with "Get Pages site failed" / Not Found.
+# `enablement: true` is kept so a fork whose token can create the site needs no
+# extra step. On this repository that request is refused, and the refusal is
+# not what is wrong with the workflow.
+#
+# There is no generated API reference, so a push that does not touch docs/ or
+# this file does not rebuild the site. iya-sts dropped that filter when its
+# JSDoc job started publishing source comments.
+name: Deploy docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# contents stays read. Nothing here pushes a branch.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. A queued run is not cancelled: cancelling a Pages
+# deploy can leave the site half on one build and half on the next.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      # The site is docs/ and nothing above it. README.md and the source tree
+      # are not published. The base URL comes from configure-pages. The
+      # baseurl in docs/_config.yml is the fallback for a local jekyll serve.
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+
+      # jekyll-build-pages succeeds on an empty source directory and would
+      # deploy a blank site. index.html is what docs/index.md must have become.
+      - name: Check the site is not empty
+        run: |
+          if [ ! -f _site/index.html ]; then
+            echo "_site/index.html is missing — docs/index.md did not render." >&2
+            ls -la _site || true
+            exit 1
+          fi
+          if [ ! -f _site/guide.html ]; then
+            echo "_site/guide.html is missing — docs/guide.md did not render." >&2
+            exit 1
+          fi
+          echo "Built $(find _site -name '*.html' | wc -l) page(s)."
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

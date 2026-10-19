@@ -21,15 +21,35 @@ categories = ["command-line-utilities", "gui"]
 # bus. vendored builds the D-Bus client without a separate libdbus
 # development package.
 #
-# eframe draws the --ui window. image decodes the window icon. Neither crate
-# is used by the protocol code.
+# eframe draws the --ui window. image decodes the window icon. p256 signs the
+# OpenID4VCI proof of possession. rustls is the TLS stack. The signature
+# crates (p256, p384, p521, k256, rsa, ed25519-dalek, ed448-goldilocks-plus,
+# fips204, fips205) and x509-parser check credential signatures and
+# certificate chains. None of these crates implements OpenID4VCI, OpenID4VP,
+# SIOPv2, SD-JWT, or JOSE.
 
 [dependencies]
 aes-gcm = "0.10"
 dbus = { version = "0.9", features = ["vendored"] }
+ed25519-dalek = "3.0.0"
+ed448-goldilocks-plus = "0.18.1"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "system_fonts", "glow", "x11", "clipboard"] }
+fips204 = "0.4.6"
+fips205 = "0.4.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+k256 = "0.14.0"
 keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "std"] }
+p384 = "0.14.0"
+p521 = "0.14.0"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rsa = "0.9.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+sha2 = { version = "0.10", features = ["oid"] }
+sha3 = "0.10"
+webpki-roots = "1"
+x509-parser = "0.18.1"
 zeroize = "1"
 
 [lib]
@@ -39,3 +59,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "oid4vc-wallet"
 path = "src/main.rs"
+
+[dev-dependencies]
+rcgen = "0.14.10"

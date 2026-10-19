@@ -1,9 +1,11 @@
 //! OpenID4VCI credential offers and OpenID4VP / SIOPv2 authorization requests.
 //!
 //! Nothing in this module calls another crate. Parsing, validation and the
-//! summaries a person reads are all first-party code. Fetching an offer or a
-//! request by reference, and redeeming or answering one, are later steps:
-//! this module stops once the invocation the desktop handed over is understood.
+//! summaries a person reads are all first-party code. Fetching an offer by
+//! reference stays outside this module. Answering a same-device presentation
+//! request is `wallet::present_same_device`. Redeeming a pre-authorized offer
+//! is `wallet::redeem`. Checking an issued credential's signature is
+//! `wallet::validate_stored`.
 
 mod http_url;
 mod json;

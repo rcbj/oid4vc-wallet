@@ -6,11 +6,15 @@ on:
 
 jobs:
   test:
+    name: Headless tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install window libraries
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libraries the window links
         run: sudo apt-get update && sudo apt-get install -y pkg-config libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev libfontconfig1-dev
-      - name: Test
-        run: cargo test
+      - name: Run the headless suite
+        run: sh ./install/test.sh

@@ -7,9 +7,11 @@
 //! the login keyring on GNOME.
 
 use keyring::Entry;
+use zeroize::Zeroize;
 
 use super::key_store::{
-    key_from_store, secret_service_is_absent, KeyStoreError, Probe, KEY_SERVICE, KEY_USER,
+    decode_retired, encode_retired, key_from_store, secret_service_is_absent, KeyStoreError, Probe,
+    RetiredKey, KEY_HISTORY_USER, KEY_SERVICE, KEY_USER,
 };
 use super::seal::Aes256Key;
 
@@ -61,8 +63,30 @@ impl SecretServiceKeyStore {
     }
 
     pub(super) fn store_key(&self, key: &Aes256Key) -> Result<(), KeyStoreError> {
-        let entry = self.entry()?;
-        match entry.set_secret(key.as_bytes()) {
+        self.set_secret(&self.user, key.as_bytes())
+    }
+
+    /// The history item is the same service and the same `set_secret` path as the key.
+    pub(super) fn load_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
+        let entry = self.entry_for(KEY_HISTORY_USER)?;
+        match entry.get_secret() {
+            Ok(bytes) => decode_retired(bytes),
+            Err(keyring::Error::NoEntry) => Ok(Vec::new()),
+            Err(err) if secret_service_is_absent(&err) => Err(KeyStoreError::Unavailable),
+            Err(err) => Err(KeyStoreError::Store(err.to_string())),
+        }
+    }
+
+    pub(super) fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
+        let mut secret = encode_retired(keys);
+        let result = self.set_secret(KEY_HISTORY_USER, &secret);
+        secret.zeroize();
+        result
+    }
+
+    fn set_secret(&self, user: &str, secret: &[u8]) -> Result<(), KeyStoreError> {
+        let entry = self.entry_for(user)?;
+        match entry.set_secret(secret) {
             Ok(()) => Ok(()),
             Err(err) if secret_service_is_absent(&err) => Err(KeyStoreError::Unavailable),
             Err(err) => Err(KeyStoreError::Store(err.to_string())),
@@ -70,7 +94,11 @@ impl SecretServiceKeyStore {
     }
 
     fn entry(&self) -> Result<Entry, KeyStoreError> {
-        Entry::new(&self.service, &self.user).map_err(|err| KeyStoreError::Store(err.to_string()))
+        self.entry_for(&self.user)
+    }
+
+    fn entry_for(&self, user: &str) -> Result<Entry, KeyStoreError> {
+        Entry::new(&self.service, user).map_err(|err| KeyStoreError::Store(err.to_string()))
     }
 }
 

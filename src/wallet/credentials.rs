@@ -20,7 +20,9 @@ use crate::protocol::is_http_url;
 use crate::protocol::Json;
 
 use super::inbox::utc_stamp;
-use super::key_store::{DesktopKeyStore, EncryptionKeyStore, KeyStoreError};
+use super::key_store::{
+    DesktopKeyStore, EncryptionKeyStore, KeyStoreError, RetiredKey, RETIRED_KEY_SECS,
+};
 use super::seal::{self, Aes256Key, SealError};
 
 /// The largest credential document this wallet will store.
@@ -36,6 +38,10 @@ pub struct Credential {
     pub received_at: String,
     /// The credential itself: a JWT, an SD-JWT, or a JSON-LD document.
     pub document: String,
+    /// Private JWK for a key this wallet bound the credential to. Absent when
+    /// the document was stored with `credential add`. It stays inside the
+    /// sealed file and is not printed.
+    pub holder_key: Option<String>,
 }
 
 /// What the caller supplies. The id and the time are assigned here.
@@ -43,6 +49,9 @@ pub struct NewCredential {
     pub format: String,
     pub issuer: String,
     pub document: String,
+    /// Private JWK, sealed with the document. `None` for a document the
+    /// person pasted in.
+    pub holder_key: Option<String>,
 }
 
 /// The credential directory, opened with a particular key store.
@@ -75,6 +84,11 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
         &self.root
     }
 
+    #[cfg(test)]
+    fn keys(&self) -> &K {
+        &self.keys
+    }
+
     /// Seal a credential and return it, including the id it was given.
     pub fn put(&self, new: NewCredential) -> Result<Credential, VaultError> {
         let format = require_format(&new.format)?;
@@ -86,16 +100,18 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
             issuer,
             received_at: utc_stamp(now_millis()),
             document,
+            holder_key: new.holder_key,
         };
         self.write(&credential)?;
         Ok(credential)
     }
 
-    /// Open one credential.
+    /// Open one credential. The current key is tried first, then each retired
+    /// key whose `expires_at` is still in the future.
     pub fn get(&self, id: &str) -> Result<Credential, VaultError> {
         require_id(id)?;
-        let key = self.key_for_read()?;
-        self.read_file(&key, id)
+        let keys = self.opening_keys()?;
+        self.read_with(&keys, id)
     }
 
     /// Open every credential. The document is included.
@@ -104,10 +120,10 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let key = self.key_for_read()?;
+        let keys = self.opening_keys()?;
         let mut credentials = Vec::with_capacity(ids.len());
         for id in ids {
-            credentials.push(self.read_file(&key, &id)?);
+            credentials.push(self.read_with(&keys, &id)?);
         }
         credentials.sort_by(|left, right| {
             left.received_at
@@ -115,6 +131,42 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
                 .then_with(|| left.id.cmp(&right.id))
         });
         Ok(credentials)
+    }
+
+    /// Draw a new AES-256 key, keep the current key for 90 days, and seal
+    /// every stored credential with the new key.
+    pub fn rotate(&self) -> Result<RotateReport, VaultError> {
+        let ids = self.ids()?;
+        let records = if ids.is_empty() {
+            Vec::new()
+        } else {
+            let keys = self.opening_keys()?;
+            let mut records = Vec::with_capacity(ids.len());
+            for id in &ids {
+                records.push(self.read_with(&keys, id)?);
+            }
+            records
+        };
+        let new_key = Aes256Key::generate();
+        let now = now_secs();
+        let mut retired = self.keys.load_retired().map_err(VaultError::Key)?;
+        retired.retain(|item| item.expires_at > now);
+        if let Some(current) = self.keys.load_key().map_err(VaultError::Key)? {
+            retired.push(RetiredKey {
+                key: current,
+                expires_at: now.saturating_add(RETIRED_KEY_SECS),
+            });
+        }
+        // The previous key is in history before the current item is replaced,
+        // so a crash while files are rewritten can still open them.
+        self.keys.store_retired(&retired).map_err(VaultError::Key)?;
+        self.keys.store_key(&new_key).map_err(VaultError::Key)?;
+        for credential in &records {
+            self.write_with(&new_key, credential)?;
+        }
+        Ok(RotateReport {
+            count: records.len(),
+        })
     }
 
     /// Remove one credential file. The AES-256 key stays in the credential store.
@@ -131,6 +183,11 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
     }
 
     fn write(&self, credential: &Credential) -> Result<(), VaultError> {
+        let key = self.key_for_write()?;
+        self.write_with(&key, credential)
+    }
+
+    fn write_with(&self, key: &Aes256Key, credential: &Credential) -> Result<(), VaultError> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         builder.mode(0o700);
@@ -146,10 +203,9 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
                 source,
             }
         })?;
-        let key = self.key_for_write()?;
         let plaintext = encode_record(credential);
         let sealed = seal::seal(
-            &key,
+            key,
             &seal::credential_aad(&credential.id),
             plaintext.as_bytes(),
         )
@@ -186,7 +242,7 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
         Ok(())
     }
 
-    fn read_file(&self, key: &Aes256Key, id: &str) -> Result<Credential, VaultError> {
+    fn read_with(&self, keys: &[Aes256Key], id: &str) -> Result<Credential, VaultError> {
         let path = self.path_for(id);
         let sealed = fs::read(&path).map_err(|source| {
             if source.kind() == io::ErrorKind::NotFound {
@@ -198,8 +254,7 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
                 }
             }
         })?;
-        let plaintext =
-            seal::open(key, &seal::credential_aad(id), &sealed).map_err(VaultError::Seal)?;
+        let plaintext = open_with_keys(keys, id, &sealed)?;
         let text = String::from_utf8(plaintext).map_err(|_| {
             VaultError::Message(crate::i18n::t_args("wallet.cred.not_utf8", &[("id", id)]))
         })?;
@@ -237,11 +292,23 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
         self.root.join(format!("{id}.bin"))
     }
 
-    fn key_for_read(&self) -> Result<Aes256Key, VaultError> {
-        match self.keys.load_key().map_err(VaultError::Key)? {
-            Some(key) => Ok(key),
-            None => Err(VaultError::Message(crate::i18n::t("wallet.cred.no_key"))),
+    /// Current key first, then retired keys that have not expired.
+    /// An expired retired key is not included, so it cannot open a file.
+    fn opening_keys(&self) -> Result<Vec<Aes256Key>, VaultError> {
+        let now = now_secs();
+        let mut keys = Vec::new();
+        if let Some(key) = self.keys.load_key().map_err(VaultError::Key)? {
+            keys.push(key);
         }
+        for retired in self.keys.load_retired().map_err(VaultError::Key)? {
+            if retired.expires_at > now {
+                keys.push(retired.key);
+            }
+        }
+        if keys.is_empty() {
+            return Err(VaultError::Message(crate::i18n::t("wallet.cred.no_key")));
+        }
+        Ok(keys)
     }
 
     fn key_for_write(&self) -> Result<Aes256Key, VaultError> {
@@ -260,7 +327,7 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
 }
 
 fn encode_record(credential: &Credential) -> String {
-    Json::Object(vec![
+    let mut members = vec![
         (
             "format".to_string(),
             Json::String(credential.format.clone()),
@@ -277,8 +344,11 @@ fn encode_record(credential: &Credential) -> String {
             "document".to_string(),
             Json::String(credential.document.clone()),
         ),
-    ])
-    .to_string()
+    ];
+    if let Some(holder_key) = &credential.holder_key {
+        members.push(("holder_key".to_string(), Json::String(holder_key.clone())));
+    }
+    Json::Object(members).to_string()
 }
 
 fn decode_record(id: &str, text: &str) -> Result<Credential, VaultError> {
@@ -295,6 +365,7 @@ fn decode_record(id: &str, text: &str) -> Result<Credential, VaultError> {
     let mut issuer = None;
     let mut received_at = None;
     let mut document = None;
+    let mut holder_key = None;
     for (name, member) in members {
         let text = member.as_str().ok_or_else(|| {
             VaultError::Message(crate::i18n::t_args(
@@ -307,6 +378,7 @@ fn decode_record(id: &str, text: &str) -> Result<Credential, VaultError> {
             "issuer" => issuer = Some(text.to_string()),
             "received_at" => received_at = Some(text.to_string()),
             "document" => document = Some(text.to_string()),
+            "holder_key" => holder_key = Some(text.to_string()),
             other => {
                 return Err(VaultError::Message(crate::i18n::t_args(
                     "wallet.cred.unexpected_field",
@@ -321,6 +393,7 @@ fn decode_record(id: &str, text: &str) -> Result<Credential, VaultError> {
         issuer: issuer.ok_or_else(|| missing(id, "issuer"))?,
         received_at: received_at.ok_or_else(|| missing(id, "received_at"))?,
         document: document.ok_or_else(|| missing(id, "document"))?,
+        holder_key,
     })
 }
 
@@ -345,12 +418,25 @@ fn require_format(format: &str) -> Result<String, VaultError> {
 
 fn require_issuer(issuer: &str) -> Result<String, VaultError> {
     let issuer = issuer.trim();
-    if !is_http_url(issuer) {
-        return Err(VaultError::Message(crate::i18n::t(
-            "wallet.cred.issuer_url",
-        )));
+    if is_http_url(issuer) || is_jwk_thumbprint_uri(issuer) {
+        return Ok(issuer.to_string());
     }
-    Ok(issuer.to_string())
+    Err(VaultError::Message(crate::i18n::t(
+        "wallet.cred.issuer_url",
+    )))
+}
+
+/// RFC 9278 SHA-256 JWK Thumbprint URI. A self-issued credential's issuer is
+/// this, not an https URL.
+fn is_jwk_thumbprint_uri(issuer: &str) -> bool {
+    const PREFIX: &str = "urn:ietf:params:oauth:jwk-thumbprint:sha-256:";
+    let Some(rest) = issuer.strip_prefix(PREFIX) else {
+        return false;
+    };
+    rest.len() == 43
+        && rest
+            .bytes()
+            .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
 }
 
 fn require_document(document: &str) -> Result<String, VaultError> {
@@ -401,6 +487,33 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn open_with_keys(keys: &[Aes256Key], id: &str, sealed: &[u8]) -> Result<Vec<u8>, VaultError> {
+    let aad = seal::credential_aad(id);
+    for key in keys {
+        match seal::open(key, &aad, sealed) {
+            Ok(plaintext) => return Ok(plaintext),
+            Err(SealError::NotACredential) => {
+                return Err(VaultError::Seal(SealError::NotACredential))
+            }
+            Err(SealError::AuthenticationFailed) => {}
+        }
+    }
+    Err(VaultError::Seal(SealError::AuthenticationFailed))
+}
+
+/// How many credential files [`CredentialVault::rotate`] sealed with the new key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RotateReport {
+    pub count: usize,
 }
 
 impl Credential {
@@ -458,6 +571,7 @@ mod tests {
             format: "dc+sd-jwt".to_string(),
             issuer: "https://sts.example".to_string(),
             document: "header.payload.sig~disclosure~".to_string(),
+            holder_key: None,
         }
     }
 
@@ -529,8 +643,139 @@ mod tests {
         let mut bad = sample();
         bad.issuer = "javascript:alert(1)".to_string();
         assert!(vault.put(bad).is_err());
+        let mut self_issued = sample();
+        self_issued.issuer =
+            "urn:ietf:params:oauth:jwk-thumbprint:sha-256:abcdefghijklmnopqrstuvwxyzABCDEFGHIJK012345"
+                .to_string();
+        let stored = vault.put(self_issued).unwrap();
+        assert_eq!(
+            stored.issuer,
+            "urn:ietf:params:oauth:jwk-thumbprint:sha-256:abcdefghijklmnopqrstuvwxyzABCDEFGHIJK012345"
+        );
         assert!(vault.get("../etc/passwd").is_err());
         assert!(vault.get("ABCD").is_err());
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_holder_key_stays_sealed_and_is_left_out_of_the_printed_record() {
+        let root = std::env::temp_dir().join(format!(
+            "oid4vc-wallet-credentials-holder-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let vault = CredentialVault::open(&root, MemoryKeyStore::empty());
+        let mut new = sample();
+        new.holder_key = Some(r#"{"kty":"EC","d":"secret-holder"}"#.to_string());
+        let stored = vault.put(new).unwrap();
+        let opened = vault.get(&stored.id).unwrap();
+        assert_eq!(
+            opened.holder_key.as_deref(),
+            Some(r#"{"kty":"EC","d":"secret-holder"}"#)
+        );
+        let printed = stored.to_json().to_string();
+        assert!(!printed.contains("holder_key"));
+        assert!(!printed.contains("secret-holder"));
+        let bytes = fs::read(root.join(format!("{}.bin", stored.id))).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("secret-holder"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rotation_reencrypts_every_credential_and_hides_the_document() {
+        let root = temp_root("rotate-round");
+        let _cleanup = RemoveOnDrop(&root);
+        let vault = CredentialVault::open(&root, MemoryKeyStore::empty());
+        let first = vault.put(sample()).unwrap();
+        let mut second_new = sample();
+        second_new.document = "second-document-plaintext-unique".to_string();
+        let second = vault.put(second_new).unwrap();
+        let before = vault.keys().load_key().unwrap().unwrap();
+        vault
+            .keys()
+            .store_retired(&[RetiredKey {
+                key: Aes256Key::generate(),
+                expires_at: 1,
+            }])
+            .unwrap();
+        let started = now_secs();
+        let report = vault.rotate().unwrap();
+        let finished = now_secs();
+        assert_eq!(report.count, 2);
+        let after = vault.keys().load_key().unwrap().unwrap();
+        assert_ne!(after.as_bytes(), before.as_bytes());
+        let retired = vault.keys().load_retired().unwrap();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].key.as_bytes(), before.as_bytes());
+        assert!(retired[0].expires_at >= started + RETIRED_KEY_SECS);
+        assert!(retired[0].expires_at <= finished + RETIRED_KEY_SECS);
+
+        let listed = vault.list().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(vault.get(&first.id).unwrap(), first);
+        assert_eq!(vault.get(&second.id).unwrap(), second);
+        for credential in [&first, &second] {
+            let bytes = fs::read(root.join(format!("{}.bin", credential.id))).unwrap();
+            assert!(!bytes
+                .windows(credential.document.len())
+                .any(|window| window == credential.document.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn a_file_left_on_the_previous_key_still_opens() {
+        let root = temp_root("rotate-old");
+        let _cleanup = RemoveOnDrop(&root);
+        let vault = CredentialVault::open(&root, MemoryKeyStore::empty());
+        let stored = vault.put(sample()).unwrap();
+        let path = root.join(format!("{}.bin", stored.id));
+        let old_bytes = fs::read(&path).unwrap();
+        vault.rotate().unwrap();
+        let rewritten = fs::read(&path).unwrap();
+        assert_ne!(rewritten, old_bytes);
+        assert!(!rewritten
+            .windows(stored.document.len())
+            .any(|window| window == stored.document.as_bytes()));
+        fs::write(&path, &old_bytes).unwrap();
+        assert_eq!(vault.get(&stored.id).unwrap().document, stored.document);
+        let listed = vault.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, stored.id);
+    }
+
+    #[test]
+    fn an_expired_retired_key_does_not_open_the_file() {
+        let root = temp_root("rotate-expired");
+        let _cleanup = RemoveOnDrop(&root);
+        let vault = CredentialVault::open(&root, MemoryKeyStore::empty());
+        let stored = vault.put(sample()).unwrap();
+        let old = vault.keys().load_key().unwrap().unwrap();
+        vault.keys().store_key(&Aes256Key::generate()).unwrap();
+        vault
+            .keys()
+            .store_retired(&[RetiredKey {
+                key: old,
+                expires_at: 1,
+            }])
+            .unwrap();
+        let err = vault.get(&stored.id).unwrap_err();
+        assert!(err.to_string().contains("could not be opened"), "{err}");
+        assert!(vault.list().is_err());
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "oid4vc-wallet-{name}-{}-{}",
+            std::process::id(),
+            now_millis()
+        ))
+    }
+
+    struct RemoveOnDrop<'a>(&'a Path);
+
+    impl Drop for RemoveOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0);
+        }
     }
 }

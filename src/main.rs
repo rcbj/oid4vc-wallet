@@ -22,6 +22,7 @@ use oid4vc_wallet::linux::{
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Json};
 use oid4vc_wallet::wallet::{accept, Credential, CredentialVault, Inbox, NewCredential};
 
+mod single;
 mod ui;
 
 fn main() -> ExitCode {
@@ -796,6 +797,7 @@ fn add_credential(options: &Options) -> Result<(), Failure> {
             format,
             issuer,
             document,
+            holder_key: None,
         })
         .map_err(|err| fail(err.to_string(), 1))?;
     if options.json {

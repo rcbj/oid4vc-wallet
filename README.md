@@ -2,7 +2,7 @@
 
 A Linux wallet for [OpenID4VCI](https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html) credential offers and [OpenID4VP](https://openid.net/specs/openid-4-verifiable-presentations-1_0.html) / [SIOPv2](https://openid.net/specs/openid-connect-self-issued-v2-1_0.html) requests. It is a native program. The installer registers it with the desktop, so a browser or an issuer page that opens `openid-credential-offer://` or `siopv2://` starts this wallet.
 
-The OpenID messages are implemented in this repository. `src/protocol` does not use another crate, and the wallet does not use a library that implements OpenID4VCI, OpenID4VP, SIOPv2, SD-JWT or JOSE. Credentials are sealed with AES-256-GCM. The key is stored through the Secret Service client or the KWallet client. `oid4vc-wallet --ui` opens a window for the same operations as the command line.
+The OpenID messages are implemented in this repository. `src/protocol` does not use another crate, and the wallet does not use a library that implements OpenID4VCI, OpenID4VP, SIOPv2, SD-JWT or JOSE. Credentials are sealed with AES-256-GCM. The key is stored through the Secret Service client or the KWallet client. `oid4vc-wallet --ui` opens one window. A later `--ui` start focuses that window and hands it the new URI. The command line without `--ui` does not take that lock. How to use each page is in [docs/guide.md](docs/guide.md). `.github/workflows/pages.yml` publishes `docs/` to GitHub Pages the same way iya-sts does. After the Pages site exists and that workflow has run on `main`, the guide is at <https://rcbj.github.io/oid4vc-wallet/>.
 
 This wallet is used to exercise [iya-sts](https://github.com/rcbj/iya-sts). iya-sts hands a wallet three URIs:
 
@@ -16,21 +16,34 @@ This wallet is used to exercise [iya-sts](https://github.com/rcbj/iya-sts). iya-
 
 ## What this version does
 
-It parses an invocation, prints what the issuer or verifier asked, and stores the raw URI in an inbox that only the owner can read. A pre-authorized code is a bearer credential, so the inbox directory is mode `0700` and each file is mode `0600`. `oid4vc-wallet --ui` opens a window that lists stored credentials and can accept an invocation, read the inbox, switch language, and register the protocol handlers.
+It parses an invocation, prints what the issuer or verifier asked, and stores the raw URI in an inbox that only the owner can read. A pre-authorized code is a bearer credential, so the inbox directory is mode `0700` and each file is mode `0600`. The Inbox page can delete one entry. `oid4vc-wallet --ui` opens a window that lists stored credentials and can accept an invocation and read the inbox. The Settings page has Language, Registration, Trust anchors, and Security tabs. Trust anchors stores a PEM root or CA chain you supply and uses it when a published chain is incomplete. Security rotates the AES-256 storage key, re-encrypts every credential, and keeps the previous key for 90 days. Credentials can export one credential or all of them to a file sealed with a fresh key that is shown once, and can import that file on another device. When the window is opened with a pre-authorized credential offer, the Accept page asks for the transaction code the issuer is showing and redeems the offer: the token endpoint, the nonce endpoint, and a credential request signed with an ES256 proof of possession. The issued credential is sealed and appears in the credential list. The private proof key is sealed with that credential and is not shown. When that window is opened with a presentation request, it opens the credential list, fetches the request, selects a stored credential that matches the verifier, the credential type, and the requested claims, submits the presentation, and opens the verifier's redirect. A `siopv2://` request builds an ID Token, stores a self-issued credential, and a later `siopv2://` sign-in reuses that subject. A request that asks for both a presentation and an ID Token sends both, signed by the presented holder key.
+
+Validate checks the issuer signature on a stored credential. The algorithms are the JOSE signatures ES256, ES384, ES512, ES256K, RS256, RS384, RS512, PS256, PS384, PS512, and EdDSA, plus ML-DSA-44, ML-DSA-65, ML-DSA-87, the twelve SLH-DSA parameter sets, and the six ML-DSA composite signatures iya-sts publishes. Published keys are read from JWT VC Issuer Metadata at `/.well-known/jwt-vc-issuer` (the `jwks` member, or `jwks_uri` when that member is absent). An `x5c` chain is completed from the RFC 5280 Authority Information Access `caIssuers` URL, which is the spec's way to retrieve a parent the credential itself did not carry. A self-signed root that was only embedded in the credential is not treated as a published anchor. When the signature checks and that chain cannot be completed, the window asks whether to trust the issuer at that URL. The TLS certificate presented by the issuer can anchor the same chain; the window says when that fallback was used. A chain with a bad signature, a name mismatch, or a date outside its validity is reported as an error. An acceptance is stored at `$XDG_CONFIG_HOME/oid4vc-wallet/trusted-issuers`, mode `0600`, keyed by the issuer URL and the SHA-256 of the leaf key, so a different key is asked again.
 
 A credential added with `credential add` is sealed with AES-256-GCM before it is written. Each file under `$XDG_DATA_HOME/oid4vc-wallet/credentials` is mode `0600`, and that directory is mode `0700`. The file holds a nonce and ciphertext. The format, issuer, time, and credential document are inside the ciphertext. The inbox stays a separate directory of raw invocation URIs.
 
 The 256-bit key is created the first time a credential is stored. GNOME Keyring holds it when the Secret Service (`org.freedesktop.secrets`) is available. The item is `org.rcbj.oid4vc-wallet` / `credential-encryption-key`, and the key is encrypted while it crosses the session bus. KeePassXC is used in that same way when its Secret Service integration is turned on and it owns the service. On a KDE session that does not provide the Secret Service, the key is a binary entry in KWallet (`org.kde.kwalletd6` or `org.kde.kwalletd5`), in the network wallet, folder `org.rcbj.oid4vc-wallet`. The login keyring or KWallet needs to be unlocked, which it is in a normal desktop session. A locked GNOME Keyring is reported as an error, so the wallet does not create a second key in KWallet while the first store may still hold the real one.
 
-It does not yet fetch an offer or a request by reference, redeem a pre-authorized code, or return a presentation or an ID Token. Those steps stay in this crate, without an OpenID library, when they are built.
+An offer by reference is not fetched. An ID Token is built for a `siopv2://` request and for a presentation that also asks for an ID Token. An ordinary presentation sends the presentation only. A same-device presentation request is fetched and answered in this crate, without an OpenID library.
+
+A loopback issuer (`localhost`, `127.0.0.1`, or `::1`) whose certificate is not in the system trust store is still accepted, so a local iya-sts process CA works. Any other issuer must chain to a CA the system store or the public web roots trust, or to a certificate you stored on the Trust anchors tab.
 
 ## Build
 
 Install a stable Rust toolchain, then:
 
 ```sh
-cargo test
 cargo build --release
+```
+
+## Tests
+
+The suite is headless. It does not open a window, and it does not use this user's wallet files or the desktop key store. The same script runs locally and in GitHub Actions (`.github/workflows/ci.yml`) on every push and pull request. The Actions job installs the X11 and font libraries the binary links, then runs the script. `--offline` uses crates already in the local Cargo cache. Any further arguments are a `cargo test` filter.
+
+```sh
+./install/test.sh
+./install/test.sh --offline
+./install/test.sh --offline wallet::present
 ```
 
 ## AppImage
@@ -75,7 +88,7 @@ That writes `/usr/local/bin/oid4vc-wallet`, `/usr/share/applications/org.rcbj.oi
 
 Remove the registration with `oid4vc-wallet uninstall` or `oid4vc-wallet uninstall --system`.
 
-The desktop file sets `Terminal=false`. Clicking the application opens the window on the credential list. A protocol link opens that same window and shows the parsed request. The command line is still there when you leave off `--ui`: `oid4vc-wallet help` prints the commands, and a URI on the command line parses it without opening the window.
+The desktop file sets `Terminal=false`. Clicking the application opens the window on the credential list. A protocol link that carries a pre-authorized offer opens the Accept page and asks for the transaction code. Another protocol link opens that same window and shows the parsed request. The command line is still there when you leave off `--ui`: `oid4vc-wallet help` prints the commands, and a URI on the command line parses it without opening the window.
 
 ## Try an invocation
 
@@ -101,7 +114,7 @@ oid4vc-wallet credential show <id>
 
 `--document` passes the credential text on the command line. `--document-file -` reads it from stdin. `credential delete <id>` removes the file and leaves the AES-256 key in GNOME Keyring or KWallet.
 
-With the wallet installed, an iya-sts page that offers **Open in a wallet on this device** launches this program. A wallet sign-in whose request is an ID Token alone uses `siopv2://`. A presentation request uses `openid4vp://`.
+With the wallet installed, an iya-sts page that offers **Open a wallet on this device** launches this program on the Accept page. Type the transaction code the page shows. A wallet sign-in whose request is an ID Token alone uses `siopv2://`. A presentation request uses `openid4vp://`.
 
 ## Language
 
@@ -142,7 +155,7 @@ A language with no catalog is skipped, and the next preference is used. `zh-HK` 
 |---|---|
 | `src/protocol` | Credential Offer and authorization-request parsing |
 | `src/linux` | Desktop Entry, `mimeapps.list`, and the installer |
-| `src/wallet` | The inbox, and the AES-256 credential vault |
+| `src/wallet` | The inbox, redemption of a pre-authorized offer, credential signature checks, and the AES-256 credential vault |
 | `src/i18n` | Catalog lookup, language choice, and message formatting |
 | `locales` | Message catalogs, in the same layout iya-sts uses |
 | `install/install.sh` | Build, then `oid4vc-wallet install` |

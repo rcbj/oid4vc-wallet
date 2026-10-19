@@ -12,5 +12,5 @@
   "ui.store": "Enregistrer le titre de compétences",
   "usage.intro": "Un portefeuille Linux pour les offres de titres de compétences OpenID4VCI\net les demandes de présentation OpenID4VP / SIOPv2. Les messages de protocole\nsont mis en œuvre dans ce programme. Il n'utilise pas de bibliothèque OpenID.",
   "usage.title": "Portefeuille de titres de compétences OID4VC",
-  "usage.ui": "  oid4vc-wallet --ui [URI]\n      Ouvre la fenêtre. Les titres de compétences, la boîte, les URI d'invocation,\n      la langue et l'enregistrement des protocoles s'y trouvent.\n      Un URI est analysé et enregistré. --no-save n'écrit pas la boîte."
+  "usage.ui": "  oid4vc-wallet --ui [URI]\n      Ouvre la fenêtre. Les titres de compétences, la boîte, les URI d'invocation,\n      la langue et l'enregistrement des protocoles s'y trouvent.\n      Une offre préautorisée demande le code de transaction et l'échange.\n      Un autre URI est analysé et enregistré. --no-save n'écrit pas la boîte."
 }

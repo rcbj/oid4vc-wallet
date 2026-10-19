@@ -12,8 +12,12 @@
 use std::time::Duration;
 
 use dbus::blocking::Connection;
+use zeroize::Zeroize;
 
-use super::key_store::{key_from_store, KeyStoreError, Probe, KEY_SERVICE, KEY_USER};
+use super::key_store::{
+    decode_retired, encode_retired, key_from_store, KeyStoreError, Probe, RetiredKey,
+    KEY_HISTORY_USER, KEY_SERVICE, KEY_USER,
+};
 use super::seal::Aes256Key;
 
 const INTERFACE: &str = "org.kde.KWallet";
@@ -92,6 +96,37 @@ impl KWalletKeyStore {
             }
         };
         session.write(&self.folder, &self.entry, key)
+    }
+
+    pub(super) fn load_retired(&self, prompt: Prompt) -> Result<Vec<RetiredKey>, KeyStoreError> {
+        let session = match Session::open(prompt) {
+            Ok(session) => session,
+            Err(Probe::Absent) => return Err(KeyStoreError::Unavailable),
+            Err(Probe::Failed(err)) => return Err(err),
+            Err(Probe::Empty | Probe::Found(_)) => {
+                return Err(KeyStoreError::Store(crate::i18n::t(
+                    "wallet.keystore.kwallet_closed",
+                )))
+            }
+        };
+        session.read_history(&self.folder, KEY_HISTORY_USER)
+    }
+
+    pub(super) fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
+        let session = match Session::open(Prompt::IfLocked) {
+            Ok(session) => session,
+            Err(Probe::Absent) => return Err(KeyStoreError::Unavailable),
+            Err(Probe::Failed(err)) => return Err(err),
+            Err(Probe::Empty | Probe::Found(_)) => {
+                return Err(KeyStoreError::Store(crate::i18n::t(
+                    "wallet.keystore.kwallet_closed",
+                )))
+            }
+        };
+        let mut secret = encode_retired(keys);
+        let result = session.write_bytes(&self.folder, KEY_HISTORY_USER, &secret);
+        secret.zeroize();
+        result
     }
 
     /// Remove the entry and, when the folder is then empty, the folder.
@@ -199,18 +234,43 @@ impl Session {
     }
 
     fn write(&self, folder: &str, entry: &str, key: &Aes256Key) -> Result<(), KeyStoreError> {
+        self.write_bytes(folder, entry, key.as_bytes())
+    }
+
+    fn read_history(&self, folder: &str, entry: &str) -> Result<Vec<RetiredKey>, KeyStoreError> {
+        let has = match call::<(bool,)>(
+            &self.conn,
+            self.daemon,
+            "hasEntry",
+            (self.handle, folder, entry, APP_ID),
+            QUICK,
+        ) {
+            Ok((has,)) => has,
+            Err(probe) => return Err(probe_error(probe)),
+        };
+        if !has {
+            return Ok(Vec::new());
+        }
+        let bytes = match call::<(Vec<u8>,)>(
+            &self.conn,
+            self.daemon,
+            "readEntry",
+            (self.handle, folder, entry, APP_ID),
+            QUICK,
+        ) {
+            Ok((bytes,)) => bytes,
+            Err(probe) => return Err(probe_error(probe)),
+        };
+        decode_retired(bytes)
+    }
+
+    fn write_bytes(&self, folder: &str, entry: &str, bytes: &[u8]) -> Result<(), KeyStoreError> {
         self.ensure_folder(folder)?;
         let written: Result<(i32,), dbus::Error> = proxy(&self.conn, self.daemon, QUICK)
             .method_call(
                 INTERFACE,
                 "writeEntry",
-                (
-                    self.handle,
-                    folder,
-                    entry,
-                    key.as_bytes().as_slice(),
-                    APP_ID,
-                ),
+                (self.handle, folder, entry, bytes, APP_ID),
             );
         let (code,): (i32,) = match written {
             Ok(code) => code,
@@ -218,14 +278,7 @@ impl Session {
                 .method_call(
                     INTERFACE,
                     "writeEntry",
-                    (
-                        self.handle,
-                        folder,
-                        entry,
-                        key.as_bytes().as_slice(),
-                        STREAM,
-                        APP_ID,
-                    ),
+                    (self.handle, folder, entry, bytes, STREAM, APP_ID),
                 )?,
             Err(err) => return Err(dbus_error(err)),
         };

@@ -22,10 +22,65 @@ pub const KEY_SERVICE: &str = "org.rcbj.oid4vc-wallet";
 /// Username of that item. Together with [`KEY_SERVICE`] it identifies the key.
 pub const KEY_USER: &str = "credential-encryption-key";
 
+/// Username of the item that holds keys retired by rotation.
+/// The service name is [`KEY_SERVICE`], the same item service as [`KEY_USER`].
+pub const KEY_HISTORY_USER: &str = "credential-encryption-key-history";
+
+/// How long a retired key can still open a credential that was not rewritten.
+pub const RETIRED_KEY_SECS: u64 = 90 * 24 * 60 * 60;
+
+/// A previous AES-256 key. `expires_at` is a unix timestamp, in seconds.
+/// The vault does not use a key once that instant has passed.
+pub struct RetiredKey {
+    pub key: Aes256Key,
+    pub expires_at: u64,
+}
+
+impl Clone for RetiredKey {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+impl std::fmt::Debug for RetiredKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetiredKey")
+            .field("key", &self.key)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// Where the wallet reads and writes its AES-256 key.
+///
+/// Retired keys are a second item. A store that has not implemented them
+/// returns an empty list. Writing a non-empty list fails, so a rotation
+/// cannot drop the previous key.
 pub trait EncryptionKeyStore {
     fn load_key(&self) -> Result<Option<Aes256Key>, KeyStoreError>;
     fn store_key(&self, key: &Aes256Key) -> Result<(), KeyStoreError>;
+
+    /// Every retired key, including entries whose `expires_at` has passed.
+    fn load_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Replace the retired-key list.
+    ///
+    /// An empty list is a no-op. A non-empty list must be stored by the
+    /// implementation. Succeeding here would drop the previous key.
+    fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
+        if keys.is_empty() {
+            Ok(())
+        } else {
+            Err(KeyStoreError::Store(crate::i18n::t(
+                "wallet.keystore.history",
+            )))
+        }
+    }
 }
 
 /// What one store reported. `Absent` means that store is not running.
@@ -166,6 +221,28 @@ impl EncryptionKeyStore for DesktopKeyStore {
             },
         }
     }
+
+    fn load_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
+        let secret = self.secret_service.probe();
+        match plan_load(presence(&secret)) {
+            LoadPlan::UseSecretService => self.secret_service.load_retired(),
+            LoadPlan::Deny => Err(probe_failure(secret)),
+            LoadPlan::CheckQuiet => self.retired_after_quiet_check(),
+            LoadPlan::Prompt => self.kwallet.load_retired(Prompt::IfLocked),
+            LoadPlan::UseKWallet | LoadPlan::Missing | LoadPlan::NoStore => {
+                Err(KeyStoreError::Unavailable)
+            }
+        }
+    }
+
+    fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
+        let secret = self.secret_service.probe();
+        match plan_store(presence(&secret)) {
+            StorePlan::SecretService => self.secret_service.store_retired(keys),
+            StorePlan::KWallet => self.kwallet.store_retired(keys),
+            StorePlan::Deny => Err(probe_failure(secret)),
+        }
+    }
 }
 
 impl DesktopKeyStore {
@@ -189,39 +266,77 @@ impl DesktopKeyStore {
             _ => Err(KeyStoreError::Unavailable),
         }
     }
+
+    /// Secret Service is up and has no current key, so the key may be in KWallet.
+    /// History is read from the store that actually holds the current key.
+    fn retired_after_quiet_check(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
+        let quiet = self.kwallet.probe(Prompt::Never);
+        match plan_quiet(presence(&quiet)) {
+            LoadPlan::UseKWallet => self.kwallet.load_retired(Prompt::Never),
+            LoadPlan::Deny => Err(probe_failure(quiet)),
+            LoadPlan::Missing => self.secret_service.load_retired(),
+            LoadPlan::UseSecretService
+            | LoadPlan::CheckQuiet
+            | LoadPlan::Prompt
+            | LoadPlan::NoStore => Err(KeyStoreError::Unavailable),
+        }
+    }
+}
+
+fn probe_failure(probe: Probe) -> KeyStoreError {
+    match probe {
+        Probe::Failed(err) => err,
+        Probe::Found(_) | Probe::Empty | Probe::Absent => KeyStoreError::Unavailable,
+    }
+}
+
+#[cfg(test)]
+struct MemoryState {
+    key: Option<Aes256Key>,
+    retired: Vec<RetiredKey>,
 }
 
 /// A key held in memory. Tests use it so they do not need a session bus.
 #[cfg(test)]
 pub struct MemoryKeyStore {
-    key: std::sync::Mutex<Option<Aes256Key>>,
+    inner: std::sync::Mutex<MemoryState>,
 }
 
 #[cfg(test)]
 impl MemoryKeyStore {
     pub fn empty() -> Self {
         Self {
-            key: std::sync::Mutex::new(None),
+            inner: std::sync::Mutex::new(MemoryState {
+                key: None,
+                retired: Vec::new(),
+            }),
         }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, MemoryState>, KeyStoreError> {
+        self.inner
+            .lock()
+            .map_err(|_| KeyStoreError::Store(crate::i18n::t("wallet.keystore.poisoned")))
     }
 }
 
 #[cfg(test)]
 impl EncryptionKeyStore for MemoryKeyStore {
     fn load_key(&self) -> Result<Option<Aes256Key>, KeyStoreError> {
-        let guard = self
-            .key
-            .lock()
-            .map_err(|_| KeyStoreError::Store(crate::i18n::t("wallet.keystore.poisoned")))?;
-        Ok(guard.clone())
+        Ok(self.lock()?.key.clone())
     }
 
     fn store_key(&self, key: &Aes256Key) -> Result<(), KeyStoreError> {
-        let mut guard = self
-            .key
-            .lock()
-            .map_err(|_| KeyStoreError::Store(crate::i18n::t("wallet.keystore.poisoned")))?;
-        *guard = Some(key.clone());
+        self.lock()?.key = Some(key.clone());
+        Ok(())
+    }
+
+    fn load_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
+        Ok(self.lock()?.retired.clone())
+    }
+
+    fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
+        self.lock()?.retired = keys.to_vec();
         Ok(())
     }
 }
@@ -237,6 +352,95 @@ pub(super) fn key_from_store(mut bytes: Vec<u8>) -> Result<Aes256Key, KeyStoreEr
     };
     bytes.zeroize();
     Ok(Aes256Key::from_bytes(copied))
+}
+
+/// ASCII lines `base64url(32 bytes) TAB unix\n`. Empty is an empty list.
+pub(super) fn encode_retired(keys: &[RetiredKey]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in keys {
+        let mut token = super::b64::b64url_encode(item.key.as_bytes());
+        out.extend_from_slice(token.as_bytes());
+        token.zeroize();
+        out.push(b'\t');
+        out.extend_from_slice(item.expires_at.to_string().as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Parse [`encode_retired`]. `bytes` is wiped before this returns.
+pub(super) fn decode_retired(mut bytes: Vec<u8>) -> Result<Vec<RetiredKey>, KeyStoreError> {
+    let parsed = parse_retired(&bytes);
+    bytes.zeroize();
+    parsed
+}
+
+fn parse_retired(bytes: &[u8]) -> Result<Vec<RetiredKey>, KeyStoreError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| bad_history())?;
+    if text.bytes().any(|byte| byte == b'\r') || !text.ends_with('\n') {
+        return Err(bad_history());
+    }
+    let mut retired = Vec::new();
+    for line in text.split_terminator('\n') {
+        let Some((token, expiry)) = line.split_once('\t') else {
+            return Err(bad_history());
+        };
+        if expiry.contains('\t') {
+            return Err(bad_history());
+        }
+        let expires_at = parse_expiry(expiry).ok_or_else(bad_history)?;
+        let key = parse_retired_key(token).ok_or_else(bad_history)?;
+        retired.push(RetiredKey { key, expires_at });
+    }
+    Ok(retired)
+}
+
+fn parse_expiry(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
+}
+
+fn parse_retired_key(token: &str) -> Option<Aes256Key> {
+    if token.len() != 43
+        || !token.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'
+            )
+        })
+    {
+        return None;
+    }
+    let mut decoded = super::b64::b64_decode(token)?;
+    if decoded.len() != KEY_LEN {
+        decoded.zeroize();
+        return None;
+    }
+    let mut array = [0u8; KEY_LEN];
+    array.copy_from_slice(&decoded);
+    decoded.zeroize();
+    let key = Aes256Key::from_bytes(array);
+    let mut encoded = super::b64::b64url_encode(key.as_bytes());
+    let matches_token = encoded == token;
+    encoded.zeroize();
+    array.zeroize();
+    if matches_token {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+fn bad_history() -> KeyStoreError {
+    KeyStoreError::Store("retired key history is malformed".to_string())
 }
 
 /// A Secret Service error that means the daemon is not there.
@@ -296,6 +500,89 @@ mod tests {
         store.store_key(&key).unwrap();
         let loaded = store.load_key().unwrap().unwrap();
         assert_eq!(loaded.as_bytes(), key.as_bytes());
+        assert!(store.load_retired().unwrap().is_empty());
+        let retired = RetiredKey {
+            key: key.clone(),
+            expires_at: 90,
+        };
+        store.store_retired(&[retired]).unwrap();
+        let loaded = store.load_retired().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].expires_at, 90);
+        assert_eq!(loaded[0].key.as_bytes(), key.as_bytes());
+    }
+
+    #[test]
+    fn a_store_without_history_methods_keeps_none() {
+        struct CurrentOnly;
+        impl EncryptionKeyStore for CurrentOnly {
+            fn load_key(&self) -> Result<Option<Aes256Key>, KeyStoreError> {
+                Ok(None)
+            }
+            fn store_key(&self, _key: &Aes256Key) -> Result<(), KeyStoreError> {
+                Ok(())
+            }
+        }
+        let store = CurrentOnly;
+        assert!(store.load_retired().unwrap().is_empty());
+        store.store_retired(&[]).unwrap();
+        let err = store
+            .store_retired(&[RetiredKey {
+                key: Aes256Key::from_bytes([3; KEY_LEN]),
+                expires_at: 1,
+            }])
+            .unwrap_err();
+        match err {
+            KeyStoreError::Store(message) => {
+                assert!(message.contains("previous encryption key"));
+            }
+            other => panic!("expected a store error, got {other}"),
+        }
+        assert!(store.load_retired().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retired_history_is_base64url_lines_and_rejects_a_bad_line() {
+        let first = Aes256Key::from_bytes([0xfb; KEY_LEN]);
+        let second = Aes256Key::from_bytes([0x02; KEY_LEN]);
+        let encoded = encode_retired(&[
+            RetiredKey {
+                key: first.clone(),
+                expires_at: 1_700_000_000,
+            },
+            RetiredKey {
+                key: second.clone(),
+                expires_at: 0,
+            },
+        ]);
+        let text = std::str::from_utf8(&encoded).unwrap();
+        assert_eq!(text.chars().filter(|ch| *ch == '\n').count(), 2);
+        assert!(text.contains('\t'));
+        assert!(!text.contains('+'));
+        assert!(!text.contains('/'));
+        assert!(!text.contains('='));
+        let loaded = decode_retired(encoded.clone()).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].key.as_bytes(), first.as_bytes());
+        assert_eq!(loaded[0].expires_at, 1_700_000_000);
+        assert_eq!(loaded[1].key.as_bytes(), second.as_bytes());
+        assert_eq!(loaded[1].expires_at, 0);
+        assert!(decode_retired(Vec::new()).unwrap().is_empty());
+
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert!(decode_retired(truncated).is_err());
+        assert!(decode_retired(b"not-a-key\t10\n".to_vec()).is_err());
+        assert!(decode_retired(b"\n".to_vec()).is_err());
+        let short = crate::wallet::b64::b64url_encode(&[0x11; 16]);
+        assert!(decode_retired(format!("{short}\t10\n").into_bytes()).is_err());
+        let standard = crate::wallet::b64::b64_encode(first.as_bytes());
+        assert!(decode_retired(format!("{standard}\t10\n").into_bytes()).is_err());
+        let token = text.lines().next().unwrap().split('\t').next().unwrap();
+        assert!(decode_retired(format!("{token}\t01\n").into_bytes()).is_err());
+        assert!(decode_retired(format!("{token}\t10\textra\n").into_bytes()).is_err());
+        assert!(decode_retired(format!("{token} 10\n").into_bytes()).is_err());
+        assert!(decode_retired(b"@@@\t10\n".to_vec()).is_err());
     }
 
     #[test]

@@ -69,7 +69,11 @@ impl Inbox {
             let Some(text) = name.to_str() else {
                 continue;
             };
-            if text.ends_with(".txt") {
+            // A symlink is not an inbox entry, even when its name ends in .txt.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if text.ends_with(".txt") && file_type.is_file() {
                 names.push(text.to_string());
             }
         }
@@ -81,6 +85,45 @@ impl Inbox {
             })
             .collect())
     }
+
+    /// Remove one inbox file. `path` contributes only its file name, and that
+    /// name has to be a regular `.txt` file directly inside the inbox. A
+    /// symlink is left in place.
+    pub fn delete(&self, path: &Path) -> io::Result<()> {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err(not_inbox_file());
+        };
+        if !inbox_file_name(name) {
+            return Err(not_inbox_file());
+        }
+        let root = self.root.canonicalize().map_err(|_| not_inbox_file())?;
+        let candidate = root.join(name);
+        let meta = match fs::symlink_metadata(&candidate) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(not_inbox_file()),
+            Err(err) => return Err(err),
+        };
+        if !meta.file_type().is_file() {
+            return Err(not_inbox_file());
+        }
+        fs::remove_file(candidate)
+    }
+}
+
+fn inbox_file_name(name: &str) -> bool {
+    name.ends_with(".txt")
+        && name.len() > 4
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+fn not_inbox_file() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        crate::i18n::t("wallet.inbox.escape"),
+    )
 }
 
 fn scheme_of(uri: &str) -> String {
@@ -186,6 +229,36 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("uri openid-credential-offer://"));
         assert!(text.contains("summary line"));
+        assert_eq!(inbox.list().unwrap().len(), 1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn deletes_one_file_and_refuses_anything_else() {
+        let root = std::env::temp_dir().join(format!(
+            "oid4vc-wallet-inbox-del-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let inbox = Inbox::new(&root);
+        let first = inbox.save("openid-credential-offer://?a=1", "one").unwrap();
+        let second = inbox.save("siopv2://?b=2", "two").unwrap();
+        inbox.delete(&first).unwrap();
+        let listed = inbox.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, second);
+        let outside = std::env::temp_dir().join(format!(
+            "oid4vc-wallet-outside-{}-{}.txt",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::write(&outside, "leave me").unwrap();
+        assert!(inbox.delete(&outside).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "leave me");
+        fs::remove_file(&outside).unwrap();
+        std::os::unix::fs::symlink(&listed[0].path, root.join("link.txt")).unwrap();
+        assert!(inbox.delete(&root.join("link.txt")).is_err());
+        assert!(root.join("link.txt").exists());
         assert_eq!(inbox.list().unwrap().len(), 1);
         fs::remove_dir_all(&root).unwrap();
     }
