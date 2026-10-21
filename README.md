@@ -126,7 +126,7 @@ oid4vc-wallet credential show <id>
 
 `--document` passes the credential text on the command line. `--document-file -` reads it from stdin. `credential delete <id>` removes the file and leaves the AES-256 key in GNOME Keyring or KWallet.
 
-With the wallet installed, an iya-sts page that offers **Open a wallet on this device** launches this program on the Accept page. Type the transaction code the page shows. A wallet sign-in whose request is an ID Token alone uses `siopv2://`. A presentation request uses `openid4vp://`. The first time either request would use a credential's key, the window asks.
+With the wallet installed, **Open in a wallet on this device** on the iya-sts portal's credential offer launches this program on the Accept page. Type the transaction code the page shows. At an iya-sts sign-in, **Open your wallet on this device** launches it on the Credentials page. A wallet sign-in whose request is an ID Token alone uses `siopv2://`. A presentation request uses `openid4vp://`. The first time either request would use a credential's key, the window asks.
 
 ## Language
 
