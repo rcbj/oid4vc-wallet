@@ -24,6 +24,7 @@ use oid4vc_wallet::linux::{
     DEFAULT_SCHEMES,
 };
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Json};
+use oid4vc_wallet::version;
 use oid4vc_wallet::wallet::{
     accept, fido_locked, signature_algorithm, unlock_fido, Credential, CredentialVault, Inbox,
     NewCredential,
@@ -62,6 +63,7 @@ struct Options {
     system: bool,
     haip: bool,
     help: bool,
+    version: bool,
     /// Open the window. Extra positionals are invocation URIs.
     ui: bool,
     format: Option<String>,
@@ -81,6 +83,10 @@ fn run() -> Result<(), Failure> {
     let _applied_lang = options.lang.as_deref();
     if options.help {
         println!("{}", usage());
+        return Ok(());
+    }
+    if options.version {
+        println!("{}", version_text(options.json));
         return Ok(());
     }
     if options.ui {
@@ -216,6 +222,7 @@ fn options_from(args: impl IntoIterator<Item = String>) -> Result<Options, Failu
         system: false,
         haip: false,
         help: false,
+        version: false,
         ui: false,
         format: None,
         issuer: None,
@@ -244,6 +251,10 @@ fn options_from(args: impl IntoIterator<Item = String>) -> Result<Options, Failu
             "--help" | "-h" | "help" => {
                 reject_inline(inline, name)?;
                 options.help = true;
+            }
+            "--version" | "-V" => {
+                reject_inline(inline, name)?;
+                options.version = true;
             }
             "--ui" => {
                 reject_inline(inline, "--ui")?;
@@ -1004,6 +1015,26 @@ fn delete_credential(id: &str, json: bool) -> Result<(), Failure> {
     Ok(())
 }
 
+fn version_text(json: bool) -> String {
+    if !json {
+        return format!("oid4vc-wallet {}", version::VERSION);
+    }
+    let text = |value: &str| Json::String(value.to_string());
+    let commit = if version::COMMIT.is_empty() {
+        Json::Null
+    } else {
+        text(version::COMMIT)
+    };
+    Json::Object(vec![
+        ("version".to_string(), text(version::VERSION)),
+        ("major_minor".to_string(), text(version::MAJOR_MINOR)),
+        ("build".to_string(), text(version::BUILD)),
+        ("built_at".to_string(), text(version::BUILT_AT)),
+        ("commit".to_string(), commit),
+    ])
+    .to_string()
+}
+
 fn usage() -> String {
     [
         t("wallet.usage.title"),
@@ -1029,6 +1060,8 @@ fn usage() -> String {
         t("wallet.usage.language"),
         String::new(),
         t("wallet.usage.ui"),
+        String::new(),
+        t("wallet.usage.version"),
         String::new(),
         t("wallet.usage.footer"),
     ]
@@ -1074,6 +1107,25 @@ mod tests {
         assert!(options.ui);
         assert!(options.no_save);
         assert_eq!(options.positionals, vec!["siopv2://?client_id=abc"]);
+    }
+
+    #[test]
+    fn version_flag_prints_the_stamped_version() {
+        let options = super::options_from(["--version".to_string(), "--json".to_string()]).unwrap();
+        assert!(options.version);
+        assert!(super::options_from(["-V".to_string()]).unwrap().version);
+        assert!(super::options_from(["--version=1".to_string()]).is_err());
+        let plain = super::version_text(false);
+        assert_eq!(plain, format!("oid4vc-wallet {}", super::version::VERSION));
+        let json = oid4vc_wallet::protocol::Json::parse(&super::version_text(true)).unwrap();
+        assert_eq!(
+            json.get("version").and_then(|v| v.as_str()),
+            Some(super::version::VERSION)
+        );
+        assert_eq!(
+            json.get("build").and_then(|v| v.as_str()),
+            Some(super::version::BUILD)
+        );
     }
 
     #[test]

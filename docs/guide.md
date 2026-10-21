@@ -299,7 +299,7 @@ The export key is not the storage key. **Rotate encryption key** does not change
 
 ### About {#about}
 
-**About** shows Copyright 2026 Iya CyberSecurity Solutions, LLC. It also opens the documentation for this wallet, the GitHub page where you can ask for help, and the Business Source License.
+**About** shows the wallet's version, for example `Version 0.1.20261020143205`. The first two numbers are the release. The last is the build, which is the UTC date and time the program was built. Hover over the version to see the build time and commit. Include the version when you ask for help. In a terminal, `oid4vc-wallet --version` prints the same number. **About** also shows Copyright 2026 Iya CyberSecurity Solutions, LLC, and it opens the documentation for this wallet, the GitHub page where you can ask for help, and the Business Source License.
 
 ## One window {#one-window}
 
