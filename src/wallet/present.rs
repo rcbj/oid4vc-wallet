@@ -2216,6 +2216,17 @@ mod tests {
     }
 
     fn fixture_request(mode: &str, aia: bool, response_type: &str, scheme: &str) -> Fixture {
+        fixture_listing(mode, aia, response_type, scheme, None)
+    }
+
+    /// `syntaxes` is the request's `client_metadata.subject_syntax_types_supported`.
+    fn fixture_listing(
+        mode: &str,
+        aia: bool,
+        response_type: &str,
+        scheme: &str,
+        syntaxes: Option<&[&str]>,
+    ) -> Fixture {
         let now = now_secs();
         let (ca_key, ca_params, ca_cert) = ca("Verifier Root");
         let aia_url = "https://verifier.example/ca.cer";
@@ -2232,7 +2243,7 @@ mod tests {
         let holder_point = holder.verifying_key().to_encoded_point(false);
         let holder_d = b64::b64url_encode(holder.to_bytes().as_slice());
         let dcql = sign_in_query();
-        let payload = object(&[
+        let mut payload = object(&[
             ("iss", Json::String(client_id.clone())),
             ("aud", Json::String(WALLET_AUDIENCE.to_string())),
             ("iat", Json::Number(now.to_string())),
@@ -2285,6 +2296,19 @@ mod tests {
                 ]),
             ),
         ]);
+        if let (Some(syntaxes), Json::Object(members)) = (syntaxes, &mut payload) {
+            let listed = Json::Array(
+                syntaxes
+                    .iter()
+                    .map(|one| Json::String(one.to_string()))
+                    .collect(),
+            );
+            for (name, value) in members.iter_mut() {
+                if let (true, Json::Object(metadata)) = (name == "client_metadata", value) {
+                    metadata.push(("subject_syntax_types_supported".to_string(), listed.clone()));
+                }
+            }
+        }
         let jwt = signed_jwt(&signer, &leaf_der, &payload.to_string());
         let request_uri = "https://verifier.example/oid4vp/request/1";
         let mut gets = HashMap::new();
@@ -3208,5 +3232,747 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.message);
         assert_eq!(outcome.credential_id.as_deref(), Some("cred-self"));
         assert!(outcome.store.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // DID subjects, checked the way a relying party checks them.
+    //
+    // `rp_verify` is written from SIOPv2 section 11.1 and the three DID
+    // method specifications, not from the wallet's encoders: it has its own
+    // base58btc decoder and its own did:web URL mapping, and it resolves the
+    // DID before it looks at the key. iya-sts (`oid4vc/siop.ts`,
+    // `oid4vc/vc_data_integrity.ts`) is the relying party it follows: a
+    // did:jwk's one method is `#0`, a did:key's is `#<multibase>`, and a
+    // did:web is fetched over https from the host it names.
+    // ---------------------------------------------------------------------
+
+    /// What a relying party learned from a self-issued ID Token it accepted.
+    #[derive(Debug)]
+    struct Accepted {
+        subject: String,
+        kid: String,
+    }
+
+    fn rp_base58_decode(text: &str) -> Option<Vec<u8>> {
+        const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        // Big-endian base-256 digits, multiplied by 58 and added to per symbol.
+        let mut number: Vec<u8> = Vec::new();
+        for symbol in text.chars() {
+            let value = ALPHABET.find(symbol)? as u32;
+            let mut carry = value;
+            for digit in number.iter_mut().rev() {
+                let next = u32::from(*digit) * 58 + carry;
+                *digit = (next % 256) as u8;
+                carry = next / 256;
+            }
+            while carry > 0 {
+                number.insert(0, (carry % 256) as u8);
+                carry /= 256;
+            }
+        }
+        let zeros = text.chars().take_while(|c| *c == '1').count();
+        let mut out = vec![0u8; zeros];
+        out.extend(number);
+        Some(out)
+    }
+
+    fn rp_did_web_url(did: &str) -> Result<String, String> {
+        let rest = did
+            .strip_prefix("did:web:")
+            .ok_or_else(|| format!("{did} is not a did:web"))?;
+        let mut parts = rest.split(':');
+        let host = parts
+            .next()
+            .unwrap()
+            .replace("%3A", ":")
+            .replace("%3a", ":");
+        let path: Vec<&str> = parts.collect();
+        if path.is_empty() {
+            Ok(format!("https://{host}/.well-known/did.json"))
+        } else {
+            Ok(format!("https://{host}/{}/did.json", path.join("/")))
+        }
+    }
+
+    fn rp_key_of_jwk(jwk: &Json) -> Result<p256::ecdsa::VerifyingKey, String> {
+        if jwk.get("kty").and_then(Json::as_str) != Some("EC")
+            || jwk.get("crv").and_then(Json::as_str) != Some("P-256")
+            || jwk.get("d").is_some()
+        {
+            return Err("not a public P-256 JWK".to_string());
+        }
+        let (x, y) = coordinates(jwk).ok_or("no coordinates")?;
+        let mut sec1 = vec![4u8];
+        sec1.extend_from_slice(&x);
+        sec1.extend_from_slice(&y);
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).map_err(|err| err.to_string())
+    }
+
+    /// The DID document of `did`, resolved by its method.
+    fn rp_resolve(did: &str, http: &Script) -> Result<Json, String> {
+        if let Some(encoded) = did.strip_prefix("did:jwk:") {
+            // did:jwk section 2.2: the document is generated from the JWK,
+            // with the one verification method `#0`.
+            let bytes = b64::b64_decode(encoded).ok_or("did:jwk is not base64url")?;
+            let jwk = Json::parse(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            let id = format!("{did}#0");
+            return Ok(object(&[
+                ("id", Json::String(did.to_string())),
+                (
+                    "verificationMethod",
+                    Json::Array(vec![object(&[
+                        ("id", Json::String(id.clone())),
+                        ("type", Json::String("JsonWebKey2020".to_string())),
+                        ("controller", Json::String(did.to_string())),
+                        ("publicKeyJwk", jwk),
+                    ])]),
+                ),
+                ("authentication", Json::Array(vec![Json::String(id)])),
+            ]));
+        }
+        if let Some(multibase) = did.strip_prefix("did:key:") {
+            // did:key: multibase base58btc, multicodec p256-pub (0x1200),
+            // a compressed point. The method id repeats the multibase value.
+            let body = multibase
+                .strip_prefix('z')
+                .ok_or("did:key is not base58btc")?;
+            let bytes = rp_base58_decode(body).ok_or("not base58btc")?;
+            if bytes.len() != 35 || bytes[0] != 0x80 || bytes[1] != 0x24 {
+                return Err("not a p256-pub multikey".to_string());
+            }
+            let public = p256::PublicKey::from_sec1_bytes(&bytes[2..])
+                .map_err(|_| "not a point on P-256".to_string())?;
+            let point = public.to_encoded_point(false);
+            let id = format!("{did}#{multibase}");
+            let jwk = object(&[
+                ("kty", Json::String("EC".to_string())),
+                ("crv", Json::String("P-256".to_string())),
+                (
+                    "x",
+                    Json::String(b64::b64url_encode(point.x().unwrap().as_slice())),
+                ),
+                (
+                    "y",
+                    Json::String(b64::b64url_encode(point.y().unwrap().as_slice())),
+                ),
+            ]);
+            return Ok(object(&[
+                ("id", Json::String(did.to_string())),
+                (
+                    "verificationMethod",
+                    Json::Array(vec![object(&[
+                        ("id", Json::String(id.clone())),
+                        ("type", Json::String("JsonWebKey2020".to_string())),
+                        ("controller", Json::String(did.to_string())),
+                        ("publicKeyJwk", jwk),
+                    ])]),
+                ),
+                ("authentication", Json::Array(vec![Json::String(id)])),
+            ]));
+        }
+        if did.starts_with("did:web:") {
+            let url = rp_did_web_url(did)?;
+            assert!(
+                url.starts_with("https://"),
+                "a did:web is fetched over https"
+            );
+            let response = http.exchange("GET", &url, None, &[])?;
+            if response.status != 200 {
+                return Err(format!("{url} answered {}", response.status));
+            }
+            let text = String::from_utf8(response.body).map_err(|e| e.to_string())?;
+            let doc = Json::parse(&text).map_err(|e| e.to_string())?;
+            // SIOPv2 section 11.1 item 5: sub equals the document's id.
+            if doc.get("id").and_then(Json::as_str) != Some(did) {
+                return Err("the document is another DID's".to_string());
+            }
+            return Ok(doc);
+        }
+        Err(format!(
+            "{did} is a DID method this relying party does not resolve"
+        ))
+    }
+
+    fn absolute_id(did: &str, id: &str) -> String {
+        if id.starts_with('#') {
+            format!("{did}{id}")
+        } else {
+            id.to_string()
+        }
+    }
+
+    /// SIOPv2 section 11.1, for a DID subject.
+    fn rp_verify(
+        token: &str,
+        client_id: &str,
+        nonce: &str,
+        now: u64,
+        http: &Script,
+    ) -> Result<Accepted, String> {
+        let header = jwt_json(token, 0).ok_or("no header")?;
+        let payload = jwt_json(token, 1).ok_or("no payload")?;
+        let sub = payload.get("sub").and_then(Json::as_str).ok_or("no sub")?;
+        if payload.get("iss").and_then(Json::as_str) != Some(sub) {
+            return Err("iss is not sub".to_string());
+        }
+        if !sub.starts_with("did:") {
+            return Err("not a DID subject".to_string());
+        }
+        if payload.get("sub_jwk").is_some() {
+            return Err("sub_jwk is present with a DID subject".to_string());
+        }
+        if header.get("alg").and_then(Json::as_str) != Some("ES256") {
+            return Err("not ES256".to_string());
+        }
+        if payload.get("aud").and_then(Json::as_str) != Some(client_id) {
+            return Err("aud".to_string());
+        }
+        if payload.get("nonce").and_then(Json::as_str) != Some(nonce) {
+            return Err("nonce".to_string());
+        }
+        let exp = payload.get("exp").and_then(Json::as_u64).ok_or("no exp")?;
+        let iat = payload.get("iat").and_then(Json::as_u64).ok_or("no iat")?;
+        if exp <= now || iat > now + 60 {
+            return Err("exp or iat".to_string());
+        }
+        let kid = header.get("kid").and_then(Json::as_str).ok_or("no kid")?;
+        let kid = absolute_id(sub, kid);
+        if kid.split('#').next() != Some(sub) {
+            return Err("the kid is another DID's".to_string());
+        }
+        let doc = rp_resolve(sub, http)?;
+        let authentication = doc
+            .get("authentication")
+            .and_then(Json::as_array)
+            .unwrap_or(&[]);
+        let in_authentication = authentication.iter().any(|one| {
+            let id = one
+                .as_str()
+                .or_else(|| one.get("id").and_then(Json::as_str));
+            id.is_some_and(|id| absolute_id(sub, id) == kid)
+        });
+        if !in_authentication {
+            return Err(format!("{kid} is not in authentication"));
+        }
+        let mut methods: Vec<&Json> = doc
+            .get("verificationMethod")
+            .and_then(Json::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .collect();
+        methods.extend(
+            authentication
+                .iter()
+                .filter(|one| one.as_object().is_some()),
+        );
+        let method = methods
+            .into_iter()
+            .find(|one| {
+                one.get("id")
+                    .and_then(Json::as_str)
+                    .is_some_and(|id| absolute_id(sub, id) == kid)
+            })
+            .ok_or("no verification method for the kid")?;
+        let key = rp_key_of_jwk(method.get("publicKeyJwk").ok_or("no publicKeyJwk")?)?;
+        let (input, signature) = token.rsplit_once('.').ok_or("not a JWS")?;
+        let signature = b64::b64_decode(signature).ok_or("signature encoding")?;
+        let signature =
+            p256::ecdsa::Signature::from_slice(&signature).map_err(|e| e.to_string())?;
+        key.verify(input.as_bytes(), &signature)
+            .map_err(|_| "the signature does not verify".to_string())?;
+        Ok(Accepted {
+            subject: sub.to_string(),
+            kid,
+        })
+    }
+
+    fn posted_id_token(fixture: &Fixture) -> String {
+        posted_plain(fixture)
+            .get("id_token")
+            .and_then(Json::as_str)
+            .expect("an id_token was posted")
+            .to_string()
+    }
+
+    fn tampered(token: &str) -> String {
+        let mut out = token.to_string();
+        let at = out.rfind('.').unwrap() + 3;
+        let next = if out.as_bytes()[at] == b'A' { "B" } else { "A" };
+        out.replace_range(at..at + 1, next);
+        out
+    }
+
+    /// Re-sign `token` with `holder`, with the header `kid` replaced.
+    fn with_kid(token: &str, holder: &str, kid: &str) -> String {
+        let signing = holder_signing(&Json::parse(holder).unwrap()).unwrap();
+        let header = object(&[
+            ("alg", Json::String("ES256".to_string())),
+            ("typ", Json::String("JWT".to_string())),
+            ("kid", Json::String(kid.to_string())),
+        ]);
+        sign_compact(&signing, &header, &part_json(token, 1))
+    }
+
+    /// One siopv2:// sign-in with `syntax`, a fresh key, and the relying
+    /// party's check of what was posted.
+    fn sign_in_as(syntax: &SubjectSyntax) -> (Fixture, String, NewCredential, Accepted) {
+        let now = now_secs();
+        let fixture = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+        let outcome = present_as(&fixture.uri, &[], &fixture.script, now, syntax);
+        assert!(outcome.ok, "{}", outcome.message);
+        let stored = outcome.store.expect("a self-issued key was created");
+        let token = posted_id_token(&fixture);
+        let accepted = rp_verify(
+            &token,
+            &fixture.client_id,
+            &fixture.nonce,
+            now,
+            &fixture.script,
+        )
+        .unwrap_or_else(|err| panic!("{syntax:?}: {err}"));
+        assert_post_hides_key(
+            &posted_body(&fixture),
+            stored.holder_key.as_deref().unwrap(),
+        );
+        (fixture, token, stored, accepted)
+    }
+
+    #[test]
+    fn a_did_jwk_sign_in_verifies_as_a_relying_party_would() {
+        let (fixture, token, stored, accepted) = sign_in_as(&SubjectSyntax::DidJwk);
+        assert!(accepted.subject.starts_with("did:jwk:"));
+        assert_eq!(accepted.kid, format!("{}#0", accepted.subject));
+        let header = part_json(&token, 0);
+        assert_eq!(
+            header.get("kid").and_then(Json::as_str),
+            Some(accepted.kid.as_str())
+        );
+        assert_eq!(header.keys(), vec!["alg", "typ", "kid"]);
+        assert_eq!(
+            part_json(&token, 1).keys(),
+            vec!["iss", "sub", "aud", "nonce", "iat", "exp"]
+        );
+        // The stored credential keeps the key under its thumbprint, as before.
+        assert!(stored.issuer.starts_with(jws::JWK_THUMBPRINT_PREFIX));
+        let holder = stored.holder_key.clone().unwrap();
+        check_self_issued_document(&stored.document, &stored.issuer, &holder);
+        let now = now_secs();
+        let script = &fixture.script;
+        assert!(rp_verify(
+            &tampered(&token),
+            &fixture.client_id,
+            &fixture.nonce,
+            now,
+            script
+        )
+        .unwrap_err()
+        .contains("signature"));
+        let wrong_kid = with_kid(&token, &holder, &format!("{}#1", accepted.subject));
+        assert!(
+            rp_verify(&wrong_kid, &fixture.client_id, &fixture.nonce, now, script)
+                .unwrap_err()
+                .contains("not in authentication")
+        );
+        assert!(rp_verify(&token, "x509_hash:other", &fixture.nonce, now, script).is_err());
+        assert!(rp_verify(&token, &fixture.client_id, "nonce-2", now, script).is_err());
+        assert!(rp_verify(
+            &token,
+            &fixture.client_id,
+            &fixture.nonce,
+            now + 601,
+            script
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_did_key_sign_in_verifies_as_a_relying_party_would() {
+        let (fixture, token, stored, accepted) = sign_in_as(&SubjectSyntax::DidKey);
+        assert!(accepted.subject.starts_with("did:key:zDn"));
+        let multibase = accepted.subject.strip_prefix("did:key:").unwrap();
+        assert_eq!(accepted.kid, format!("{}#{multibase}", accepted.subject));
+        assert!(part_json(&token, 1).get("sub_jwk").is_none());
+        let holder = stored.holder_key.clone().unwrap();
+        // The did:key names the holder key.
+        let signing = holder_signing(&Json::parse(&holder).unwrap()).unwrap();
+        let point = signing.verifying_key().to_encoded_point(true);
+        let bytes = rp_base58_decode(multibase.strip_prefix('z').unwrap()).unwrap();
+        assert_eq!(&bytes[..2], &[0x80, 0x24]);
+        assert_eq!(&bytes[2..], point.as_bytes());
+        let now = now_secs();
+        let script = &fixture.script;
+        assert!(rp_verify(
+            &tampered(&token),
+            &fixture.client_id,
+            &fixture.nonce,
+            now,
+            script
+        )
+        .unwrap_err()
+        .contains("signature"));
+        let wrong_kid = with_kid(&token, &holder, &format!("{}#key-1", accepted.subject));
+        assert!(
+            rp_verify(&wrong_kid, &fixture.client_id, &fixture.nonce, now, script)
+                .unwrap_err()
+                .contains("not in authentication")
+        );
+        let other_did = with_kid(&token, &holder, "did:key:zOther#zOther");
+        assert!(
+            rp_verify(&other_did, &fixture.client_id, &fixture.nonce, now, script)
+                .unwrap_err()
+                .contains("another DID")
+        );
+    }
+
+    #[test]
+    fn a_did_web_sign_in_verifies_against_the_published_document() {
+        let now = now_secs();
+        let did = "did:web:wallet.example%3A8443:users:alice";
+        let syntax = SubjectSyntax::DidWeb(did.to_string());
+        // The Security tab creates the key when did:web is saved.
+        let stored = held(
+            "cred-self",
+            "20261018T120000.000Z",
+            create_self_issued_credential().expect("a key"),
+        );
+        let credentials = std::slice::from_ref(&stored);
+        let publication = did_web_publication(credentials, did).expect("a document");
+        assert_eq!(
+            publication.url,
+            "https://wallet.example:8443/users/alice/did.json"
+        );
+        assert_eq!(rp_did_web_url(did).unwrap(), publication.url);
+        assert_eq!(
+            self_issued_identifier(credentials, &syntax).as_deref(),
+            Some(did)
+        );
+        let mut fixture = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+        let served = publication.document.to_string();
+        fixture.script.gets.insert(
+            publication.url.clone(),
+            http(&publication.url, 200, served.as_bytes(), Vec::new()),
+        );
+        let outcome = present_as(&fixture.uri, credentials, &fixture.script, now, &syntax);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.store.is_none(), "the published key is reused");
+        assert_eq!(outcome.credential_id.as_deref(), Some("cred-self"));
+        let token = posted_id_token(&fixture);
+        let accepted = rp_verify(
+            &token,
+            &fixture.client_id,
+            &fixture.nonce,
+            now,
+            &fixture.script,
+        )
+        .unwrap();
+        assert_eq!(accepted.subject, did);
+        let methods = publication
+            .document
+            .get("verificationMethod")
+            .and_then(Json::as_array)
+            .unwrap();
+        assert_eq!(
+            methods[0].get("id").and_then(Json::as_str),
+            Some(accepted.kid.as_str())
+        );
+        assert!(part_json(&token, 1).get("sub_jwk").is_none());
+        let holder = stored.holder_key.clone().unwrap();
+        assert!(
+            !served.contains(
+                Json::parse(&holder)
+                    .unwrap()
+                    .get("d")
+                    .and_then(Json::as_str)
+                    .unwrap()
+            ),
+            "the document publishes no private key"
+        );
+        let script = &fixture.script;
+        assert!(rp_verify(
+            &tampered(&token),
+            &fixture.client_id,
+            &fixture.nonce,
+            now,
+            script
+        )
+        .unwrap_err()
+        .contains("signature"));
+        let wrong_kid = with_kid(&token, &holder, &format!("{did}#key-2"));
+        assert!(
+            rp_verify(&wrong_kid, &fixture.client_id, &fixture.nonce, now, script)
+                .unwrap_err()
+                .contains("not in authentication")
+        );
+
+        // A document that lists the method but not in `authentication` does
+        // not vouch for the token.
+        let assertion_only = served.replace(
+            &format!("\"authentication\":[\"{}\"]", accepted.kid),
+            "\"authentication\":[]",
+        );
+        assert_ne!(assertion_only, served);
+        let mut other = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+        other.script.gets.insert(
+            publication.url.clone(),
+            http(&publication.url, 200, assertion_only.as_bytes(), Vec::new()),
+        );
+        let again = present_as(&other.uri, credentials, &other.script, now, &syntax);
+        assert!(again.ok, "{}", again.message);
+        let second = posted_id_token(&other);
+        assert!(
+            rp_verify(&second, &other.client_id, &other.nonce, now, &other.script)
+                .unwrap_err()
+                .contains("not in authentication")
+        );
+    }
+
+    #[test]
+    fn a_did_web_with_no_self_issued_key_sends_nothing() {
+        let now = now_secs();
+        let fixture = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+        let syntax = SubjectSyntax::DidWeb("did:web:wallet.example".to_string());
+        let outcome = present_as(&fixture.uri, &[], &fixture.script, now, &syntax);
+        assert!(!outcome.ok);
+        assert!(!outcome.answered);
+        assert!(outcome.store.is_none());
+        assert!(outcome.message.contains("did:web:wallet.example"));
+        assert!(fixture.script.posts.lock().expect("posts").is_empty());
+    }
+
+    #[test]
+    fn a_later_did_sign_in_reuses_the_stored_subject() {
+        for syntax in [SubjectSyntax::DidJwk, SubjectSyntax::DidKey] {
+            let now = now_secs();
+            let (_, _, minted, first) = sign_in_as(&syntax);
+            let stored = held("cred-self", "20261018T120000.000Z", minted);
+            let second = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+            let outcome = present_as(
+                &second.uri,
+                std::slice::from_ref(&stored),
+                &second.script,
+                now,
+                &syntax,
+            );
+            assert!(outcome.ok, "{}", outcome.message);
+            assert!(outcome.store.is_none());
+            assert_eq!(outcome.credential_id.as_deref(), Some("cred-self"));
+            let token = posted_id_token(&second);
+            let accepted = rp_verify(
+                &token,
+                &second.client_id,
+                &second.nonce,
+                now,
+                &second.script,
+            )
+            .unwrap();
+            assert_eq!(accepted.subject, first.subject, "{syntax:?}");
+            assert_eq!(
+                self_issued_identifier(std::slice::from_ref(&stored), &syntax).as_deref(),
+                Some(first.subject.as_str())
+            );
+            // The same key under the thumbprint syntax is the stored issuer.
+            assert_eq!(
+                self_issued_identifier(
+                    std::slice::from_ref(&stored),
+                    &SubjectSyntax::JwkThumbprint
+                ),
+                Some(stored.issuer.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn an_approved_new_key_signs_with_the_chosen_did() {
+        let now = now_secs();
+        let fixture = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+        let step = stage_as(
+            &fixture.uri,
+            &[],
+            &fixture.script,
+            now,
+            Some(&[]),
+            &SubjectSyntax::DidKey,
+        );
+        let Presentation::NeedsApproval(pending) = step else {
+            panic!("a new key was created before approval");
+        };
+        assert!(fixture.script.posts.lock().expect("posts").is_empty());
+        let outcome = approve_with(*pending, &[], &fixture.script, now);
+        assert!(outcome.ok, "{}", outcome.message);
+        let token = posted_id_token(&fixture);
+        let accepted = rp_verify(
+            &token,
+            &fixture.client_id,
+            &fixture.nonce,
+            now,
+            &fixture.script,
+        )
+        .unwrap();
+        assert!(accepted.subject.starts_with("did:key:"));
+    }
+
+    fn refused_with(syntax: &SubjectSyntax, listed: &[&str], response_type: &str) -> Fixture {
+        let now = now_secs();
+        let scheme = if response_type == "id_token" {
+            "siopv2"
+        } else {
+            "openid4vp"
+        };
+        let fixture = fixture_listing("direct_post.jwt", true, response_type, scheme, Some(listed));
+        let held_self = {
+            let made = present_as(
+                &fixture_request("direct_post.jwt", true, "id_token", "siopv2").uri,
+                &[],
+                &fixture_request("direct_post.jwt", true, "id_token", "siopv2").script,
+                now,
+                &SubjectSyntax::JwkThumbprint,
+            );
+            made.store
+                .map(|new| held("cred-self", "20261018T120000.000Z", new))
+        };
+        let mut credentials = vec![fixture.same.clone()];
+        credentials.extend(held_self);
+        let outcome = present_as(&fixture.uri, &credentials, &fixture.script, now, syntax);
+        assert!(
+            !outcome.ok,
+            "{syntax:?} was sent to a verifier listing {listed:?}"
+        );
+        assert!(outcome.answered);
+        assert!(outcome.store.is_none());
+        assert!(
+            outcome.message.contains(syntax.type_value()) || response_type != "id_token",
+            "{}",
+            outcome.message
+        );
+        for one in listed {
+            assert!(outcome.message.contains(one), "{}", outcome.message);
+        }
+        let plain = posted_plain(&fixture);
+        assert_eq!(
+            plain.get("error").and_then(Json::as_str),
+            Some("subject_syntax_types_not_supported")
+        );
+        assert!(plain
+            .get("error_description")
+            .and_then(Json::as_str)
+            .is_some());
+        assert!(plain.get("id_token").is_none());
+        assert!(plain.get("vp_token").is_none());
+        assert_eq!(plain.get("state").and_then(Json::as_str), Some("state-1"));
+        fixture
+    }
+
+    #[test]
+    fn a_verifier_that_does_not_list_the_chosen_syntax_is_refused() {
+        refused_with(&SubjectSyntax::DidJwk, &["did:key"], "id_token");
+        refused_with(&SubjectSyntax::DidKey, &["did:jwk", "did:web"], "id_token");
+        refused_with(
+            &SubjectSyntax::DidWeb("did:web:wallet.example".to_string()),
+            &[subject::THUMBPRINT_TYPE],
+            "id_token",
+        );
+        refused_with(&SubjectSyntax::JwkThumbprint, &["did"], "id_token");
+        refused_with(&SubjectSyntax::DidKey, &[], "id_token");
+        // vp_token id_token is signed by the credential's key, named by its
+        // thumbprint whatever Settings says.
+        refused_with(&SubjectSyntax::DidJwk, &["did:jwk"], "vp_token id_token");
+    }
+
+    #[test]
+    fn a_verifier_listing_the_chosen_syntax_gets_the_token() {
+        let cases: &[(SubjectSyntax, &[&str])] = &[
+            (SubjectSyntax::DidJwk, &["did:key", "did:jwk"]),
+            (SubjectSyntax::DidKey, &["did"]),
+            (
+                SubjectSyntax::JwkThumbprint,
+                &[subject::THUMBPRINT_TYPE, "did:jwk"],
+            ),
+        ];
+        for (syntax, listed) in cases {
+            let now = now_secs();
+            let fixture = fixture_listing("direct_post", true, "id_token", "siopv2", Some(listed));
+            let outcome = present_as(&fixture.uri, &[], &fixture.script, now, syntax);
+            assert!(outcome.ok, "{syntax:?}: {}", outcome.message);
+            let posts = fixture.script.posts.lock().expect("posts");
+            let token = form_value(&posts[0].1, "id_token");
+            drop(posts);
+            if syntax.is_did() {
+                rp_verify(
+                    &token,
+                    &fixture.client_id,
+                    &fixture.nonce,
+                    now,
+                    &fixture.script,
+                )
+                .unwrap();
+            } else {
+                let holder = outcome.store.unwrap().holder_key.unwrap();
+                check_id_token(&token, &fixture.client_id, &fixture.nonce, &holder, now);
+            }
+        }
+        let now = now_secs();
+        let combined = fixture_listing(
+            "direct_post.jwt",
+            true,
+            "vp_token id_token",
+            "openid4vp",
+            Some(&[subject::THUMBPRINT_TYPE]),
+        );
+        let outcome = present_as(
+            &combined.uri,
+            std::slice::from_ref(&combined.same),
+            &combined.script,
+            now,
+            &SubjectSyntax::DidKey,
+        );
+        assert!(outcome.ok, "{}", outcome.message);
+        let token = posted_id_token(&combined);
+        let holder = combined.same.holder_key.clone().unwrap();
+        check_id_token(&token, &combined.client_id, &combined.nonce, &holder, now);
+    }
+
+    #[test]
+    fn the_thumbprint_choice_signs_what_it_signed_before() {
+        let now = now_secs();
+        let fixture = fixture_request("direct_post.jwt", true, "id_token", "siopv2");
+        let outcome = present_as(
+            &fixture.uri,
+            &[],
+            &fixture.script,
+            now,
+            &SubjectSyntax::JwkThumbprint,
+        );
+        let holder = outcome.store.unwrap().holder_key.unwrap();
+        let token = posted_id_token(&fixture);
+        check_id_token(&token, &fixture.client_id, &fixture.nonce, &holder, now);
+        assert_eq!(part_json(&token, 0).keys(), vec!["alg", "typ"]);
+        assert_eq!(
+            part_json(&token, 1).keys(),
+            vec!["iss", "sub", "sub_jwk", "aud", "nonce", "iat", "exp"]
+        );
+        let ready = Ready {
+            client_id: fixture.client_id.clone(),
+            nonce: fixture.nonce.clone(),
+            state: "state-1".to_string(),
+            response_uri: "https://verifier.example/oid4vp/response".to_string(),
+            jwt_response: false,
+            dcql: Json::Null,
+            recipient: None,
+            enc: String::new(),
+            can_respond: true,
+            wants_vp: false,
+            wants_id: true,
+            subject_types: None,
+            subject: SubjectSyntax::JwkThumbprint,
+        };
+        let signing = holder_signing(&Json::parse(&holder).unwrap()).unwrap();
+        // ES256 signatures are randomised, so compare the signed parts.
+        let before = id_token_from(&signing, &ready, now).unwrap();
+        let after = id_token_as(&signing, &ready, now, &SubjectSyntax::JwkThumbprint).unwrap();
+        assert_eq!(
+            before.rsplit_once('.').unwrap().0,
+            after.rsplit_once('.').unwrap().0
+        );
     }
 }
