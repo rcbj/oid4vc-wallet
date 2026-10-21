@@ -95,17 +95,40 @@ impl Fido for HardwareFido {
             return Ok(None);
         }
         let (_info, mut auth) = open_one()?;
-        let refs: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
-        // A silent probe does not touch and does not use the PIN. Firmware
-        // that rejects up=false falls back to one touch, still without a PIN.
-        match auth.probe_credential(RP_ID, &random_hash(), &refs) {
-            Ok(found) => Ok(found),
-            Err(ctap_fido2::error::Error::Ctap(_)) => auth
-                .probe_credential_with_touch(RP_ID, &random_hash(), &refs)
-                .map_err(|err| map_ctap(Some(&mut auth), err)),
-            Err(err) => Err(map_ctap(None, err)),
+        // One id per probe: a YubiKey answers a credential id minted by
+        // another authenticator with InvalidCredential instead of
+        // NoCredentials, and one foreign id would hide its own in a list.
+        for id in ids {
+            let refs = [id.as_slice()];
+            // A silent probe does not touch and does not use the PIN.
+            // Firmware that rejects up=false falls back to one touch, still
+            // without a PIN.
+            let found = match auth.probe_credential(RP_ID, &random_hash(), &refs) {
+                Err(err) if is_foreign(&err) => None,
+                Err(ctap_fido2::error::Error::Ctap(_)) => {
+                    match auth.probe_credential_with_touch(RP_ID, &random_hash(), &refs) {
+                        Err(err) if is_foreign(&err) => None,
+                        Err(err) => return Err(map_ctap(Some(&mut auth), err)),
+                        Ok(found) => found,
+                    }
+                }
+                Err(err) => return Err(map_ctap(None, err)),
+                Ok(found) => found,
+            };
+            if found.is_some() {
+                return Ok(Some(id.clone()));
+            }
         }
+        Ok(None)
     }
+}
+
+/// CTAP2_ERR_INVALID_CREDENTIAL (0x22). The crate has no named variant.
+fn is_foreign(err: &ctap_fido2::error::Error) -> bool {
+    matches!(
+        err,
+        ctap_fido2::error::Error::Ctap(ctap_fido2::error::CtapStatus::Other(0x22))
+    )
 }
 
 fn listed() -> Result<Vec<ctap_fido2::device::DeviceInfo>, KeyStoreError> {

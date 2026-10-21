@@ -316,8 +316,21 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
         // A key that is already pending says so even when two are waiting,
         // so the person is not told the list is full for a key they enrolled.
         let pending_ids: Vec<Vec<u8>> = doc.pending.iter().map(|item| item.id.clone()).collect();
-        if self.fido.holds(&pending_ids)?.is_some() {
-            return Err(plain("wallet.fido.already"));
+        if let Some(id) = self.fido.holds(&pending_ids)? {
+            if cached_kek(self.session, &id).is_some() {
+                return Err(plain("wallet.fido.already"));
+            }
+            // A restart dropped this key's output, and activate cannot wrap
+            // without it. The stored credential and salt give the same
+            // output again, so relearn it instead of leaving a dead end.
+            let Some(item) = doc.pending.iter().find(|item| item.id == id) else {
+                return Err(plain("wallet.fido.malformed"));
+            };
+            let kek = self
+                .fido
+                .hmac(&item.id, &item.public_key, &item.salt, pin)?;
+            remember_kek(self.session, &item.id, kek);
+            return Ok(item.label.clone());
         }
         if doc.pending.len() >= 2 {
             return Err(plain("wallet.fido.pending_full"));
@@ -1507,6 +1520,29 @@ mod tests {
         let doc = read_doc(&lab.path).unwrap();
         assert_eq!(doc.mechanism, Mechanism::Keyring);
         assert_eq!(doc.pending.len(), 2);
+    }
+
+    #[test]
+    fn enrolling_a_pending_key_after_a_restart_relearns_its_wrap_key() {
+        let mut lab = Lab::new("fido-relearn");
+        let dek = Aes256Key::from_bytes([0x67; 32]);
+        lab.desktop.store_key(&dek).unwrap();
+        enroll_pair(&mut lab);
+        lab.session.keks.clear();
+        lab.fido.set_connected(&[11]);
+        lab.work().enroll("1111").unwrap();
+        let err = lab.work().activate().unwrap_err();
+        assert_eq!(err.to_string(), message("wallet.fido.session"));
+        lab.fido.set_connected(&[22]);
+        lab.work().enroll("2222").unwrap();
+        assert_eq!(lab.fido.credential_count(11), 1);
+        assert_eq!(lab.fido.credential_count(22), 1);
+        assert_eq!(read_doc(&lab.path).unwrap().pending.len(), 2);
+        lab.work().activate().unwrap();
+        lab.session.dek = None;
+        lab.fido.set_connected(&[11]);
+        lab.work().unlock("1111").unwrap();
+        assert_eq!(lab.session.dek.as_ref().unwrap().as_bytes(), dek.as_bytes());
     }
 
     #[test]
