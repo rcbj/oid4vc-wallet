@@ -7,7 +7,7 @@
 //! same-device request from the credential list, answer a self-issued ID
 //! Token request, show the signer certificate chain carried in a credential,
 //! and open Settings for the language, the protocol handlers, trust anchors,
-//! the storage key, import and export, and About.
+//! the self-issued subject and the storage key, import and export, and About.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -20,13 +20,15 @@ use oid4vc_wallet::i18n::{self, t, t_args};
 use oid4vc_wallet::protocol::offer::{CredentialOffer, OfferPassing};
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Invocation, Json};
 use oid4vc_wallet::wallet::{
-    accept, approve_presentation, delete_anchor, ensure_self_issued_certificate,
-    export_credentials, import_anchors, import_credentials, list_anchors, prepare_presentation,
-    presentation_approval_path, presentation_approvals, redeem_pre_authorized, refuse_presentation,
-    remember_presentation, remember_trust, signature_algorithm, signer_certificates,
-    trust_anchors_dir, validate_stored, AnchorInfo, Credential, CredentialVault, Inbox,
-    NewCredential, Outcome, PendingPresentation, PortableError, Presentation, Presented, Redeemed,
-    SignerCertificate,
+    accept, approve_presentation, create_self_issued_credential, delete_anchor,
+    did_web_publication, did_web_url, ensure_self_issued_certificate, export_credentials,
+    import_anchors, import_credentials, list_anchors, prepare_presentation,
+    presentation_approval_path, presentation_approvals, read_subject_setting,
+    redeem_pre_authorized, refuse_presentation, remember_presentation, remember_trust,
+    self_issued_identifier, signature_algorithm, signer_certificates, subject_setting_path,
+    trust_anchors_dir, validate_stored, write_subject_setting, AnchorInfo, Credential,
+    CredentialVault, Inbox, NewCredential, Outcome, PendingPresentation, PortableError,
+    Presentation, Presented, Redeemed, SignerCertificate, SubjectSyntax,
 };
 
 use super::single::Incoming;
@@ -62,6 +64,49 @@ const ABOUT_PAGES: &[(&str, &str)] = &[
     (
         "wallet.ui.about_license",
         "https://github.com/rcbj/oid4vc-wallet/blob/main/LICENSE",
+    ),
+];
+
+/// The radio buttons of Settings → Security → Self-issued ID subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubjectChoice {
+    Thumbprint,
+    DidJwk,
+    DidKey,
+    DidWeb,
+}
+
+impl SubjectChoice {
+    fn of(syntax: &SubjectSyntax) -> Self {
+        match syntax {
+            SubjectSyntax::JwkThumbprint => Self::Thumbprint,
+            SubjectSyntax::DidJwk => Self::DidJwk,
+            SubjectSyntax::DidKey => Self::DidKey,
+            SubjectSyntax::DidWeb(_) => Self::DidWeb,
+        }
+    }
+}
+
+const SUBJECT_CHOICES: &[(SubjectChoice, &str, &str)] = &[
+    (
+        SubjectChoice::Thumbprint,
+        "wallet.ui.subject_thumbprint",
+        "wallet.ui.subject_thumbprint_help",
+    ),
+    (
+        SubjectChoice::DidJwk,
+        "wallet.ui.subject_did_jwk",
+        "wallet.ui.subject_did_jwk_help",
+    ),
+    (
+        SubjectChoice::DidKey,
+        "wallet.ui.subject_did_key",
+        "wallet.ui.subject_did_key_help",
+    ),
+    (
+        SubjectChoice::DidWeb,
+        "wallet.ui.subject_did_web",
+        "wallet.ui.subject_did_web_help",
     ),
 ];
 
@@ -254,6 +299,12 @@ struct WalletApp {
     present_prompt: Option<PresentPrompt>,
     /// Signer certificates of one credential, when that window is open.
     cert_view: Option<CertView>,
+    /// The saved self-issued subject.
+    subject: SubjectSyntax,
+    /// The radio button selected on the Security tab, saved or not.
+    subject_choice: SubjectChoice,
+    /// The `did:web` typed on the Security tab.
+    did_web_input: String,
 }
 
 #[derive(Clone)]
@@ -322,7 +373,11 @@ impl WalletApp {
             answered: HashMap::new(),
             present_prompt: None,
             cert_view: None,
+            subject: SubjectSyntax::JwkThumbprint,
+            subject_choice: SubjectChoice::Thumbprint,
+            did_web_input: String::new(),
         };
+        app.reload_subject();
         app.reload_credentials();
         app.reload_inbox();
         app.apply_launch(&uris);
@@ -397,7 +452,17 @@ impl WalletApp {
             let old = self.present_prompt.take().expect("prompt");
             self.finish_present(old, false);
         }
-        match prepare_presentation(uri, &self.credentials, &approved_presentations()) {
+        // Read the file again: the subject is what Settings saved, and a file
+        // that cannot be read is said, not replaced by the default.
+        let subject = match subject_setting_path().and_then(|path| read_subject_setting(&path)) {
+            Ok(subject) => subject,
+            Err(err) => {
+                self.fail(err);
+                return;
+            }
+        };
+        self.subject = subject.clone();
+        match prepare_presentation(uri, &self.credentials, &approved_presentations(), &subject) {
             Presentation::Finished(outcome) => {
                 self.settle_present(uri, outcome);
             }
@@ -1272,6 +1337,163 @@ impl WalletApp {
     }
 
     fn security_tab(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("security-tab")
+            .show(ui, |ui| {
+                self.subject_section(ui);
+                ui.separator();
+                self.storage_key_section(ui);
+            });
+    }
+
+    fn reload_subject(&mut self) {
+        match subject_setting_path().and_then(|path| read_subject_setting(&path)) {
+            Ok(subject) => {
+                self.subject_choice = SubjectChoice::of(&subject);
+                if let SubjectSyntax::DidWeb(did) = &subject {
+                    self.did_web_input = did.clone();
+                }
+                self.subject = subject;
+            }
+            Err(err) => self.warn(err),
+        }
+    }
+
+    fn subject_section(&mut self, ui: &mut egui::Ui) {
+        ui.strong(t("wallet.ui.subject_title"));
+        wrapped(ui, t("wallet.ui.subject_help"));
+        ui.add_space(6.0);
+        for (choice, label, help) in SUBJECT_CHOICES {
+            ui.radio_value(&mut self.subject_choice, *choice, t(label));
+            ui.indent(label, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(t(help)).small()).wrap());
+            });
+            if *choice == SubjectChoice::DidWeb && self.subject_choice == SubjectChoice::DidWeb {
+                ui.indent("did-web-input", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.did_web_input)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("did:web:example.com")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            }
+        }
+        ui.add_space(6.0);
+        if ui.button(t("wallet.ui.subject_save")).clicked() {
+            self.save_subject();
+        }
+        ui.add_space(6.0);
+        match self_issued_identifier(&self.credentials, &self.subject) {
+            Some(identifier) => {
+                ui.label(t("wallet.ui.subject_current"));
+                let mut shown = identifier;
+                ui.add(
+                    egui::TextEdit::multiline(&mut shown)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2)
+                        .interactive(false),
+                );
+            }
+            None => wrapped(ui, t("wallet.ui.subject_no_key")),
+        }
+        if let SubjectSyntax::DidWeb(did) = self.subject.clone() {
+            self.did_web_section(ui, &did);
+        }
+    }
+
+    fn did_web_section(&mut self, ui: &mut egui::Ui, did: &str) {
+        let Some(publication) = did_web_publication(&self.credentials, did) else {
+            return;
+        };
+        ui.add_space(6.0);
+        wrapped(
+            ui,
+            t_args("wallet.ui.did_web_publish", &[("url", &publication.url)]),
+        );
+        let mut document = pretty_json(&publication.document);
+        let copy = ui.button(t("wallet.ui.did_web_copy")).clicked();
+        ui.add(
+            egui::TextEdit::multiline(&mut document)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+                .desired_rows(12)
+                .interactive(false),
+        );
+        if copy {
+            ui.ctx().copy_text(document);
+            self.note(t("wallet.ui.did_web_copied"));
+        }
+    }
+
+    /// The choice on the tab, as a setting. A malformed `did:web` is refused.
+    fn chosen_subject(&self) -> Result<SubjectSyntax, String> {
+        Ok(match self.subject_choice {
+            SubjectChoice::Thumbprint => SubjectSyntax::JwkThumbprint,
+            SubjectChoice::DidJwk => SubjectSyntax::DidJwk,
+            SubjectChoice::DidKey => SubjectSyntax::DidKey,
+            SubjectChoice::DidWeb => {
+                let did = self.did_web_input.trim();
+                if did_web_url(did).is_none() {
+                    return Err(t_args("wallet.subject.did_web_invalid", &[("did", did)]));
+                }
+                SubjectSyntax::DidWeb(did.to_string())
+            }
+        })
+    }
+
+    fn save_subject(&mut self) {
+        let chosen = match self.chosen_subject() {
+            Ok(chosen) => chosen,
+            Err(err) => {
+                self.fail(err);
+                return;
+            }
+        };
+        // A did:web document names a key, so the key has to exist before the
+        // document can be published. Create it now rather than at the first
+        // sign-in, which would sign with a key the document does not name.
+        let mut created = None;
+        if matches!(chosen, SubjectSyntax::DidWeb(_))
+            && self_issued_identifier(&self.credentials, &chosen).is_none()
+        {
+            let Some(new) = create_self_issued_credential() else {
+                self.fail(t("wallet.present.unsupported"));
+                return;
+            };
+            match CredentialVault::open_default().and_then(|vault| vault.put(new)) {
+                Ok(stored) => {
+                    created = Some(stored.id);
+                    self.reload_credentials();
+                }
+                Err(err) => {
+                    self.fail(err.to_string());
+                    return;
+                }
+            }
+        }
+        let saved = subject_setting_path().and_then(|path| write_subject_setting(&path, &chosen));
+        if let Err(err) = saved {
+            self.fail(err);
+            return;
+        }
+        let changed = chosen != self.subject;
+        self.subject = chosen;
+        let mut text = t("wallet.ui.subject_saved");
+        if let Some(id) = created {
+            text.push(' ');
+            text.push_str(&t_args("wallet.ui.subject_key_created", &[("id", &id)]));
+        }
+        if changed {
+            text.push(' ');
+            text.push_str(&t("wallet.ui.subject_enrol_again"));
+        }
+        self.note(text);
+    }
+
+    fn storage_key_section(&mut self, ui: &mut egui::Ui) {
+        ui.strong(t("wallet.ui.storage_key_title"));
         ui.label(t("wallet.ui.rotate_help"));
         ui.add_space(8.0);
         if ui.button(t("wallet.ui.rotate_key")).clicked() {

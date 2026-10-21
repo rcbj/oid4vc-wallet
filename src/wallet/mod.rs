@@ -9,7 +9,9 @@
 //! selects a stored credential, and posts the answer. [`prepare_presentation`]
 //! stops before a holder key is used so the window can ask first.
 //! [`remember_presentation`] records a credential that should not be asked
-//! again. An `id_token` request is answered with a self-issued ID Token.
+//! again. An `id_token` request is answered with a self-issued ID Token,
+//! whose subject is the JWK thumbprint, a `did:jwk`, a `did:key` or a
+//! `did:web` ([`SubjectSyntax`], saved with [`write_subject_setting`]).
 //! [`export_credentials`] copies credentials into a file sealed with a new
 //! AES-256 key, so they can move to another device. [`import_credentials`]
 //! opens that file. The new key is not the wallet's storage key.
@@ -30,6 +32,7 @@ mod proof;
 mod redeem;
 mod seal;
 mod secret_service;
+mod subject;
 mod trust;
 mod validate;
 
@@ -48,13 +51,18 @@ pub use jws::signature_algorithm;
 pub use key_store::{DesktopKeyStore, EncryptionKeyStore, KeyStoreError, RetiredKey};
 pub use portable::{export_credentials, import_credentials, PortableError, PortableExport};
 pub use present::{
-    approve_presentation, ensure_self_issued_certificate, prepare_presentation,
-    present_same_device, refuse_presentation, PendingPresentation, Presentation,
+    approve_presentation, create_self_issued_credential, did_web_publication,
+    ensure_self_issued_certificate, prepare_presentation, present_same_device, refuse_presentation,
+    self_issued_identifier, DidWebPublication, PendingPresentation, Presentation,
     PresentationSummary, Presented,
 };
 pub use redeem::{redeem_pre_authorized, RedeemError, Redeemed};
 pub use seal::{Aes256Key, SealError};
 pub use secret_service::SecretServiceKeyStore;
+pub use subject::{
+    default_path as subject_setting_path, did_web_url, read as read_subject_setting,
+    write as write_subject_setting, SubjectSyntax,
+};
 pub use validate::{remember_trust, validate_stored, Outcome, ValidateError};
 
 use crate::protocol::invocation::{self, Invocation, ParseError};

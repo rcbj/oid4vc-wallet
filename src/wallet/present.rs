@@ -14,6 +14,18 @@
 //! certificate for that key in the JWS `x5c` header. `vp_token id_token`
 //! sends both, signed by the presented credential's holder key. `vp_token`
 //! alone is unchanged.
+//!
+//! The self-issued ID Token names its subject the way Settings → Security
+//! says ([`SubjectSyntax`]): the JWK Thumbprint syntax with `sub_jwk`, or a
+//! `did:jwk`, `did:key` or `did:web` of the same self-issued key, with the
+//! verification method in the JWS `kid` header and no `sub_jwk` (SIOPv2
+//! section 8). `vp_token id_token` always uses the JWK Thumbprint syntax:
+//! that token is signed by the presented credential's holder key, and a
+//! DID chosen for the self-issued key does not name it. When the request's
+//! `client_metadata` lists `subject_syntax_types_supported` and the subject
+//! this answer would use is not among them, the verifier is sent
+//! `subject_syntax_types_not_supported` (section 10.3). Another subject is
+//! never substituted.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
@@ -32,6 +44,7 @@ use super::b64;
 use super::certs::{self, Chain, OwnedCert};
 use super::http::RawResponse;
 use super::jws::{self, IssuerJws};
+use super::subject::{self, SubjectSyntax};
 use super::{Credential, NewCredential};
 
 const WALLET_AUDIENCE: &str = "https://self-issued.me/v2";
@@ -97,8 +110,13 @@ impl Transport for LiveHttp {
 
 /// Fetch the request the desktop launched, present one matching credential,
 /// and report the page the verifier asked the browser to open.
-pub fn present_same_device(uri: &str, credentials: &[Credential]) -> Presented {
-    present_with(uri, credentials, &LiveHttp, now_secs())
+/// A self-issued ID Token names its subject as `subject` says.
+pub fn present_same_device(
+    uri: &str,
+    credentials: &[Credential],
+    subject: &SubjectSyntax,
+) -> Presented {
+    present_as(uri, credentials, &LiveHttp, now_secs(), subject)
 }
 
 /// What the window shows about the credential whose key would be used.
@@ -141,13 +159,22 @@ pub enum Presentation {
 
 /// Fetch and check the request. When a holder key would be used and its
 /// credential id is not in `approved`, return [`Presentation::NeedsApproval`]
-/// without signing or posting. A new self-issued key always waits.
+/// without signing or posting. A new self-issued key always waits. A
+/// self-issued ID Token names its subject as `subject` says.
 pub fn prepare_presentation(
     uri: &str,
     credentials: &[Credential],
     approved: &[String],
+    subject: &SubjectSyntax,
 ) -> Presentation {
-    stage(uri, credentials, &LiveHttp, now_secs(), Some(approved))
+    stage_as(
+        uri,
+        credentials,
+        &LiveHttp,
+        now_secs(),
+        Some(approved),
+        subject,
+    )
 }
 
 /// Sign and post a presentation the person approved.
@@ -160,24 +187,54 @@ pub fn refuse_presentation(pending: PendingPresentation) -> Presented {
     refuse_with(pending, &LiveHttp)
 }
 
+#[cfg(test)]
 fn present_with<T: Transport>(
     uri: &str,
     credentials: &[Credential],
     http: &T,
     now: u64,
 ) -> Presented {
-    match stage(uri, credentials, http, now, None) {
+    present_as(uri, credentials, http, now, &SubjectSyntax::JwkThumbprint)
+}
+
+fn present_as<T: Transport>(
+    uri: &str,
+    credentials: &[Credential],
+    http: &T,
+    now: u64,
+    subject: &SubjectSyntax,
+) -> Presented {
+    match stage_as(uri, credentials, http, now, None, subject) {
         Presentation::Finished(done) => done,
         Presentation::NeedsApproval(pending) => approve_with(*pending, credentials, http, now),
     }
 }
 
+#[cfg(test)]
 fn stage<T: Transport>(
     uri: &str,
     credentials: &[Credential],
     http: &T,
     now: u64,
     approved: Option<&[String]>,
+) -> Presentation {
+    stage_as(
+        uri,
+        credentials,
+        http,
+        now,
+        approved,
+        &SubjectSyntax::JwkThumbprint,
+    )
+}
+
+fn stage_as<T: Transport>(
+    uri: &str,
+    credentials: &[Credential],
+    http: &T,
+    now: u64,
+    approved: Option<&[String]>,
+    subject: &SubjectSyntax,
 ) -> Presentation {
     let Some(request) = invocation_request(uri) else {
         return finished(Presented::bare(t("wallet.present.unverified")));
@@ -186,10 +243,11 @@ fn stage<T: Transport>(
         Ok(fetched) => fetched,
         Err(done) => return finished(*done),
     };
-    let ready = match authorize(http, &request, &fetched, now) {
+    let mut ready = match authorize(http, &request, &fetched, now) {
         Ok(ready) => ready,
         Err(done) => return finished(*done),
     };
+    ready.subject = subject.clone();
     if !ready.can_respond {
         return finished(Presented::bare(t("wallet.present.unsupported")));
     }
@@ -206,6 +264,11 @@ fn stage<T: Transport>(
             None,
             Answer::Unsupported,
         ));
+    }
+    if ready.wants_id {
+        if let Some(refusal) = syntax_refusal(http, &ready, subject::THUMBPRINT_TYPE) {
+            return finished(refusal);
+        }
     }
     let verifier_host = host_of(&ready.response_uri);
     match choose(&ready.dcql, credentials, verifier_host.as_deref()) {
@@ -258,6 +321,9 @@ fn stage_self_issued<T: Transport>(
     now: u64,
     approved: Option<&[String]>,
 ) -> Presentation {
+    if let Some(refusal) = syntax_refusal(http, &ready, ready.subject.type_value()) {
+        return finished(refusal);
+    }
     if let Some(index) = newest_self_issued(credentials) {
         let credential = &credentials[index];
         if asks(approved, Some(&credential.id)) {
@@ -271,6 +337,14 @@ fn stage_self_issued<T: Transport>(
             }));
         }
         return finished(send_existing_id_token(http, &ready, credential, now));
+    }
+    if let SubjectSyntax::DidWeb(did) = &ready.subject {
+        // The published document names a key that already exists. A new key
+        // would sign a token that document does not vouch for.
+        return finished(Presented::bare(t_args(
+            "wallet.present.did_web_no_key",
+            &[("did", did)],
+        )));
     }
     if asks(approved, None) {
         return Presentation::NeedsApproval(Box::new(PendingPresentation {
@@ -425,7 +499,7 @@ fn send_existing_id_token<T: Transport>(
     credential: &Credential,
     now: u64,
 ) -> Presented {
-    let Some(id_token) = id_token_for(credential, ready, now) else {
+    let Some(id_token) = self_issued_token_for(credential, ready, now) else {
         return respond(
             http,
             ready,
@@ -548,6 +622,10 @@ struct Ready {
     can_respond: bool,
     wants_vp: bool,
     wants_id: bool,
+    /// `subject_syntax_types_supported` from `client_metadata`, when the request lists it.
+    subject_types: Option<Vec<String>>,
+    /// How a self-issued ID Token names its subject.
+    subject: SubjectSyntax,
 }
 
 struct Recipient {
@@ -657,7 +735,63 @@ fn authorize<T: Transport>(
         can_respond,
         wants_vp,
         wants_id,
+        subject_types: subject_types(&payload, &metadata),
+        subject: SubjectSyntax::JwkThumbprint,
     })
+}
+
+/// SIOPv2 section 7.5 `subject_syntax_types_supported`, from `client_metadata`
+/// or, in requests written to earlier drafts, `registration`. A value that is
+/// not an array of strings lists nothing.
+fn subject_types(payload: &Json, metadata: &Json) -> Option<Vec<String>> {
+    let value = metadata.get("subject_syntax_types_supported").or_else(|| {
+        payload
+            .get("registration")
+            .and_then(|registration| registration.get("subject_syntax_types_supported"))
+    })?;
+    let items = value.as_array().unwrap_or(&[]);
+    let names: Option<Vec<String>> = items
+        .iter()
+        .map(|item| item.as_str().map(str::to_string))
+        .collect();
+    Some(names.unwrap_or_default())
+}
+
+/// When the verifier listed the subject syntax types it accepts and
+/// `type_value` is not one of them, SIOPv2 section 10 says the Self-Issued OP
+/// MUST return an error. Section 10.3 names it
+/// `subject_syntax_types_not_supported`. The answer is that error, posted to
+/// the verifier. A request that does not list them is not refused.
+fn syntax_refusal<T: Transport>(http: &T, ready: &Ready, type_value: &str) -> Option<Presented> {
+    let supported = ready.subject_types.as_ref()?;
+    if subject::accepts(supported, type_value) {
+        return None;
+    }
+    let accepted = if supported.is_empty() {
+        t("wallet.present.subject_none_listed")
+    } else {
+        supported.join(", ")
+    };
+    let message = t_args(
+        "wallet.present.subject_unsupported",
+        &[("method", type_value), ("accepted", &accepted)],
+    );
+    let description = format!(
+        "The wallet is set to name the subject with {type_value}, and the request accepts {}.",
+        supported.join(", ")
+    );
+    Some(respond(
+        http,
+        ready,
+        None,
+        None,
+        None,
+        None,
+        Answer::Subject {
+            message,
+            description,
+        },
+    ))
 }
 
 fn signature_ok(jws: &IssuerJws) -> bool {
@@ -1279,6 +1413,77 @@ fn id_token_for(credential: &Credential, ready: &Ready, now: u64) -> Option<Stri
     id_token_from(&signing, ready, now)
 }
 
+/// The self-issued ID Token, with the subject `ready.subject` names.
+fn self_issued_token_for(credential: &Credential, ready: &Ready, now: u64) -> Option<String> {
+    let holder = Json::parse(credential.holder_key.as_deref()?).ok()?;
+    let signing = holder_signing(&holder)?;
+    id_token_as(&signing, ready, now, &ready.subject)
+}
+
+/// A DID of the self-issued key, and the DID URL of its verification method.
+struct DidSubject {
+    did: String,
+    kid: String,
+}
+
+fn did_subject(signing: &SigningKey, syntax: &SubjectSyntax) -> Option<DidSubject> {
+    let (x, y) = encoded_xy(signing)?;
+    match syntax {
+        SubjectSyntax::JwkThumbprint => None,
+        SubjectSyntax::DidJwk => {
+            let did = subject::did_jwk(&x, &y);
+            let kid = subject::did_jwk_kid(&did);
+            Some(DidSubject { did, kid })
+        }
+        SubjectSyntax::DidKey => {
+            let point = signing.verifying_key().to_encoded_point(true);
+            let did = subject::did_key(point.as_bytes())?;
+            let kid = subject::did_key_kid(&did)?;
+            Some(DidSubject { did, kid })
+        }
+        SubjectSyntax::DidWeb(did) => {
+            subject::did_web_url(did)?;
+            let thumbprint = thumbprint_uri(&x, &y)?;
+            let fragment = subject::did_web_fragment(&thumbprint)?;
+            Some(DidSubject {
+                did: did.clone(),
+                kid: format!("{did}#{fragment}"),
+            })
+        }
+    }
+}
+
+/// SIOPv2 section 8: a JWK Thumbprint subject carries `sub_jwk`. A DID
+/// subject does not, and its `kid` header names a verification method in
+/// the DID's `authentication` relationship.
+fn id_token_as(
+    signing: &SigningKey,
+    ready: &Ready,
+    now: u64,
+    syntax: &SubjectSyntax,
+) -> Option<String> {
+    let Some(named) = did_subject(signing, syntax) else {
+        if syntax.is_did() {
+            return None;
+        }
+        return id_token_from(signing, ready, now);
+    };
+    let header = object(&[
+        ("alg", Json::String("ES256".to_string())),
+        ("typ", Json::String("JWT".to_string())),
+        ("kid", Json::String(named.kid)),
+    ]);
+    let payload = object(&[
+        ("iss", Json::String(named.did.clone())),
+        ("sub", Json::String(named.did)),
+        ("aud", Json::String(ready.client_id.clone())),
+        ("nonce", Json::String(ready.nonce.clone())),
+        ("iat", Json::Number(now.to_string())),
+        ("exp", Json::Number(now.saturating_add(600).to_string())),
+    ]);
+    Some(sign_compact(signing, &header, &payload))
+}
+
 fn id_token_from(signing: &SigningKey, ready: &Ready, now: u64) -> Option<String> {
     let (x, y) = encoded_xy(signing)?;
     let subject = thumbprint_uri(&x, &y)?;
@@ -1304,6 +1509,13 @@ struct Minted {
 }
 
 fn mint_self_issued(ready: &Ready, now: u64) -> Option<Minted> {
+    let (signing, store) = mint_credential(now)?;
+    let id_token = id_token_as(&signing, ready, now, &ready.subject)?;
+    Some(Minted { id_token, store })
+}
+
+/// A new self-issued key, and the self-signed credential that keeps it.
+fn mint_credential(now: u64) -> Option<(SigningKey, NewCredential)> {
     let signing = SigningKey::random(&mut OsRng);
     let (x, y) = encoded_xy(&signing)?;
     let subject = thumbprint_uri(&x, &y)?;
@@ -1329,16 +1541,66 @@ fn mint_self_issued(ready: &Ready, now: u64) -> Option<Minted> {
     ]);
     let document = format!("{}~", sign_compact(&signing, &header, &payload));
     let holder_key = private_jwk(&signing)?;
-    let id_token = id_token_from(&signing, ready, now)?;
-    Some(Minted {
-        id_token,
-        store: NewCredential {
+    Some((
+        signing,
+        NewCredential {
             format: "dc+sd-jwt".to_string(),
             issuer: subject,
             document,
             holder_key: Some(holder_key),
         },
+    ))
+}
+
+/// Create a self-issued key now, for a `did:web` document to publish before
+/// the first sign-in. The caller stores the credential that keeps it.
+pub fn create_self_issued_credential() -> Option<NewCredential> {
+    mint_credential(now_secs()).map(|(_, store)| store)
+}
+
+/// The identifier a verifier sees for the self-issued key `siopv2://` would
+/// use now: the newest stored self-issued credential's key. `None` when there
+/// is no self-issued key yet.
+pub fn self_issued_identifier(
+    credentials: &[Credential],
+    syntax: &SubjectSyntax,
+) -> Option<String> {
+    let signing = newest_self_issued_key(credentials)?;
+    match did_subject(&signing, syntax) {
+        Some(named) => Some(named.did),
+        None if syntax.is_did() => None,
+        None => {
+            let (x, y) = encoded_xy(&signing)?;
+            thumbprint_uri(&x, &y)
+        }
+    }
+}
+
+/// The document a `did:web` must serve, and where.
+pub struct DidWebPublication {
+    /// The https URL the document must be served at.
+    pub url: String,
+    /// The DID document, as JSON.
+    pub document: Json,
+}
+
+/// The `did:web` document for the self-issued key `siopv2://` would use now.
+/// `None` when `did` is not a well formed `did:web`, or there is no
+/// self-issued key yet.
+pub fn did_web_publication(credentials: &[Credential], did: &str) -> Option<DidWebPublication> {
+    let url = subject::did_web_url(did)?;
+    let signing = newest_self_issued_key(credentials)?;
+    let named = did_subject(&signing, &SubjectSyntax::DidWeb(did.to_string()))?;
+    let (x, y) = encoded_xy(&signing)?;
+    Some(DidWebPublication {
+        url,
+        document: subject::did_web_document(did, &named.kid, &x, &y),
     })
+}
+
+fn newest_self_issued_key(credentials: &[Credential]) -> Option<SigningKey> {
+    let credential = &credentials[newest_self_issued(credentials)?];
+    holder_signing(&Json::parse(credential.holder_key.as_deref()?).ok()?)
 }
 
 /// Put a self-signed signer certificate on a self-issued credential that
@@ -1427,6 +1689,11 @@ enum Answer {
     Unsupported,
     SiopCreated,
     SiopSent,
+    /// SIOPv2 section 10.3 `subject_syntax_types_not_supported`.
+    Subject {
+        message: String,
+        description: String,
+    },
 }
 
 enum Page {
@@ -1444,7 +1711,13 @@ fn respond<T: Transport>(
     store: Option<NewCredential>,
     answer: Answer,
 ) -> Presented {
-    let page = match post_response(http, ready, vp.as_ref(), id_token.as_deref()) {
+    let error = match &answer {
+        Answer::Subject { description, .. } => {
+            Some(("subject_syntax_types_not_supported", description.as_str()))
+        }
+        _ => None,
+    };
+    let page = match post_response(http, ready, vp.as_ref(), id_token.as_deref(), error) {
         Ok(page) => page,
         Err(PostError::Answered(message)) => {
             return Presented {
@@ -1482,6 +1755,7 @@ fn post_response<T: Transport>(
     ready: &Ready,
     vp: Option<&Vp>,
     id_token: Option<&str>,
+    error: Option<(&str, &str)>,
 ) -> Result<Page, PostError> {
     let response = if ready.jwt_response {
         let recipient = ready
@@ -1491,7 +1765,7 @@ fn post_response<T: Transport>(
         if ready.enc != "A256GCM" && ready.enc != "A128GCM" {
             return Err(PostError::Unsent(t("wallet.present.unsupported")));
         }
-        let plaintext = response_json(ready, vp, id_token).to_string();
+        let plaintext = response_json(ready, vp, id_token, error).to_string();
         let compact = encrypt_ecdh_es(plaintext.as_bytes(), recipient, &ready.enc)
             .ok_or_else(|| PostError::Unsent(t("wallet.present.unsupported")))?;
         post_form(http, &ready.response_uri, &[("response", compact.as_str())])?
@@ -1505,7 +1779,13 @@ fn post_response<T: Transport>(
             fields.push(("id_token", token));
         }
         if vp_body.is_none() && id_token.is_none() {
-            fields.push(("error", "access_denied"));
+            match error {
+                Some((code, description)) => {
+                    fields.push(("error", code));
+                    fields.push(("error_description", description));
+                }
+                None => fields.push(("error", "access_denied")),
+            }
         }
         fields.push(("state", ready.state.as_str()));
         post_form(http, &ready.response_uri, &fields)?
@@ -1520,7 +1800,12 @@ fn post_response<T: Transport>(
     Ok(page_from(&response.body, &ready.response_uri))
 }
 
-fn response_json(ready: &Ready, vp: Option<&Vp>, id_token: Option<&str>) -> Json {
+fn response_json(
+    ready: &Ready,
+    vp: Option<&Vp>,
+    id_token: Option<&str>,
+    error: Option<(&str, &str)>,
+) -> Json {
     let mut members = Vec::new();
     if let Some(vp) = vp {
         members.push(("vp_token".to_string(), vp_token_json(vp)));
@@ -1529,10 +1814,14 @@ fn response_json(ready: &Ready, vp: Option<&Vp>, id_token: Option<&str>) -> Json
         members.push(("id_token".to_string(), Json::String(token.to_string())));
     }
     if vp.is_none() && id_token.is_none() {
-        members.push((
-            "error".to_string(),
-            Json::String("access_denied".to_string()),
-        ));
+        let code = error.map_or("access_denied", |(code, _)| code);
+        members.push(("error".to_string(), Json::String(code.to_string())));
+        if let Some((_, description)) = error {
+            members.push((
+                "error_description".to_string(),
+                Json::String(description.to_string()),
+            ));
+        }
     }
     members.push(("state".to_string(), Json::String(ready.state.clone())));
     Json::Object(members)
@@ -1621,6 +1910,7 @@ fn narrate(
         (Answer::SiopCreated, _) => t_args("wallet.present.siop_created_no_page", &[("id", id)]),
         (Answer::SiopSent, Page::Open(_)) => t_args("wallet.present.siop_sent", &[("id", id)]),
         (Answer::SiopSent, _) => t_args("wallet.present.siop_sent_no_page", &[("id", id)]),
+        (Answer::Subject { message, .. }, _) => message.clone(),
     };
     let redirect_uri = match page {
         Page::Open(url) => Some(url),
