@@ -7,7 +7,8 @@
 //! same-device request from the credential list, answer a self-issued ID
 //! Token request, show the signer certificate chain carried in a credential,
 //! and open Settings for the language, the protocol handlers, trust anchors,
-//! the self-issued subject and the storage key, import and export, and About.
+//! the self-issued subject, the storage key, and YubiKey protection, import
+//! and export, and About.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -20,16 +21,19 @@ use oid4vc_wallet::i18n::{self, t, t_args};
 use oid4vc_wallet::protocol::offer::{CredentialOffer, OfferPassing};
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Invocation, Json};
 use oid4vc_wallet::wallet::{
-    accept, approve_presentation, create_self_issued_credential, delete_anchor,
-    did_web_publication, did_web_url, ensure_self_issued_certificate, export_credentials,
-    import_anchors, import_credentials, list_anchors, prepare_presentation,
-    presentation_approval_path, presentation_approvals, read_subject_setting,
+    accept, activate_yubikeys, approve_presentation, begin_replace, cancel_replace,
+    create_self_issued_credential, delete_anchor, did_web_publication, did_web_url,
+    discard_pending, enroll_yubikey, ensure_self_issued_certificate, export_credentials,
+    finish_replace, import_anchors, import_credentials, list_anchors, prepare_presentation,
+    presentation_approval_path, presentation_approvals, protection_status, read_subject_setting,
     redeem_pre_authorized, refuse_presentation, remember_presentation, remember_trust,
     self_issued_identifier, signature_algorithm, signer_certificates, subject_setting_path,
-    trust_anchors_dir, validate_stored, write_subject_setting, AnchorInfo, Credential,
-    CredentialVault, Inbox, NewCredential, Outcome, PendingPresentation, PortableError,
-    Presentation, Presented, Redeemed, SignerCertificate, SubjectSyntax,
+    switch_to_keyring, trust_anchors_dir, unlock_yubikey, validate_stored, write_subject_setting,
+    AnchorInfo, Credential, CredentialVault, Inbox, KeyStoreError, Mechanism, NewCredential,
+    Outcome, PendingPresentation, PortableError, Presentation, Presented, ProtectionStatus,
+    Redeemed, SignerCertificate, SubjectSyntax,
 };
+use zeroize::Zeroize;
 
 use super::single::Incoming;
 use super::{install, uninstall, Failure, Options};
@@ -305,6 +309,25 @@ struct WalletApp {
     subject_choice: SubjectChoice,
     /// The `did:web` typed on the Security tab.
     did_web_input: String,
+    /// Desktop key ring or YubiKey, as the person selected it. This is not
+    /// reset on every frame, or enrolling would snap back to the key ring.
+    protection_choice: ProtectionChoice,
+    yubi_pin: String,
+    /// Credential reads are waiting for a YubiKey PIN.
+    yubi_locked: bool,
+    /// Serial of the YubiKey a replacement will remove.
+    replacing: Option<u32>,
+    /// The key being kept has unwrapped the storage key.
+    replace_verified: bool,
+    protection: Option<ProtectionStatus>,
+    /// False until Settings → Security has loaded the protection file.
+    protection_loaded: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProtectionChoice {
+    Keyring,
+    YubiKey,
 }
 
 #[derive(Clone)]
@@ -376,6 +399,13 @@ impl WalletApp {
             subject: SubjectSyntax::JwkThumbprint,
             subject_choice: SubjectChoice::Thumbprint,
             did_web_input: String::new(),
+            protection_choice: ProtectionChoice::Keyring,
+            yubi_pin: String::new(),
+            yubi_locked: false,
+            replacing: None,
+            replace_verified: false,
+            protection: None,
+            protection_loaded: false,
         };
         app.reload_subject();
         app.reload_credentials();
@@ -587,6 +617,7 @@ impl WalletApp {
     fn reload_credentials(&mut self) {
         match load_credentials() {
             Ok(credentials) => {
+                self.yubi_locked = false;
                 let credentials = credentials
                     .into_iter()
                     .map(|credential| self.with_signer_certificate(credential))
@@ -605,6 +636,11 @@ impl WalletApp {
                 self.credentials.clear();
                 self.selected = None;
                 self.export_checked.clear();
+                if err == KeyStoreError::Locked.to_string() {
+                    self.yubi_locked = true;
+                    return;
+                }
+                self.yubi_locked = false;
                 self.fail(err);
             }
         }
@@ -875,6 +911,12 @@ impl WalletApp {
 
     fn credentials_page(&mut self, ui: &mut egui::Ui) {
         ui.heading(t("wallet.ui.credentials"));
+        if self.yubi_locked {
+            ui.add_space(12.0);
+            wrapped(ui, t("wallet.keystore.locked"));
+            self.unlock_row(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             if ui.button(t("wallet.ui.refresh")).clicked() {
                 self.reload_credentials();
@@ -1222,11 +1264,16 @@ impl WalletApp {
             {
                 self.reload_anchors();
             }
-            ui.selectable_value(
-                &mut self.settings_tab,
-                SettingsTab::Security,
-                t("wallet.ui.security"),
-            );
+            if ui
+                .selectable_value(
+                    &mut self.settings_tab,
+                    SettingsTab::Security,
+                    t("wallet.ui.security"),
+                )
+                .clicked()
+            {
+                self.reload_protection(true);
+            }
             if ui
                 .selectable_value(
                     &mut self.settings_tab,
@@ -1343,6 +1390,7 @@ impl WalletApp {
                 self.subject_section(ui);
                 ui.separator();
                 self.storage_key_section(ui);
+                self.yubi_section(ui);
             });
     }
 
@@ -1498,6 +1546,334 @@ impl WalletApp {
         ui.add_space(8.0);
         if ui.button(t("wallet.ui.rotate_key")).clicked() {
             self.rotate_storage_key();
+        }
+    }
+
+    fn reload_protection(&mut self, reset_choice: bool) {
+        match protection_status() {
+            Ok(status) => {
+                if reset_choice || !self.protection_loaded {
+                    self.protection_choice = match status.mechanism {
+                        Mechanism::YubiKey => ProtectionChoice::YubiKey,
+                        Mechanism::Keyring => ProtectionChoice::Keyring,
+                    };
+                }
+                self.yubi_locked = status.mechanism == Mechanism::YubiKey && !status.unlocked;
+                self.protection = Some(status);
+                self.protection_loaded = true;
+            }
+            Err(err) => self.fail(err.to_string()),
+        }
+    }
+
+    fn yubi_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(16.0);
+        ui.separator();
+        ui.strong(t("wallet.ui.yubi_title"));
+        wrapped(ui, t("wallet.ui.yubi_help"));
+        ui.add_space(6.0);
+        ui.label(t("wallet.ui.yubi_choice"));
+        ui.radio_value(
+            &mut self.protection_choice,
+            ProtectionChoice::Keyring,
+            t("wallet.ui.yubi_keyring"),
+        );
+        ui.radio_value(
+            &mut self.protection_choice,
+            ProtectionChoice::YubiKey,
+            t("wallet.ui.yubi_title"),
+        );
+        let Some(status) = self.protection.clone() else {
+            return;
+        };
+        ui.add_space(8.0);
+        match (status.mechanism, self.protection_choice) {
+            (Mechanism::Keyring, ProtectionChoice::Keyring) => self.keyring_home(ui, &status),
+            (Mechanism::Keyring, ProtectionChoice::YubiKey) => self.enroll_panel(ui, &status),
+            (Mechanism::YubiKey, ProtectionChoice::YubiKey) => self.yubi_active_panel(ui, &status),
+            (Mechanism::YubiKey, ProtectionChoice::Keyring) => self.move_back_panel(ui),
+        }
+    }
+
+    fn keyring_home(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus) {
+        ui.label(t("wallet.ui.yubi_status_keyring"));
+        wrapped(ui, t("wallet.ui.yubi_keyring_help"));
+        if !status.pending.is_empty() {
+            self.pending_actions(ui, status, false);
+        }
+    }
+
+    fn enroll_panel(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus) {
+        wrapped(ui, t("wallet.ui.yubi_step1"));
+        wrapped(ui, t("wallet.ui.yubi_step2"));
+        self.pending_actions(ui, status, true);
+    }
+
+    fn pending_actions(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus, enroll: bool) {
+        if !status.pending.is_empty() {
+            ui.label(t_args(
+                "wallet.ui.yubi_status_pending",
+                &[("serials", &serial_list(&status.pending))],
+            ));
+        }
+        if enroll {
+            self.pin_field(ui);
+        }
+        let mut do_enroll = false;
+        let mut do_discard = false;
+        let mut do_activate = false;
+        ui.horizontal(|ui| {
+            if enroll && ui.button(t("wallet.ui.yubi_enroll")).clicked() {
+                do_enroll = true;
+            }
+            if !status.pending.is_empty() && ui.button(t("wallet.ui.yubi_discard")).clicked() {
+                do_discard = true;
+            }
+            if status.pending.len() == 2 && ui.button(t("wallet.ui.yubi_activate")).clicked() {
+                do_activate = true;
+            }
+        });
+        if do_enroll {
+            self.enroll_clicked();
+        } else if do_discard {
+            self.discard_clicked();
+        } else if do_activate {
+            self.activate_clicked();
+        }
+    }
+
+    fn yubi_active_panel(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus) {
+        ui.label(t("wallet.ui.yubi_status_yubi"));
+        for serial in &status.enrolled {
+            ui.label(t_args(
+                "wallet.ui.yubi_serial",
+                &[("serial", &serial.to_string())],
+            ));
+        }
+        if status.keyring_pending_removal {
+            wrapped(ui, t("wallet.ui.yubi_keyring_copy"));
+        }
+        if !status.unlocked {
+            ui.add_space(8.0);
+            self.unlock_row(ui);
+        }
+        ui.add_space(8.0);
+        self.replace_block(ui, status);
+    }
+
+    fn replace_block(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus) {
+        let Some(remove) = self.replacing else {
+            let mut picked = None;
+            for serial in &status.enrolled {
+                ui.horizontal(|ui| {
+                    if ui.button(t("wallet.ui.yubi_replace")).clicked() {
+                        picked = Some(*serial);
+                    }
+                    ui.label(t_args(
+                        "wallet.ui.yubi_serial",
+                        &[("serial", &serial.to_string())],
+                    ));
+                });
+            }
+            if let Some(serial) = picked {
+                self.replacing = Some(serial);
+                self.replace_verified = false;
+                self.wipe_pin_field();
+            }
+            return;
+        };
+        let keep = status
+            .enrolled
+            .iter()
+            .copied()
+            .find(|serial| *serial != remove)
+            .unwrap_or(remove);
+        wrapped(
+            ui,
+            t_args(
+                "wallet.ui.yubi_replace_help",
+                &[("keep", &keep.to_string())],
+            ),
+        );
+        if self.replace_verified {
+            wrapped(ui, t("wallet.yubi.insert_new"));
+        }
+        self.pin_field(ui);
+        let mut verify = false;
+        let mut finish = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            if !self.replace_verified && ui.button(t("wallet.ui.yubi_verify_keep")).clicked() {
+                verify = true;
+            }
+            if self.replace_verified && ui.button(t("wallet.ui.yubi_finish_replace")).clicked() {
+                finish = true;
+            }
+            if ui.button(t("wallet.ui.yubi_cancel_replace")).clicked() {
+                cancel = true;
+            }
+        });
+        if verify {
+            self.verify_keep_clicked();
+        } else if finish {
+            self.finish_replace_clicked();
+        } else if cancel {
+            self.cancel_replace_clicked();
+        }
+    }
+
+    fn move_back_panel(&mut self, ui: &mut egui::Ui) {
+        wrapped(ui, t("wallet.ui.yubi_to_keyring_help"));
+        self.pin_field(ui);
+        if ui.button(t("wallet.ui.yubi_to_keyring")).clicked() {
+            self.switch_clicked();
+        }
+    }
+
+    fn unlock_row(&mut self, ui: &mut egui::Ui) {
+        self.pin_field(ui);
+        if ui.button(t("wallet.ui.yubi_unlock")).clicked() {
+            self.unlock_clicked();
+        }
+    }
+
+    fn pin_field(&mut self, ui: &mut egui::Ui) {
+        ui.label(t("wallet.ui.yubi_pin"));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.yubi_pin)
+                .password(true)
+                .desired_width(220.0),
+        );
+    }
+
+    fn wipe_pin_field(&mut self) {
+        self.yubi_pin.zeroize();
+        self.yubi_pin.clear();
+    }
+
+    fn take_pin(&mut self) -> String {
+        std::mem::take(&mut self.yubi_pin)
+    }
+
+    fn enroll_clicked(&mut self) {
+        let mut pin = self.take_pin();
+        let result = enroll_yubikey(&pin);
+        pin.zeroize();
+        match result {
+            Ok(serial) => {
+                self.reload_protection(false);
+                self.note(t_args(
+                    "wallet.yubi.enrolled",
+                    &[("serial", &serial.to_string())],
+                ));
+            }
+            Err(err) => self.fail(err.to_string()),
+        }
+    }
+
+    fn discard_clicked(&mut self) {
+        match discard_pending() {
+            Ok(()) => {
+                self.wipe_pin_field();
+                self.reload_protection(false);
+            }
+            Err(err) => self.fail(err.to_string()),
+        }
+    }
+
+    fn activate_clicked(&mut self) {
+        match activate_yubikeys() {
+            Ok(()) => {
+                self.replacing = None;
+                self.replace_verified = false;
+                self.wipe_pin_field();
+                self.reload_protection(true);
+                self.reload_credentials();
+                self.note(t("wallet.yubi.activated"));
+            }
+            Err(err) => self.fail(err.to_string()),
+        }
+    }
+
+    fn unlock_clicked(&mut self) {
+        let mut pin = self.take_pin();
+        let result = unlock_yubikey(&pin);
+        pin.zeroize();
+        match result {
+            Ok(()) => {
+                self.reload_protection(false);
+                self.reload_credentials();
+                self.note(t("wallet.yubi.unlocked"));
+            }
+            Err(err) => self.fail(err.to_string()),
+        }
+    }
+
+    fn verify_keep_clicked(&mut self) {
+        let Some(remove) = self.replacing else {
+            return;
+        };
+        let mut pin = self.take_pin();
+        let result = begin_replace(remove, &pin);
+        pin.zeroize();
+        match result {
+            Ok(()) => {
+                self.replace_verified = true;
+                self.reload_protection(false);
+            }
+            Err(err) => self.fail(err.to_string()),
+        }
+    }
+
+    fn finish_replace_clicked(&mut self) {
+        let Some(remove) = self.replacing else {
+            return;
+        };
+        let mut pin = self.take_pin();
+        let result = finish_replace(remove, &pin);
+        pin.zeroize();
+        match result {
+            Ok(new_serial) => {
+                self.replacing = None;
+                self.replace_verified = false;
+                self.reload_protection(false);
+                self.note(t_args(
+                    "wallet.yubi.replaced",
+                    &[
+                        ("old", &remove.to_string()),
+                        ("new", &new_serial.to_string()),
+                    ],
+                ));
+            }
+            Err(err) => self.fail(err.to_string()),
+        }
+    }
+
+    fn cancel_replace_clicked(&mut self) {
+        match cancel_replace() {
+            Ok(()) => {
+                self.replacing = None;
+                self.replace_verified = false;
+                self.wipe_pin_field();
+                self.reload_protection(false);
+            }
+            Err(err) => self.fail(err.to_string()),
+        }
+    }
+
+    fn switch_clicked(&mut self) {
+        let mut pin = self.take_pin();
+        let result = switch_to_keyring(&pin);
+        pin.zeroize();
+        match result {
+            Ok(()) => {
+                self.replacing = None;
+                self.replace_verified = false;
+                self.reload_protection(true);
+                self.reload_credentials();
+                self.note(t("wallet.yubi.now_keyring"));
+            }
+            Err(err) => self.fail(err.to_string()),
         }
     }
 
@@ -2349,6 +2725,14 @@ fn algorithm_name(credential: &Credential) -> String {
 
 fn wrapped(ui: &mut egui::Ui, text: String) {
     ui.add(egui::Label::new(text).wrap());
+}
+
+fn serial_list(serials: &[u32]) -> String {
+    serials
+        .iter()
+        .map(|serial| serial.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Metadata rows on the Credentials detail pane.

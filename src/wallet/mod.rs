@@ -3,7 +3,9 @@
 //!
 //! Invocations stay as the raw URI. Credentials are sealed with AES-256-GCM.
 //! The key is read from GNOME Keyring, or from KWallet when the Secret
-//! Service is not running. [`validate_stored`] checks an issued credential's
+//! Service is not running. Settings can instead wrap that key to two
+//! YubiKeys, which needs pcscd and, at build time, libpcsclite.
+//! [`validate_stored`] checks an issued credential's
 //! signature. One inbox entry can be removed with [`Inbox::delete`].
 //! [`present_same_device`] fetches a same-device presentation request,
 //! selects a stored credential, and posts the answer. [`prepare_presentation`]
@@ -24,11 +26,14 @@ mod credentials;
 mod http;
 mod inbox;
 mod jws;
+mod kek;
 mod key_store;
 mod kwallet;
+mod piv;
 mod portable;
 mod present;
 mod proof;
+mod protection;
 mod redeem;
 mod seal;
 mod secret_service;
@@ -55,6 +60,11 @@ pub use present::{
     ensure_self_issued_certificate, prepare_presentation, present_same_device, refuse_presentation,
     self_issued_identifier, DidWebPublication, PendingPresentation, Presentation,
     PresentationSummary, Presented,
+};
+pub use protection::{
+    activate_yubikeys, begin_replace, cancel_replace, discard_pending, enroll_yubikey,
+    finish_replace, protection_status, switch_to_keyring, unlock_yubikey, yubikey_locked,
+    Mechanism, ProtectionStatus,
 };
 pub use redeem::{redeem_pre_authorized, RedeemError, Redeemed};
 pub use seal::{Aes256Key, SealError};

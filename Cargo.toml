@@ -23,7 +23,10 @@ categories = ["command-line-utilities", "gui"]
 #
 # eframe draws the --ui window. rfd opens the desktop file selector for
 # import and export. image decodes the window icon. p256 signs the
-# OpenID4VCI proof of possession. rustls is the TLS stack. The signature
+# OpenID4VCI proof of possession and derives an AES-256 key-encryption key
+# with the key on a YubiKey. yubikey talks to that key through PC/SC.
+# The `untested` feature is the crate's gate for PIV decipher; the call
+# itself is the standard GENERAL AUTHENTICATE. rustls is the TLS stack. The signature
 # crates (p256, p384, p521, k256, rsa, ed25519-dalek, ed448-goldilocks-plus,
 # fips204, fips205) and x509-parser check credential signatures and
 # certificate chains. None of these crates implements OpenID4VCI, OpenID4VP,
@@ -52,6 +55,7 @@ sha2 = { version = "0.10", features = ["oid"] }
 sha3 = "0.10"
 webpki-roots = "1"
 x509-parser = "0.18.1"
+yubikey = { version = "0.8", features = ["untested"] }
 zeroize = "1"
 
 [lib]
