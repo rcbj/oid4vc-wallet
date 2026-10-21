@@ -8,11 +8,10 @@
 //! The key is created the first time a credential is stored, and it is not
 //! written into the credential files.
 //!
-//! YubiKey protection is the other choice. The same key is wrapped to a key
-//! on each of two YubiKeys, and this store then returns the copy cached for
-//! the process. A locked cache is an error, so a second key is not created
-//! while those YubiKeys still hold the real one. That path needs pcscd, and
-//! building it needs libpcsclite.
+//! FIDO2 protection is the other choice. The same key is wrapped to the
+//! hmac-secret of each of two security keys, and this store then returns
+//! the copy cached for the process. A locked cache is an error, so a second
+//! key is not created while those authenticators still hold the real one.
 
 use zeroize::Zeroize;
 
@@ -206,28 +205,28 @@ impl DesktopKeyStore {
 
 impl EncryptionKeyStore for DesktopKeyStore {
     fn load_key(&self) -> Result<Option<Aes256Key>, KeyStoreError> {
-        if super::protection::protects_with_yubikey()? {
+        if super::protection::protects_with_fido()? {
             return Ok(Some(super::protection::cached_key()?));
         }
         self.load_desktop_key()
     }
 
     fn store_key(&self, key: &Aes256Key) -> Result<(), KeyStoreError> {
-        if super::protection::protects_with_yubikey()? {
+        if super::protection::protects_with_fido()? {
             return super::protection::rewrap_stored_key(key);
         }
         self.store_desktop_key(key)
     }
 
     fn load_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
-        if super::protection::protects_with_yubikey()? {
+        if super::protection::protects_with_fido()? {
             return super::protection::cached_retired();
         }
         self.load_desktop_retired()
     }
 
     fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
-        if super::protection::protects_with_yubikey()? {
+        if super::protection::protects_with_fido()? {
             return super::protection::rewrap_stored_retired(keys);
         }
         self.store_desktop_retired(keys)
@@ -235,7 +234,7 @@ impl EncryptionKeyStore for DesktopKeyStore {
 }
 
 impl DesktopKeyStore {
-    /// The desktop key ring only. YubiKey mode must not call this, or a
+    /// The desktop key ring only. FIDO mode must not call this, or a
     /// missing cache would look like a missing key.
     pub(super) fn load_desktop_key(&self) -> Result<Option<Aes256Key>, KeyStoreError> {
         let secret = self.secret_service.probe();
@@ -535,10 +534,8 @@ pub enum KeyStoreError {
     Unavailable,
     /// An item was found, and it is not a 32-byte AES-256 key.
     WrongLength(usize),
-    /// YubiKey protection is on, and this process has not unwrapped the key.
+    /// FIDO protection is on, and this process has not unwrapped the key.
     Locked,
-    /// PIV slot 82 already holds a key this wallet will not replace.
-    SlotBusy,
     /// A sentence that is already the message to show.
     Plain(String),
 }
@@ -559,14 +556,13 @@ impl std::fmt::Display for KeyStoreError {
                 ],
             )),
             Self::Locked => f.write_str(&crate::i18n::t("wallet.keystore.locked")),
-            Self::SlotBusy => f.write_str(&crate::i18n::t("wallet.yubi.slot_busy")),
             Self::Plain(message) => f.write_str(message),
         }
     }
 }
 
 impl KeyStoreError {
-    /// The storage key is wrapped to a YubiKey and this process has not unwrapped it.
+    /// The storage key is wrapped to a security key and this process has not unwrapped it.
     pub fn is_locked(&self) -> bool {
         matches!(self, Self::Locked)
     }

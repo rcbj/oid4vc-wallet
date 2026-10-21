@@ -252,33 +252,23 @@ Changing the choice changes the identifier a verifier sees. A verifier that enro
 
 **Rotate encryption key** makes a new storage key and locks every stored credential with it. The previous key is kept for 90 days, so a rotation that was interrupted can be finished.
 
-The new key is the storage key. It is not the key shown after an export, and it is not a credential's private key. With the desktop key ring selected, it lives in GNOME Keyring when that service is available, in KeePassXC when KeePassXC provides that service, or in KWallet on a KDE session that does not. That store needs to be unlocked, which it is in a normal desktop session. With YubiKey protection selected, the new key is wrapped to the two enrolled YubiKeys. Unlock the wallet on this tab first.
+The new key is the storage key. It is not the key shown after an export, and it is not a credential's private key. With the desktop key ring selected, it lives in GNOME Keyring when that service is available, in KeePassXC when KeePassXC provides that service, or in KWallet on a KDE session that does not. That store needs to be unlocked, which it is in a normal desktop session. With security-key protection selected, the new key is wrapped to the two enrolled keys. Unlock the wallet on this tab first. Rotating it also needs the other enrolled key unlocked in this same run.
 
-**How the storage key is protected** chooses that desktop key ring, or two YubiKeys. The desktop key ring is the usual choice.
+**How the storage key is protected** chooses that desktop key ring, or two security keys. The desktop key ring is the usual choice.
 
-**YubiKey protection** wraps the same storage key to a P-256 key pair on each of two YubiKeys. Either key can unlock the wallet. The private keys stay on the devices. The wallet talks to a YubiKey. A card from another vendor, including a government PIV card or a CAC, is left unused.
+**Security key protection** wraps the same storage key with the FIDO2 hmac-secret of each of two security keys. Either key can unlock the wallet. The wallet speaks the FIDO CTAP2 messages over USB HID. A key from another vendor works when it supports the hmac-secret extension and has a FIDO2 PIN. The key does not need a PIV application.
 
-The key is created in PIV retired slot 82. That slot is separate from the authentication, signature, and key-management slots. The wallet will not overwrite a key that is already in slot 82. If that slot is taken, clear it with `ykman piv keys delete 82` and enroll again. This wallet does not run that command for you. You do not touch the metal contact. The PIN is the check the key asks for.
+The PIN is the FIDO2 PIN you set in the key's own tool. It can contain letters. It is at least 4 bytes and at most 63 bytes. This wallet does not set or change that PIN. Leave only one security key plugged in for each step. Touch the key when it blinks. Enrollment touches the key twice.
 
-The PIN is six to eight digits. The YubiKey asks for it every time the storage key is unwrapped. A new YubiKey's factory PIN is `123456`. Change it with `ykman piv access change-pin` before you enroll. This wallet does not change the PIN.
+To enroll, choose **Security key protection**. Insert the first key, enter its FIDO2 PIN, and choose **Enroll this security key**. Remove it, insert the second key, and enroll that one too. Then choose **Protect the storage key with these security keys** before you quit this window. That writes both wrapped copies and then removes the storage key from the desktop key ring. The wrap key is kept only until that step finishes. If you quit first, enroll both keys again.
 
-To enroll, choose **YubiKey protection**. Insert the first key, enter its PIN, and choose **Enroll this YubiKey**. Remove it, insert the second key, and enroll that one too. Then choose **Protect the storage key with these YubiKeys**. That writes both wrapped copies and then removes the storage key from the desktop key ring.
+To replace a key, choose **Replace** next to the one you want to remove. Enter the PIN of the key you are keeping and touch it when it blinks. Then remove that key, insert the new one, and choose **Enroll the new security key**. Two keys stay enrolled. You replace one at a time, and you cannot leave only one.
 
-To replace a key, choose **Replace a YubiKey** next to the one you want to remove. Enter the PIN of the key you are keeping, then insert the new key and enroll it. Two keys stay enrolled. You replace one at a time, and you cannot leave only one.
+**Move the storage key back to the key ring** unwraps it with either enrolled security key and stores it in the desktop key ring again. The FIDO credentials stay on the security keys.
 
-**Move the storage key back to the key ring** unwraps it with either enrolled YubiKey and stores it in the desktop key ring again. The key pairs stay on the devices.
+After you start the wallet again, one enrolled key unlocks it. **Unlock the other security key** is what lets a rotation reseal both copies. The command line asks for the PIN in the terminal. The window asks on **Credentials** and on this tab. The unwrapped key stays available until the program exits. The next launch asks again.
 
-The command line asks for the PIN in the terminal. The window asks on **Credentials** and on this tab. The unwrapped key stays available until the program exits. The next launch asks again.
-
-The computer needs `pcscd` running, and the YubiKey needs its PIV application. Firmware older than 5.2.3 cannot report whether slot 82 is empty, so the wallet will not write a key on that YubiKey.
-
-Creating the key authenticates with the 3DES management key `010203040506070801020304050607080102030405060708`. Firmware older than 5.7 uses that key unless you changed it. Firmware 5.7 and later stores the same value as AES-192. This wallet authenticates only the 3DES form. The window then says the management key is not the factory key. Set the management key to 3DES with that value before you enroll:
-
-```sh
-ykman piv access change-management-key --algorithm TDES --management-key 010203040506070801020304050607080102030405060708 --new-management-key 010203040506070801020304050607080102030405060708
-```
-
-If you already chose a different management key, pass that current value as `--management-key`. The wallet does not change the management key, and it does not reset the PIV application. Building the program needs the `libpcsclite-dev` package.
+A protection file from the older PIV wrap is not opened. Move the storage key back with that older version, or start again from the desktop key ring. Building the program needs the `libudev-dev` package. Running it does not need `pcscd`.
 
 ### Move credentials to another computer {#move}
 

@@ -4,7 +4,7 @@
 //! Invocations stay as the raw URI. Credentials are sealed with AES-256-GCM.
 //! The key is read from GNOME Keyring, or from KWallet when the Secret
 //! Service is not running. Settings can instead wrap that key to two
-//! YubiKeys, which needs pcscd and, at build time, libpcsclite.
+//! FIDO2 security keys through the hmac-secret extension.
 //! [`validate_stored`] checks an issued credential's
 //! signature. One inbox entry can be removed with [`Inbox::delete`].
 //! [`present_same_device`] fetches a same-device presentation request,
@@ -23,13 +23,13 @@ mod b64;
 mod certs;
 mod consent;
 mod credentials;
+mod fido;
 mod http;
 mod inbox;
 mod jws;
 mod kek;
 mod key_store;
 mod kwallet;
-mod piv;
 mod portable;
 mod present;
 mod proof;
@@ -62,9 +62,9 @@ pub use present::{
     PresentationSummary, Presented,
 };
 pub use protection::{
-    activate_yubikeys, begin_replace, cancel_replace, discard_pending, enroll_yubikey,
-    finish_replace, protection_status, switch_to_keyring, unlock_yubikey, yubikey_locked,
-    Mechanism, ProtectionStatus,
+    activate_fido, begin_replace, cancel_replace, discard_pending, enroll_fido, fido_locked,
+    finish_replace, protection_status, switch_to_keyring, unlock_fido, unlock_other_fido,
+    AuthenticatorRef, Mechanism, ProtectionStatus,
 };
 pub use redeem::{redeem_pre_authorized, RedeemError, Redeemed};
 pub use seal::{Aes256Key, SealError};
