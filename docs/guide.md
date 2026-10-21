@@ -183,6 +183,12 @@ The sign-in carries the subject and the public key. The private key stays in the
 
 A later `siopv2://` sign-in sends the same subject, so iya-sts can recognize the person who enrolled that key. The wallet asks again unless you checked the box the first time.
 
+The subject is the key's JWK thumbprint unless you chose another one on [Security](#security). There it can be a `did:jwk`, a `did:key`, or a `did:web` of the same key. The sign-in then names the DID, says which of its keys signed, and does not carry the public key separately. A verifier that enrolled one identifier does not recognize another, so after a change, enrol the new one with that verifier.
+
+A verifier can say which kinds of subject it accepts. When it does, and your choice is not one of them, the wallet signs nothing. It tells the verifier, and the message names your choice and the kinds the verifier accepts. The wallet never sends another kind of subject in its place.
+
+A request that asks for a presentation and a sign-in together always uses the JWK thumbprint of the presented credential's key. The DID you chose names the self-issued key, not that one.
+
 ## Settings {#settings}
 
 **Settings** has six tabs: **Language**, **Registration**, **Trust anchors**, **Security**, **Import and export**, and **About**.
@@ -228,6 +234,21 @@ The list shows each saved certificate's name and a long fingerprint. Click one, 
 An issuer running on this same computer is covered under [A local iya-sts](#local).
 
 ### Security {#security}
+
+**Self-issued ID subject** says how a `siopv2://` sign-in names you. Each choice names the same self-issued key.
+
+- **JWK thumbprint (default)**: the subject is the key's RFC 7638 thumbprint, and the sign-in carries the public key in `sub_jwk`. This is what the wallet always did.
+- **did:jwk**: the subject is the public key itself, base64url encoded. A verifier reads the key from the identifier. Nothing has to be published.
+- **did:key**: the subject is the compressed public key with its multicodec prefix, base58btc encoded (`did:key:zDn…`). A verifier reads the key from the identifier. Nothing has to be published.
+- **did:web**: the subject is a DID on a web site you control. Type it in the box, for example `did:web:example.com` or `did:web:example.com:users:alice`. A port is written `%3A`, as in `did:web:example.com%3A8443`.
+
+Choose **Save subject**. A malformed `did:web` is refused, and the earlier choice stays.
+
+Below the choices, the tab shows the subject a sign-in sends now. If there is no self-issued key yet, it says so: the first `siopv2://` sign-in creates one. Saving **did:web** creates one at once, because the document has to name a key before you can publish it.
+
+For **did:web**, the tab shows the DID document and the address it must be served at. `did:web:example.com` is `https://example.com/.well-known/did.json`, and `did:web:example.com:users:alice` is `https://example.com/users/alice/did.json`. **Copy document** copies it. Serve it over https, with no redirect. The document lists the key for `authentication`, which is what a verifier checks a sign-in against. A verifier fetches the document when you enrol and pins the key. If the self-issued key changes, for example because you removed that credential, publish the new document and enrol again.
+
+Changing the choice changes the identifier a verifier sees. A verifier that enrolled the old one has to enrol the new one.
 
 **Rotate encryption key** makes a new storage key and locks every stored credential with it. The previous key is kept for 90 days, so a rotation that was interrupted can be finished.
 
