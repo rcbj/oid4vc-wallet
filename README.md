@@ -42,6 +42,12 @@ cargo build --release
 
 The desktop key ring and security-key protection use the same binary. Security-key protection talks to the authenticator over USB HID.
 
+## Version
+
+The version is `M.N.O`, the same scheme iya-sts and id-proto-debugger use. `M.N` is the `VERSION` file at the repo root (now `0.1`). `O` is the build number, which is the UTC build instant as `YYYYMMDDHHMMSS`, for example `0.1.20261020143205`. Set `BUILD_NUMBER` to use another value, such as a CI run number. Then keeping it unique and increasing is up to you. `build.rs` stamps the version into the binary when it is built, so a restarted window shows the same number. Settings → About shows it, with the build instant and commit as hover text. `oid4vc-wallet --version` prints it. `--version --json` also prints the build instant and commit. Set `GIT_COMMIT` when the build has no git history.
+
+`Cargo.toml` carries `M.N.0`, because semver needs three parts. To bump a release, edit `VERSION` and the `Cargo.toml` `version` together. The test suite fails if the two disagree. A missing or malformed `VERSION` file produces a build warning and the version `0.0`. It does not stop the build.
+
 ## Tests
 
 The suite is headless. It does not open a window, and it does not use this user's wallet files, the desktop key store, or a security key. The same script runs locally and in GitHub Actions (`.github/workflows/ci.yml`) on every push and pull request. The Actions job installs the X11 and font libraries the binary links, then runs the script. `--offline` uses crates already in the local Cargo cache. Any further arguments are a `cargo test` filter.

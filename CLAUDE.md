@@ -24,7 +24,7 @@ The UI is native egui (`eframe` 0.37). It is not a web app. Do not verify it in 
 
 | Path | Role |
 |---|---|
-| `src/lib.rs` | Library. Public modules: `i18n`, `linux`, `protocol`, `wallet`, `xdg`. |
+| `src/lib.rs` | Library. Public modules: `i18n`, `linux`, `protocol`, `version`, `wallet`, `xdg`. |
 | `src/main.rs` | Binary. Modules `browser`, `single`, `ui` live here, not in the library. |
 | `src/ui.rs` | The `--ui` egui window. |
 | `src/browser.rs` | Opens the verifier's return page in the browser that already holds the binding cookie. `xdg-open` is the wrong browser. |
@@ -33,6 +33,8 @@ The UI is native egui (`eframe` 0.37). It is not a web app. Do not verify it in 
 | `src/wallet/` | Inbox, redeem, present, validate, seal, key stores, FIDO2 wrap. |
 | `src/i18n/` | Catalogs, negotiation, the saved language. |
 | `src/linux/` | Desktop Entry and `mimeapps.list`. |
+| `src/version.rs` | The build's `M.N.O`, from env vars `build.rs` sets. |
+| `VERSION` | `M.N`, the release. |
 | `src/xdg.rs` | `data_home()` and `config_home()`. Empty XDG variables count as unset. |
 | `locales/` | Same catalog layout as iya-sts. Embedded by `build.rs` into `OUT_DIR/locales_gen.rs`. |
 | `install/test.sh` | Headless suite. Sets a throwaway `HOME` and the XDG dirs, unsets `DBUS_SESSION_BUS_ADDRESS`, `DISPLAY`, and `WAYLAND_DISPLAY`. |
@@ -62,11 +64,15 @@ export LIBRARY_PATH=/tmp/oid4vc-libudev/root/usr/lib/x86_64-linux-gnu
 
 `install/test.sh` does not set those variables. A plain `./install/test.sh` fails to compile hidapi on this machine until `libudev-dev` exists. `--offline` is valid only after `ctap-fido2` 0.1.3 is already in the cargo cache. The first fetch of that crate must be online. Running the wallet does not need `pcscd`.
 
+## Version
+
+`M.N.O`, the scheme iya-sts (`common/version.js`) and id-proto-debugger (`client/version.js`) use (issue #2). `M.N` is the repo-root `VERSION` file, now `0.1`. `O` is the UTC build instant `YYYYMMDDHHMMSS`, or `BUILD_NUMBER` when that is set and has no control characters. `build.rs` sets `OID4VC_WALLET_{VERSION,MAJOR_MINOR,BUILD,BUILT_AT,COMMIT}` with `rustc-env`. `src/version.rs` exposes them as constants. The number is fixed when the binary is built, not when it starts. `COMMIT` is `GIT_COMMIT` or `git rev-parse --short=12 HEAD`, and empty without history. `build.rs` lists `src`, `VERSION`, `Cargo.toml`, and `build.rs` in `rerun-if-changed`. Without them, an explicit rerun list (the locales) would leave a stale build number. A missing or malformed `VERSION` is a `cargo:warning` and `0.0`, never a build failure. `Cargo.toml` is `M.N.0`. The test `cargo_version_is_the_version_file_plus_zero` fails when the two drift, so a bump edits both. The About tab shows `wallet.ui.about_version` with `about_built` / `about_built_commit` as hover text. `--version` (or `-V`) prints `oid4vc-wallet M.N.O`. With `--json` it prints `version`, `major_minor`, `build`, `built_at`, and `commit` (`null` without history). It runs before `--ui`, and only `--help` takes precedence over it. `install/appimage.sh` still names the file from `Cargo.toml` (`M.N.0`).
+
 ## Commands
 
 `oid4vc-wallet --ui` opens the window and takes the single-instance lock. A later `--ui` hands its URIs to the running window and exits. The command line without `--ui` does not take that lock. `--ui install` is rejected.
 
-Commands in `main.rs` `run()`: `install`, `uninstall`, `inbox`, `credentials`, `credential` (`add`, `show`, `delete`, `list`), `language` (`set`, `clear`), `handle`, or a positional URI containing `://`. `help` and no arguments print usage. `--json` prints one JSON object. `--no-save` parses without writing the inbox. `--lang` applies to the current run.
+Commands in `main.rs` `run()`: `install`, `uninstall`, `inbox`, `credentials`, `credential` (`add`, `show`, `delete`, `list`), `language` (`set`, `clear`), `handle`, or a positional URI containing `://`. `help` and no arguments print usage. `--version` prints the version. `--json` prints one JSON object. `--no-save` parses without writing the inbox. `--lang` applies to the current run.
 
 `open_vault` is only the credential commands. If `fido_locked()` is `Ok(true)` it prompts on `/dev/tty` (not stdin; stdin may be the credential document), turns echo off with `stty -echo` pointed at that tty, then `unlock_fido`. No tty or an `stty` failure returns `wallet.fido.tty`, which has no `{error}` placeholder — call `t`, not `t_args`. `EchoGuard` restores echo on drop. The PIN is `zeroize`d. A malformed protection file fails `open_vault` instead of prompting, because `fido_locked` returns `Result`. The window does not use this prompt.
 
@@ -235,4 +241,4 @@ Temp directories follow the `credentials.rs` pattern: `oid4vc-wallet-{name}-{pid
 
 Covered invariants worth not re-breaking: a PIN shorter than 4 bytes, including empty, and one longer than 63 bytes are refused before a credential exists, and a letter PIN is accepted; two keys unwrap the same storage key and one is not enough; a pending key is `already` even when two are pending, and a third device is `pending_full` with no credential created; replace keeps two, the key being kept is `fido.same`, and the removed credential cannot unwrap; switching back stores the key, clears the cached outputs, and leaves the credentials on the devices; a generation change locks the cache and keeps the outputs; discard forgets the pending id and the same device can enroll again; a failed desktop delete rolls the file back only while the desktop key is still there; activate with no cached outputs returns `fido.session` and does not write mechanism `fido`; rotate without both outputs is `fido.both`, and `unlock_other_fido` of the missing device restores it; mechanism `yubikey` is `fido.retired_piv`.
 
-`install/test.sh` last known green run: 2026-10-20, rustc 1.99.1, with the `/tmp/oid4vc-libudev` variables above. 151 library tests and 20 binary tests passed, and clippy with `-D warnings` was clean. That run did not open the window and did not use a security key.
+`install/test.sh` last known green run: 2026-10-20, rustc 1.99.1, with the `/tmp/oid4vc-libudev` variables above. 154 library tests and 21 binary tests passed, and clippy with `-D warnings` was clean. That run did not open the window and did not use a security key.

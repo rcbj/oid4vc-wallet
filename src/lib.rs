@@ -12,10 +12,12 @@
 //! opens the credential list, selects a matching stored credential, and
 //! returns the browser to the verifier. Validate checks the issuer signature
 //! on a stored credential, including the published key and certificate chain.
-//! An inbox entry can be deleted on its own.
+//! An inbox entry can be deleted on its own. [`version`] is the build's
+//! M.N.O version.
 
 pub mod i18n;
 pub mod linux;
 pub mod protocol;
+pub mod version;
 pub mod wallet;
 pub mod xdg;

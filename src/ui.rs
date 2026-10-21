@@ -20,6 +20,7 @@ use eframe::egui;
 use oid4vc_wallet::i18n::{self, t, t_args};
 use oid4vc_wallet::protocol::offer::{CredentialOffer, OfferPassing};
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Invocation, Json};
+use oid4vc_wallet::version;
 use oid4vc_wallet::wallet::{
     accept, activate_fido, approve_presentation, begin_replace, cancel_replace,
     create_self_issued_credential, delete_anchor, did_web_publication, did_web_url,
@@ -70,6 +71,17 @@ const ABOUT_PAGES: &[(&str, &str)] = &[
         "https://github.com/rcbj/oid4vc-wallet/blob/main/LICENSE",
     ),
 ];
+
+fn about_built() -> String {
+    if version::COMMIT.is_empty() {
+        t_args("wallet.ui.about_built", &[("time", version::BUILT_AT)])
+    } else {
+        t_args(
+            "wallet.ui.about_built_commit",
+            &[("time", version::BUILT_AT), ("commit", version::COMMIT)],
+        )
+    }
+}
 
 /// The radio buttons of Settings → Security → Self-issued ID subject.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1302,6 +1314,12 @@ impl WalletApp {
     }
 
     fn about_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(t_args(
+            "wallet.ui.about_version",
+            &[("version", version::VERSION)],
+        ))
+        .on_hover_text(about_built());
+        ui.add_space(8.0);
         ui.label(t("wallet.ui.about_copyright"));
         ui.add_space(8.0);
         ui.label(t("wallet.ui.about_license_note"));
@@ -2694,6 +2712,7 @@ fn registration_options(system: bool, haip: bool) -> Options {
         system,
         haip,
         help: false,
+        version: false,
         ui: false,
         format: None,
         issuer: None,
