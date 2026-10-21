@@ -153,7 +153,7 @@ struct KeySet {
     url: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn validate_with<F: Fetch>(
     format: &str,
     stored_issuer: &str,
