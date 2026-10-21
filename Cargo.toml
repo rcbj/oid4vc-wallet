@@ -69,3 +69,9 @@ path = "src/main.rs"
 
 [dev-dependencies]
 rcgen = "0.14.10"
+
+# Pedantic is on so style drift fails ./install/test.sh and CI, which run
+# clippy with -D warnings. The lower priority lets a single lint be set
+# differently below the group if that is ever needed.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

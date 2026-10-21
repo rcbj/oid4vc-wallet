@@ -86,6 +86,10 @@ pub struct Accepted {
 }
 
 /// Parse `uri`. When `inbox` is set, store the raw URI and the summary in it.
+///
+/// # Errors
+///
+/// `uri` is not a wallet invocation, or it cannot be saved to `inbox`.
 pub fn accept(uri: &str, inbox: Option<&Inbox>) -> Result<Accepted, AcceptError> {
     let invocation = invocation::parse(uri).map_err(AcceptError::Parse)?;
     let summary = invocation::summary(&invocation);

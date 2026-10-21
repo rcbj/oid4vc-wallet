@@ -7,6 +7,10 @@
 use std::path::PathBuf;
 
 /// The user's home directory, from `HOME`.
+///
+/// # Errors
+///
+/// `HOME` is unset or empty.
 pub fn home() -> Result<PathBuf, String> {
     let value = std::env::var("HOME").map_err(|_| crate::i18n::t("wallet.xdg.home_unset"))?;
     if value.is_empty() {
@@ -16,11 +20,19 @@ pub fn home() -> Result<PathBuf, String> {
 }
 
 /// `$XDG_DATA_HOME` or `~/.local/share`.
+///
+/// # Errors
+///
+/// `XDG_DATA_HOME` is unset or empty, and `HOME` is unset or empty.
 pub fn data_home() -> Result<PathBuf, String> {
     override_or("XDG_DATA_HOME", || Ok(home()?.join(".local/share")))
 }
 
 /// `$XDG_CONFIG_HOME` or `~/.config`.
+///
+/// # Errors
+///
+/// `XDG_CONFIG_HOME` is unset or empty, and `HOME` is unset or empty.
 pub fn config_home() -> Result<PathBuf, String> {
     override_or("XDG_CONFIG_HOME", || Ok(home()?.join(".config")))
 }

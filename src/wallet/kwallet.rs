@@ -84,12 +84,7 @@ impl KWalletKeyStore {
             Ok(session) => session,
             Err(Probe::Absent) => return Err(KeyStoreError::Unavailable),
             Err(Probe::Failed(err)) => return Err(err),
-            Err(Probe::Empty) => {
-                return Err(KeyStoreError::Store(crate::i18n::t(
-                    "wallet.keystore.kwallet_closed",
-                )))
-            }
-            Err(Probe::Found(_)) => {
+            Err(Probe::Empty | Probe::Found(_)) => {
                 return Err(KeyStoreError::Store(crate::i18n::t(
                     "wallet.keystore.kwallet_closed",
                 )))
@@ -160,7 +155,7 @@ impl KWalletKeyStore {
     /// True when a daemon is running and its network wallet is already open.
     /// This does not start KWallet and does not prompt.
     #[cfg(test)]
-    fn already_open(&self) -> bool {
+    fn already_open() -> bool {
         let Ok(conn) = Connection::new_session() else {
             return false;
         };
@@ -185,22 +180,22 @@ impl Session {
     fn open(prompt: Prompt) -> Result<Self, Probe> {
         let conn = match Connection::new_session() {
             Ok(conn) => conn,
-            Err(err) => return Err(dbus_probe(err)),
+            Err(err) => return Err(dbus_probe(&err)),
         };
         let daemon = match reach(&conn, prompt) {
             Ok(Some(daemon)) => daemon,
             Ok(None) => return Err(Probe::Absent),
-            Err(err) => return Err(dbus_probe(err)),
+            Err(err) => return Err(dbus_probe(&err)),
         };
         let wallet = match network_wallet(&conn, daemon) {
             Ok(wallet) => wallet,
-            Err(err) => return Err(dbus_probe(err)),
+            Err(err) => return Err(dbus_probe(&err)),
         };
         if prompt == Prompt::Never {
             match is_open(&conn, daemon, &wallet) {
                 Ok(true) => {}
                 Ok(false) => return Err(Probe::Empty),
-                Err(err) => return Err(dbus_probe(err)),
+                Err(err) => return Err(dbus_probe(&err)),
             }
         }
         let handle = match open_handle(&conn, daemon, &wallet) {
@@ -210,7 +205,7 @@ impl Session {
                     "wallet.keystore.kwallet_closed",
                 ))))
             }
-            Err(err) => return Err(dbus_probe(err)),
+            Err(err) => return Err(dbus_probe(&err)),
         };
         Ok(Self {
             conn,
@@ -296,7 +291,7 @@ impl Session {
                     "writeEntry",
                     (self.handle, folder, entry, bytes, STREAM, APP_ID),
                 )?,
-            Err(err) => return Err(dbus_error(err)),
+            Err(err) => return Err(dbus_error(&err)),
         };
         if code != 0 {
             return Err(rejected(&code.to_string()));
@@ -411,7 +406,7 @@ fn reach(conn: &Connection, prompt: Prompt) -> Result<Option<Daemon>, dbus::Erro
                 match is_enabled(conn, daemon) {
                     Ok(true) => return Ok(Some(daemon)),
                     Ok(false) => return Ok(None),
-                    Err(err) if dbus_is_absent(&err) => continue,
+                    Err(err) if dbus_is_absent(&err) => {}
                     Err(err) => return Err(err),
                 }
             }
@@ -489,7 +484,7 @@ where
 {
     proxy(conn, daemon, timeout)
         .method_call(INTERFACE, method, args)
-        .map_err(dbus_probe)
+        .map_err(|err| dbus_probe(&err))
 }
 
 fn proxy(
@@ -503,16 +498,17 @@ fn proxy(
 fn signature_mismatch(err: &dbus::Error) -> bool {
     matches!(
         err.name(),
-        Some("org.freedesktop.DBus.Error.UnknownMethod")
-            | Some("org.freedesktop.DBus.Error.InvalidArgs")
+        Some("org.freedesktop.DBus.Error.UnknownMethod" | "org.freedesktop.DBus.Error.InvalidArgs")
     )
 }
 
 pub(super) fn dbus_is_absent(err: &dbus::Error) -> bool {
     if matches!(
         err.name(),
-        Some("org.freedesktop.DBus.Error.ServiceUnknown")
-            | Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        Some(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+                | "org.freedesktop.DBus.Error.NameHasNoOwner"
+        )
     ) {
         return true;
     }
@@ -522,27 +518,25 @@ pub(super) fn dbus_is_absent(err: &dbus::Error) -> bool {
         || message.contains("cannot autolaunch")
 }
 
-fn dbus_probe(err: dbus::Error) -> Probe {
-    if dbus_is_absent(&err) {
+fn dbus_probe(err: &dbus::Error) -> Probe {
+    if dbus_is_absent(err) {
         Probe::Absent
     } else {
         Probe::Failed(KeyStoreError::Store(err.to_string()))
     }
 }
 
-fn dbus_error(err: dbus::Error) -> KeyStoreError {
+fn dbus_error(err: &dbus::Error) -> KeyStoreError {
     match dbus_probe(err) {
-        Probe::Absent => KeyStoreError::Unavailable,
         Probe::Failed(err) => err,
-        Probe::Empty | Probe::Found(_) => KeyStoreError::Unavailable,
+        Probe::Absent | Probe::Empty | Probe::Found(_) => KeyStoreError::Unavailable,
     }
 }
 
 fn probe_error(probe: Probe) -> KeyStoreError {
     match probe {
         Probe::Failed(err) => err,
-        Probe::Absent => KeyStoreError::Unavailable,
-        Probe::Empty | Probe::Found(_) => KeyStoreError::Unavailable,
+        Probe::Absent | Probe::Empty | Probe::Found(_) => KeyStoreError::Unavailable,
     }
 }
 
@@ -555,7 +549,7 @@ fn rejected(code: &str) -> KeyStoreError {
 
 impl From<dbus::Error> for KeyStoreError {
     fn from(err: dbus::Error) -> Self {
-        dbus_error(err)
+        dbus_error(&err)
     }
 }
 
@@ -588,7 +582,7 @@ mod tests {
             entry: KEY_USER.to_string(),
         };
         assert_ne!(store.folder, KEY_SERVICE);
-        if !store.already_open() {
+        if !KWalletKeyStore::already_open() {
             eprintln!("KWallet is not open, skipping");
             return;
         }

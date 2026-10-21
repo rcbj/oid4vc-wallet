@@ -72,9 +72,9 @@ fn b64url(bytes: &[u8]) -> String {
     let mut out = String::new();
     let mut index = 0;
     while index + 3 <= bytes.len() {
-        let n = ((bytes[index] as u32) << 16)
-            | ((bytes[index + 1] as u32) << 8)
-            | bytes[index + 2] as u32;
+        let n = (u32::from(bytes[index]) << 16)
+            | (u32::from(bytes[index + 1]) << 8)
+            | u32::from(bytes[index + 2]);
         out.push(TABLE[((n >> 18) & 63) as usize] as char);
         out.push(TABLE[((n >> 12) & 63) as usize] as char);
         out.push(TABLE[((n >> 6) & 63) as usize] as char);
@@ -83,11 +83,11 @@ fn b64url(bytes: &[u8]) -> String {
     }
     let rest = bytes.len() - index;
     if rest == 1 {
-        let n = (bytes[index] as u32) << 16;
+        let n = u32::from(bytes[index]) << 16;
         out.push(TABLE[((n >> 18) & 63) as usize] as char);
         out.push(TABLE[((n >> 12) & 63) as usize] as char);
     } else if rest == 2 {
-        let n = ((bytes[index] as u32) << 16) | ((bytes[index + 1] as u32) << 8);
+        let n = (u32::from(bytes[index]) << 16) | (u32::from(bytes[index + 1]) << 8);
         out.push(TABLE[((n >> 18) & 63) as usize] as char);
         out.push(TABLE[((n >> 12) & 63) as usize] as char);
         out.push(TABLE[((n >> 6) & 63) as usize] as char);
@@ -168,25 +168,25 @@ mod tests {
         let mut out = Vec::new();
         let mut index = 0;
         while index + 4 <= bytes.len() {
-            let n = ((value(bytes[index]) as u32) << 18)
-                | ((value(bytes[index + 1]) as u32) << 12)
-                | ((value(bytes[index + 2]) as u32) << 6)
-                | value(bytes[index + 3]) as u32;
-            out.push((n >> 16) as u8);
-            out.push((n >> 8) as u8);
-            out.push(n as u8);
+            let n = (u32::from(value(bytes[index])) << 18)
+                | (u32::from(value(bytes[index + 1])) << 12)
+                | (u32::from(value(bytes[index + 2])) << 6)
+                | u32::from(value(bytes[index + 3]));
+            let [_, first, second, third] = n.to_be_bytes();
+            out.extend_from_slice(&[first, second, third]);
             index += 4;
         }
         let rest = bytes.len() - index;
         if rest == 2 {
-            let n = ((value(bytes[index]) as u32) << 18) | ((value(bytes[index + 1]) as u32) << 12);
-            out.push((n >> 16) as u8);
+            let n =
+                (u32::from(value(bytes[index])) << 18) | (u32::from(value(bytes[index + 1])) << 12);
+            out.push(n.to_be_bytes()[1]);
         } else if rest == 3 {
-            let n = ((value(bytes[index]) as u32) << 18)
-                | ((value(bytes[index + 1]) as u32) << 12)
-                | ((value(bytes[index + 2]) as u32) << 6);
-            out.push((n >> 16) as u8);
-            out.push((n >> 8) as u8);
+            let n = (u32::from(value(bytes[index])) << 18)
+                | (u32::from(value(bytes[index + 1])) << 12)
+                | (u32::from(value(bytes[index + 2])) << 6);
+            let [_, first, second, _] = n.to_be_bytes();
+            out.extend_from_slice(&[first, second]);
         }
         out
     }

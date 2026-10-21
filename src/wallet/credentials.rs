@@ -64,6 +64,10 @@ pub struct CredentialVault<K> {
 impl CredentialVault<DesktopKeyStore> {
     /// `$XDG_DATA_HOME/oid4vc-wallet/credentials`. The key is in GNOME Keyring,
     /// or in KWallet when the Secret Service is not running.
+    ///
+    /// # Errors
+    ///
+    /// The data directory cannot be found.
     pub fn open_default() -> Result<Self, VaultError> {
         let root = crate::xdg::data_home()
             .map_err(VaultError::Message)?
@@ -91,6 +95,11 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
     }
 
     /// Seal a credential and return it, including the id it was given.
+    ///
+    /// # Errors
+    ///
+    /// A field of `new` is empty or invalid, the storage key cannot be loaded
+    /// or created, or the file cannot be written.
     pub fn put(&self, new: NewCredential) -> Result<Credential, VaultError> {
         let format = require_format(&new.format)?;
         let issuer = require_issuer(&new.issuer)?;
@@ -109,6 +118,11 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
 
     /// Open one credential. The current key is tried first, then each retired
     /// key whose `expires_at` is still in the future.
+    ///
+    /// # Errors
+    ///
+    /// `id` is malformed, the storage key cannot be loaded, no file has that
+    /// id, or no current or unexpired retired key opens it.
     pub fn get(&self, id: &str) -> Result<Credential, VaultError> {
         require_id(id)?;
         let keys = self.opening_keys()?;
@@ -116,6 +130,11 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
     }
 
     /// Open every credential. The document is included.
+    ///
+    /// # Errors
+    ///
+    /// The directory cannot be read, the storage key cannot be loaded, or a
+    /// credential file does not open.
     pub fn list(&self) -> Result<Vec<Credential>, VaultError> {
         let ids = self.ids()?;
         if ids.is_empty() {
@@ -136,6 +155,11 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
 
     /// Draw a new AES-256 key, keep the current key for 90 days, and seal
     /// every stored credential with the new key.
+    ///
+    /// # Errors
+    ///
+    /// A stored credential does not open, the key store cannot load or store a
+    /// key, or a resealed file cannot be written.
     pub fn rotate(&self) -> Result<RotateReport, VaultError> {
         let ids = self.ids()?;
         let records = if ids.is_empty() {
@@ -172,6 +196,11 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
 
     /// Replace the document of one stored credential. The id, the issuer, the
     /// format, the received time, and the holder key stay as they are.
+    ///
+    /// # Errors
+    ///
+    /// `id` or `document` is invalid, the credential does not open, or the file
+    /// cannot be written.
     pub fn replace_document(&self, id: &str, document: &str) -> Result<Credential, VaultError> {
         require_id(id)?;
         let document = require_document(document)?;
@@ -182,6 +211,11 @@ impl<K: EncryptionKeyStore> CredentialVault<K> {
     }
 
     /// Remove one credential file. The AES-256 key stays in the credential store.
+    ///
+    /// # Errors
+    ///
+    /// `id` is malformed, no credential has that id, or the file cannot be
+    /// removed.
     pub fn delete(&self, id: &str) -> Result<(), VaultError> {
         require_id(id)?;
         let path = self.path_for(id);
@@ -498,7 +532,9 @@ fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn now_secs() -> u64 {
@@ -530,6 +566,7 @@ pub struct RotateReport {
 
 impl Credential {
     /// The JSON object printed by `credential show --json`.
+    #[must_use]
     pub fn to_json(&self) -> Json {
         Json::Object(vec![
             ("id".to_string(), Json::String(self.id.clone())),
@@ -572,6 +609,7 @@ impl std::fmt::Display for VaultError {
 
 impl VaultError {
     /// The storage key is wrapped to a security key and has not been unwrapped.
+    #[must_use]
     pub fn is_locked(&self) -> bool {
         matches!(self, Self::Key(err) if err.is_locked())
     }
@@ -629,7 +667,7 @@ mod tests {
         assert_eq!(vault.get(&stored.id).unwrap().document, replaced.document);
 
         vault.delete(&stored.id).unwrap();
-        assert!(vault.list().unwrap().is_empty());
+        assert_eq!(vault.list().unwrap().len(), 0);
         assert!(vault.get(&stored.id).is_err());
         fs::remove_dir_all(&root).ok();
     }

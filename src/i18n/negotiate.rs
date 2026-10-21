@@ -30,12 +30,13 @@ pub struct TagParts {
 /// The catalogs that answer one tag, most specific first, English last.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chain {
-    pub chain: Vec<String>,
+    pub tags: Vec<String>,
     pub matched: bool,
     pub direction: Direction,
 }
 
 /// Canonicalise a language tag, or `""` when it is not well-formed.
+#[must_use]
 pub fn canonical(tag: &str) -> String {
     let text = tag.trim();
     if text.is_empty() || text.len() > 64 || text == "*" {
@@ -132,10 +133,11 @@ pub fn parts_of(tag: &str) -> Option<TagParts> {
 }
 
 /// Catalogs that answer `tag`, most specific first, with English at the end.
+#[must_use]
 pub fn chain_for(tag: &str, catalogs: &[TagParts]) -> Chain {
     let Some(want) = parts_of(tag) else {
         return Chain {
-            chain: vec!["en".to_string()],
+            tags: vec!["en".to_string()],
             matched: false,
             direction: Direction::Ltr,
         };
@@ -157,7 +159,7 @@ pub fn chain_for(tag: &str, catalogs: &[TagParts]) -> Chain {
     let matched = !chain.is_empty();
     push_unique(&mut chain, "en");
     Chain {
-        chain,
+        tags: chain,
         matched,
         direction: want.direction,
     }
@@ -195,10 +197,10 @@ fn answered(raw: &str, catalogs: &[TagParts]) -> Option<Negotiated> {
     if !found.matched {
         return None;
     }
-    let catalog = found.chain[0].clone();
+    let catalog = found.tags[0].clone();
     Some(Negotiated {
         locale: tag,
-        chain: found.chain,
+        chain: found.tags,
         catalog,
         direction: found.direction,
         matched: true,
@@ -217,6 +219,7 @@ pub struct Negotiated {
 
 /// `Accept-Language`, best first. A `q=0` tag and a tag that is not
 /// well-formed are left out.
+#[must_use]
 pub fn accept_language(value: &str) -> Vec<String> {
     let mut rows = Vec::new();
     for (at, part) in value.split(',').take(32).enumerate() {
@@ -260,6 +263,7 @@ pub fn accept_language(value: &str) -> Vec<String> {
 }
 
 /// OpenID Connect `ui_locales`: space-separated tags, best first.
+#[must_use]
 pub fn ui_locales(value: &str) -> Vec<String> {
     let mut out = Vec::new();
     for part in value.split_whitespace().take(32) {
@@ -272,6 +276,7 @@ pub fn ui_locales(value: &str) -> Vec<String> {
 }
 
 /// The language subtag (`zh` for `zh-Hant-HK`).
+#[must_use]
 pub fn language_of(tag: &str) -> &str {
     tag.split('-').next().unwrap_or(tag)
 }
@@ -300,9 +305,9 @@ fn is_region(text: &str) -> bool {
 fn is_variant(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() == 4 {
-        return chars[0].is_ascii_digit() && chars[1..].iter().all(|ch| ch.is_ascii_alphanumeric());
+        return chars[0].is_ascii_digit() && chars[1..].iter().all(char::is_ascii_alphanumeric);
     }
-    (5..=8).contains(&chars.len()) && chars.iter().all(|ch| ch.is_ascii_alphanumeric())
+    (5..=8).contains(&chars.len()) && chars.iter().all(char::is_ascii_alphanumeric)
 }
 
 fn title_script(text: &str) -> String {

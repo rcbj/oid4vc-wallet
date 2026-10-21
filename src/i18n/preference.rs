@@ -36,8 +36,9 @@ pub fn write_tag(path: &Path, tag: &str) -> Result<(), String> {
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true);
             builder.mode(0o700);
-            builder.create(parent).map_err(write_error)?;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(write_error)?;
+            builder.create(parent).map_err(|err| write_error(&err))?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|err| write_error(&err))?;
         }
     }
     let temporary = path.with_extension("new");
@@ -48,12 +49,14 @@ pub fn write_tag(path: &Path, tag: &str) -> Result<(), String> {
             .truncate(true)
             .mode(0o600)
             .open(&temporary)
-            .map_err(write_error)?;
-        writeln!(file, "{tag}").map_err(write_error)?;
-        file.sync_all().map_err(write_error)?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).map_err(write_error)?;
-        fs::rename(&temporary, path).map_err(write_error)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(write_error)?;
+            .map_err(|err| write_error(&err))?;
+        writeln!(file, "{tag}").map_err(|err| write_error(&err))?;
+        file.sync_all().map_err(|err| write_error(&err))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+            .map_err(|err| write_error(&err))?;
+        fs::rename(&temporary, path).map_err(|err| write_error(&err))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| write_error(&err))?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -67,10 +70,10 @@ pub fn remove_tag(path: &Path) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(write_error(err)),
+        Err(err) => Err(write_error(&err)),
     }
 }
 
-fn write_error(err: std::io::Error) -> String {
+fn write_error(err: &std::io::Error) -> String {
     super::t_args("wallet.cli.language_write", &[("error", &err.to_string())])
 }

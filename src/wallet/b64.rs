@@ -46,14 +46,15 @@ pub(crate) fn b64_decode(text: &str) -> Option<Vec<u8>> {
         let mut n = 0u32;
         for (shift, byte) in chunk.iter().enumerate() {
             let value = if *byte == b'=' { 0 } else { value(*byte)? };
-            n |= (value as u32) << (18 - 6 * shift);
+            n |= u32::from(value) << (18 - 6 * shift);
         }
-        out.push((n >> 16) as u8);
+        let [_, first, second, third] = n.to_be_bytes();
+        out.push(first);
         if pad < 2 {
-            out.push((n >> 8) as u8);
+            out.push(second);
         }
         if pad < 1 {
-            out.push(n as u8);
+            out.push(third);
         }
         index += 4;
     }
@@ -69,9 +70,9 @@ fn encode(bytes: &[u8], url: bool, pad: bool) -> String {
     let mut out = String::new();
     let mut index = 0;
     while index + 3 <= bytes.len() {
-        let n = ((bytes[index] as u32) << 16)
-            | ((bytes[index + 1] as u32) << 8)
-            | bytes[index + 2] as u32;
+        let n = (u32::from(bytes[index]) << 16)
+            | (u32::from(bytes[index + 1]) << 8)
+            | u32::from(bytes[index + 2]);
         out.push(table[((n >> 18) & 63) as usize] as char);
         out.push(table[((n >> 12) & 63) as usize] as char);
         out.push(table[((n >> 6) & 63) as usize] as char);
@@ -80,14 +81,14 @@ fn encode(bytes: &[u8], url: bool, pad: bool) -> String {
     }
     let rest = bytes.len() - index;
     if rest == 1 {
-        let n = (bytes[index] as u32) << 16;
+        let n = u32::from(bytes[index]) << 16;
         out.push(table[((n >> 18) & 63) as usize] as char);
         out.push(table[((n >> 12) & 63) as usize] as char);
         if pad {
             out.push_str("==");
         }
     } else if rest == 2 {
-        let n = ((bytes[index] as u32) << 16) | ((bytes[index + 1] as u32) << 8);
+        let n = (u32::from(bytes[index]) << 16) | (u32::from(bytes[index + 1]) << 8);
         out.push(table[((n >> 18) & 63) as usize] as char);
         out.push(table[((n >> 12) & 63) as usize] as char);
         out.push(table[((n >> 6) & 63) as usize] as char);
@@ -112,10 +113,11 @@ fn value(byte: u8) -> Option<u8> {
 /// Lower-case hex SHA-256 of `bytes`.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
+    use std::fmt::Write as _;
     let digest = sha2::Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }

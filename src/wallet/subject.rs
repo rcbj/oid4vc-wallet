@@ -49,6 +49,7 @@ pub enum SubjectSyntax {
 
 impl SubjectSyntax {
     /// The Subject Syntax Type a verifier lists in `subject_syntax_types_supported`.
+    #[must_use]
     pub fn type_value(&self) -> &'static str {
         match self {
             Self::JwkThumbprint => THUMBPRINT_TYPE,
@@ -59,6 +60,7 @@ impl SubjectSyntax {
     }
 
     /// `true` for the three DID choices.
+    #[must_use]
     pub fn is_did(&self) -> bool {
         !matches!(self, Self::JwkThumbprint)
     }
@@ -138,6 +140,7 @@ pub(crate) fn did_key_point(did: &str) -> Option<Vec<u8>> {
 /// `did:web:example.com` is `https://example.com/.well-known/did.json`.
 /// `did:web:example.com:users:alice` is `https://example.com/users/alice/did.json`.
 /// A port is written `%3A`: `did:web:example.com%3A8443`.
+#[must_use]
 pub fn did_web_url(did: &str) -> Option<String> {
     let rest = did.strip_prefix("did:web:")?;
     let mut parts = rest.split(':');
@@ -172,11 +175,11 @@ fn split_port(authority: &str) -> Option<(&str, Option<u16>)> {
     if digits.is_empty() || digits.len() > 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let port: u32 = digits.parse().ok()?;
-    if port == 0 || port > 65535 {
+    let port: u16 = digits.parse().ok()?;
+    if port == 0 {
         return None;
     }
-    Some((host, Some(port as u16)))
+    Some((host, Some(port)))
 }
 
 /// A fully qualified domain name: two or more labels of letters, digits and
@@ -261,7 +264,7 @@ pub(crate) fn base58btc_encode(bytes: &[u8]) -> String {
     let mut digits: Vec<u8> = Vec::new();
     for byte in &bytes[zeros..] {
         let mut carry = u32::from(*byte);
-        for digit in digits.iter_mut() {
+        for digit in &mut digits {
             carry += u32::from(*digit) << 8;
             *digit = (carry % 58) as u8;
             carry /= 58;
@@ -288,8 +291,8 @@ pub(crate) fn base58btc_decode(text: &str) -> Option<Vec<u8>> {
     let ones = text.bytes().take_while(|byte| *byte == b'1').count();
     let mut bytes: Vec<u8> = Vec::new();
     for symbol in text.bytes().skip(ones) {
-        let mut carry = BASE58.iter().position(|one| *one == symbol)? as u32;
-        for byte in bytes.iter_mut() {
+        let mut carry = u32::try_from(BASE58.iter().position(|one| *one == symbol)?).ok()?;
+        for byte in &mut bytes {
             carry += u32::from(*byte) * 58;
             *byte = (carry & 0xff) as u8;
             carry >>= 8;
@@ -305,6 +308,10 @@ pub(crate) fn base58btc_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 /// `$XDG_CONFIG_HOME/oid4vc-wallet/self-issued-subject`.
+///
+/// # Errors
+///
+/// The configuration directory cannot be found.
 pub fn default_path() -> Result<PathBuf, String> {
     Ok(crate::xdg::config_home()?
         .join("oid4vc-wallet")
@@ -314,6 +321,11 @@ pub fn default_path() -> Result<PathBuf, String> {
 /// The saved choice. A missing file is the JWK Thumbprint syntax. A file
 /// that cannot be read, or that names nothing this wallet knows, is an error:
 /// the wallet does not fall back to another subject without saying so.
+///
+/// # Errors
+///
+/// The file exists and cannot be read, or it names no subject syntax this
+/// wallet knows.
 pub fn read(path: &Path) -> Result<SubjectSyntax, String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -335,6 +347,10 @@ pub fn read(path: &Path) -> Result<SubjectSyntax, String> {
 }
 
 /// Save `syntax` as the only line of `path`.
+///
+/// # Errors
+///
+/// A `did:web` DID does not map to a URL, or the file cannot be written.
 pub fn write(path: &Path, syntax: &SubjectSyntax) -> Result<(), String> {
     if let SubjectSyntax::DidWeb(did) = syntax {
         if did_web_url(did).is_none() {
@@ -546,7 +562,12 @@ mod tests {
 
     #[test]
     fn a_verifier_list_names_a_method_or_every_did() {
-        let list = |items: &[&str]| items.iter().map(|one| one.to_string()).collect::<Vec<_>>();
+        let list = |items: &[&str]| {
+            items
+                .iter()
+                .map(|one| (*one).to_string())
+                .collect::<Vec<_>>()
+        };
         assert!(accepts(&list(&["did:key"]), "did:key"));
         assert!(!accepts(&list(&["did:key"]), "did:jwk"));
         assert!(accepts(&list(&["did"]), "did:web"));

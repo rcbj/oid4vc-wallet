@@ -67,6 +67,10 @@ impl std::error::Error for PortableError {}
 ///
 /// Pass one credential, or every credential. An empty slice is
 /// [`PortableError::Empty`].
+///
+/// # Errors
+///
+/// `credentials` is empty, or sealing fails.
 pub fn export_credentials(credentials: &[Credential]) -> Result<PortableExport, PortableError> {
     if credentials.is_empty() {
         return Err(PortableError::Empty);
@@ -85,6 +89,11 @@ pub fn export_credentials(credentials: &[Credential]) -> Result<PortableExport, 
 ///
 /// `key` is the standard base64 text that export returned. A holder key,
 /// including its private `d`, is returned unchanged.
+///
+/// # Errors
+///
+/// `key` is not a base64 AES-256 key, `bytes` is not an export sealed with that
+/// key, or the opened contents are malformed.
 pub fn import_credentials(bytes: &[u8], key: &str) -> Result<Vec<NewCredential>, PortableError> {
     let key = decode_key(key)?;
     let mut plaintext = open(&key, bytes)?;
@@ -141,9 +150,8 @@ fn open(key: &Aes256Key, sealed: &[u8]) -> Result<String, PortableError> {
 }
 
 fn decode_key(text: &str) -> Result<Aes256Key, PortableError> {
-    let mut bytes = match b64::b64_decode(text) {
-        Some(bytes) => bytes,
-        None => return Err(PortableError::BadKey),
+    let Some(mut bytes) = b64::b64_decode(text) else {
+        return Err(PortableError::BadKey);
     };
     if bytes.len() != KEY_LEN {
         bytes.zeroize();

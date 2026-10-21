@@ -111,6 +111,7 @@ impl Transport for LiveHttp {
 /// Fetch the request the desktop launched, present one matching credential,
 /// and report the page the verifier asked the browser to open.
 /// A self-issued ID Token names its subject as `subject` says.
+#[must_use]
 pub fn present_same_device(
     uri: &str,
     credentials: &[Credential],
@@ -161,6 +162,7 @@ pub enum Presentation {
 /// credential id is not in `approved`, return [`Presentation::NeedsApproval`]
 /// without signing or posting. A new self-issued key always waits. A
 /// self-issued ID Token names its subject as `subject` says.
+#[must_use]
 pub fn prepare_presentation(
     uri: &str,
     credentials: &[Credential],
@@ -178,12 +180,14 @@ pub fn prepare_presentation(
 }
 
 /// Sign and post a presentation the person approved.
+#[must_use]
 pub fn approve_presentation(pending: PendingPresentation, credentials: &[Credential]) -> Presented {
     approve_with(pending, credentials, &LiveHttp, now_secs())
 }
 
 /// Tell the verifier the presentation was declined. The holder key is not used.
-pub fn refuse_presentation(pending: PendingPresentation) -> Presented {
+#[must_use]
+pub fn refuse_presentation(pending: &PendingPresentation) -> Presented {
     refuse_with(pending, &LiveHttp)
 }
 
@@ -262,7 +266,7 @@ fn stage_as<T: Transport>(
             None,
             None,
             None,
-            Answer::Unsupported,
+            &Answer::Unsupported,
         ));
     }
     if ready.wants_id {
@@ -300,7 +304,7 @@ fn stage_as<T: Transport>(
             None,
             None,
             None,
-            Answer::Cannot,
+            &Answer::Cannot,
         )),
         None => finished(respond(
             http,
@@ -309,7 +313,7 @@ fn stage_as<T: Transport>(
             None,
             None,
             None,
-            Answer::Declined,
+            &Answer::Declined,
         )),
     }
 }
@@ -390,7 +394,7 @@ fn approve_with<T: Transport>(
                     None,
                     None,
                     None,
-                    Answer::Cannot,
+                    &Answer::Cannot,
                 );
             };
             send_presentation(http, &ready, credential, &query_id, now)
@@ -407,7 +411,7 @@ fn approve_with<T: Transport>(
                     None,
                     None,
                     None,
-                    Answer::Cannot,
+                    &Answer::Cannot,
                 );
             };
             send_existing_id_token(http, &ready, credential, now)
@@ -416,9 +420,9 @@ fn approve_with<T: Transport>(
     }
 }
 
-fn refuse_with<T: Transport>(pending: PendingPresentation, http: &T) -> Presented {
+fn refuse_with<T: Transport>(pending: &PendingPresentation, http: &T) -> Presented {
     let id = pending.summary.credential_id.clone();
-    respond(http, &pending.ready, id, None, None, None, Answer::Refused)
+    respond(http, &pending.ready, id, None, None, None, &Answer::Refused)
 }
 
 /// `approved` is `None` when the caller already decided to use the key.
@@ -468,7 +472,7 @@ fn send_presentation<T: Transport>(
             None,
             None,
             None,
-            Answer::Cannot,
+            &Answer::Cannot,
         );
     }
     match presentation_for(credential, query_id, ready, now) {
@@ -476,10 +480,10 @@ fn send_presentation<T: Transport>(
             http,
             ready,
             Some(credential.id.clone()),
-            Some(vp),
-            id_token,
+            Some(&vp),
+            id_token.as_deref(),
             None,
-            Answer::Sent,
+            &Answer::Sent,
         ),
         None => respond(
             http,
@@ -488,7 +492,7 @@ fn send_presentation<T: Transport>(
             None,
             None,
             None,
-            Answer::Cannot,
+            &Answer::Cannot,
         ),
     }
 }
@@ -507,7 +511,7 @@ fn send_existing_id_token<T: Transport>(
             None,
             None,
             None,
-            Answer::Cannot,
+            &Answer::Cannot,
         );
     };
     respond(
@@ -515,9 +519,9 @@ fn send_existing_id_token<T: Transport>(
         ready,
         Some(credential.id.clone()),
         None,
-        Some(id_token),
+        Some(id_token.as_str()),
         None,
-        Answer::SiopSent,
+        &Answer::SiopSent,
     )
 }
 
@@ -530,9 +534,9 @@ fn send_new_id_token<T: Transport>(http: &T, ready: &Ready, now: u64) -> Present
         ready,
         None,
         None,
-        Some(minted.id_token),
+        Some(minted.id_token.as_str()),
         Some(minted.store),
-        Answer::SiopCreated,
+        &Answer::SiopCreated,
     )
 }
 
@@ -787,7 +791,7 @@ fn syntax_refusal<T: Transport>(http: &T, ready: &Ready, type_value: &str) -> Op
         None,
         None,
         None,
-        Answer::Subject {
+        &Answer::Subject {
             message,
             description,
         },
@@ -1147,7 +1151,7 @@ fn claim_asks(query: &Json) -> Vec<ClaimAsk> {
             let values = claim
                 .get("values")
                 .and_then(Json::as_array)
-                .map(|items| items.to_vec());
+                .map(<[Json]>::to_vec);
             ClaimAsk {
                 path,
                 usable,
@@ -1280,8 +1284,8 @@ fn holder_signing(jwk: &Json) -> Option<SigningKey> {
     let signing = SigningKey::from_bytes(&bytes).ok()?;
     let point = signing.verifying_key().to_encoded_point(false);
     let (x, y) = coordinates(jwk)?;
-    if point.x().map(|value| value.as_slice()) != Some(x.as_slice())
-        || point.y().map(|value| value.as_slice()) != Some(y.as_slice())
+    if point.x().map(AsRef::as_ref) != Some(x.as_slice())
+        || point.y().map(AsRef::as_ref) != Some(y.as_slice())
     {
         return None;
     }
@@ -1554,6 +1558,7 @@ fn mint_credential(now: u64) -> Option<(SigningKey, NewCredential)> {
 
 /// Create a self-issued key now, for a `did:web` document to publish before
 /// the first sign-in. The caller stores the credential that keeps it.
+#[must_use]
 pub fn create_self_issued_credential() -> Option<NewCredential> {
     mint_credential(now_secs()).map(|(_, store)| store)
 }
@@ -1561,6 +1566,7 @@ pub fn create_self_issued_credential() -> Option<NewCredential> {
 /// The identifier a verifier sees for the self-issued key `siopv2://` would
 /// use now: the newest stored self-issued credential's key. `None` when there
 /// is no self-issued key yet.
+#[must_use]
 pub fn self_issued_identifier(
     credentials: &[Credential],
     syntax: &SubjectSyntax,
@@ -1587,6 +1593,7 @@ pub struct DidWebPublication {
 /// The `did:web` document for the self-issued key `siopv2://` would use now.
 /// `None` when `did` is not a well formed `did:web`, or there is no
 /// self-issued key yet.
+#[must_use]
 pub fn did_web_publication(credentials: &[Credential], did: &str) -> Option<DidWebPublication> {
     let url = subject::did_web_url(did)?;
     let signing = newest_self_issued_key(credentials)?;
@@ -1706,18 +1713,18 @@ fn respond<T: Transport>(
     http: &T,
     ready: &Ready,
     credential_id: Option<String>,
-    vp: Option<Vp>,
-    id_token: Option<String>,
+    vp: Option<&Vp>,
+    id_token: Option<&str>,
     store: Option<NewCredential>,
-    answer: Answer,
+    answer: &Answer,
 ) -> Presented {
-    let error = match &answer {
+    let error = match answer {
         Answer::Subject { description, .. } => {
             Some(("subject_syntax_types_not_supported", description.as_str()))
         }
         _ => None,
     };
-    let page = match post_response(http, ready, vp.as_ref(), id_token.as_deref(), error) {
+    let page = match post_response(http, ready, vp, id_token, error) {
         Ok(page) => page,
         Err(PostError::Answered(message)) => {
             return Presented {
@@ -1883,17 +1890,17 @@ fn page_from(body: &[u8], response_uri: &str) -> Page {
 }
 
 fn narrate(
-    answer: Answer,
+    answer: &Answer,
     credential_id: Option<String>,
     page: Page,
     store: Option<NewCredential>,
 ) -> Presented {
     let created = store.as_ref().map(|item| item.issuer.clone());
-    let id = match &answer {
+    let id = match answer {
         Answer::SiopCreated => created.as_deref().unwrap_or(""),
         _ => credential_id.as_deref().unwrap_or(""),
     };
-    let message = match (&answer, &page) {
+    let message = match (answer, &page) {
         (Answer::Sent, Page::Open(_)) => t_args("wallet.present.ok", &[("id", id)]),
         (Answer::Sent, Page::Elsewhere) => t_args("wallet.present.redirect_other", &[("id", id)]),
         (Answer::Sent, Page::Nowhere) => t_args("wallet.present.ok_no_page", &[("id", id)]),
@@ -1993,19 +2000,27 @@ fn seal_gcm(enc: &str, cek: &[u8], iv: &[u8], aad: &[u8], plaintext: &[u8]) -> O
 }
 
 fn concat_kdf(z: &[u8], key_bytes: usize, alg_id: &[u8], apu: &[u8], apv: &[u8]) -> Vec<u8> {
+    // RFC 7518 section 4.6.2 writes every length and the round counter as a
+    // 32-bit big-endian integer. These inputs are a few bytes long, so a
+    // value that does not fit is a bug, not a request to handle.
+    let be32 = |n: usize| {
+        u32::try_from(n)
+            .expect("Concat KDF length fits in 32 bits")
+            .to_be_bytes()
+    };
     let mut info = Vec::new();
-    info.extend_from_slice(&(alg_id.len() as u32).to_be_bytes());
+    info.extend_from_slice(&be32(alg_id.len()));
     info.extend_from_slice(alg_id);
-    info.extend_from_slice(&(apu.len() as u32).to_be_bytes());
+    info.extend_from_slice(&be32(apu.len()));
     info.extend_from_slice(apu);
-    info.extend_from_slice(&(apv.len() as u32).to_be_bytes());
+    info.extend_from_slice(&be32(apv.len()));
     info.extend_from_slice(apv);
-    info.extend_from_slice(&((key_bytes as u32).saturating_mul(8)).to_be_bytes());
+    info.extend_from_slice(&be32(key_bytes * 8));
     let rounds = key_bytes.div_ceil(32);
     let mut out = Vec::with_capacity(rounds * 32);
     for counter in 1..=rounds {
         let mut hasher = Sha256::new();
-        hasher.update((counter as u32).to_be_bytes());
+        hasher.update(be32(counter));
         hasher.update(z);
         hasher.update(&info);
         out.extend_from_slice(&hasher.finalize());
@@ -2053,16 +2068,16 @@ fn host_of(url: &str) -> Option<String> {
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn json_same(left: &Json, right: &Json) -> bool {
     match (left, right) {
         (Json::Null, Json::Null) => true,
         (Json::Bool(left), Json::Bool(right)) => left == right,
-        (Json::Number(left), Json::Number(right)) => left == right,
-        (Json::String(left), Json::String(right)) => left == right,
+        (Json::Number(left), Json::Number(right)) | (Json::String(left), Json::String(right)) => {
+            left == right
+        }
         (Json::Array(left), Json::Array(right)) => {
             left.len() == right.len()
                 && left
@@ -2219,36 +2234,23 @@ mod tests {
         fixture_listing(mode, aia, response_type, scheme, None)
     }
 
-    /// `syntaxes` is the request's `client_metadata.subject_syntax_types_supported`.
-    fn fixture_listing(
+    /// The signed request's claims. `syntaxes` is added to `client_metadata`.
+    fn request_payload(
+        now: u64,
+        client_id: &str,
         mode: &str,
-        aia: bool,
         response_type: &str,
-        scheme: &str,
+        recipient: &SecretKey,
         syntaxes: Option<&[&str]>,
-    ) -> Fixture {
-        let now = now_secs();
-        let (ca_key, ca_params, ca_cert) = ca("Verifier Root");
-        let aia_url = "https://verifier.example/ca.cer";
-        let (leaf_key, leaf_cert) = leaf("Verifier", &ca_params, &ca_key, aia.then_some(aia_url));
-        let leaf_der = leaf_cert.der().to_vec();
-        let signer = signer_of(&leaf_key);
-        let client_id = format!(
-            "x509_hash:{}",
-            b64::b64url_encode(&Sha256::digest(&leaf_der))
-        );
-        let recipient = SecretKey::random(&mut OsRng);
+    ) -> Json {
         let recipient_point = recipient.public_key().to_encoded_point(false);
-        let holder = SigningKey::random(&mut OsRng);
-        let holder_point = holder.verifying_key().to_encoded_point(false);
-        let holder_d = b64::b64url_encode(holder.to_bytes().as_slice());
         let dcql = sign_in_query();
         let mut payload = object(&[
-            ("iss", Json::String(client_id.clone())),
+            ("iss", Json::String(client_id.to_string())),
             ("aud", Json::String(WALLET_AUDIENCE.to_string())),
             ("iat", Json::Number(now.to_string())),
             ("exp", Json::Number((now + 600).to_string())),
-            ("client_id", Json::String(client_id.clone())),
+            ("client_id", Json::String(client_id.to_string())),
             ("response_type", Json::String(response_type.to_string())),
             ("response_mode", Json::String(mode.to_string())),
             (
@@ -2309,6 +2311,31 @@ mod tests {
                 }
             }
         }
+        payload
+    }
+
+    /// `syntaxes` is the request's `client_metadata.subject_syntax_types_supported`.
+    fn fixture_listing(
+        mode: &str,
+        aia: bool,
+        response_type: &str,
+        scheme: &str,
+        syntaxes: Option<&[&str]>,
+    ) -> Fixture {
+        let now = now_secs();
+        let (ca_key, ca_params, ca_cert) = ca("Verifier Root");
+        let aia_url = "https://verifier.example/ca.cer";
+        let (leaf_key, leaf_cert) = leaf("Verifier", &ca_params, &ca_key, aia.then_some(aia_url));
+        let leaf_der = leaf_cert.der().to_vec();
+        let signer = signer_of(&leaf_key);
+        let client_id = format!(
+            "x509_hash:{}",
+            b64::b64url_encode(&Sha256::digest(&leaf_der))
+        );
+        let recipient = SecretKey::random(&mut OsRng);
+        let holder = SigningKey::random(&mut OsRng);
+        let holder_d = b64::b64url_encode(holder.to_bytes().as_slice());
+        let payload = request_payload(now, &client_id, mode, response_type, &recipient, syntaxes);
         let jwt = signed_jwt(&signer, &leaf_der, &payload.to_string());
         let request_uri = "https://verifier.example/oid4vp/request/1";
         let mut gets = HashMap::new();
@@ -2327,41 +2354,11 @@ mod tests {
                 http(aia_url, 200, ca_cert.der().as_ref(), Vec::new()),
             );
         }
-        let holder_secret = object(&[
-            ("kty", Json::String("EC".to_string())),
-            ("crv", Json::String("P-256".to_string())),
-            (
-                "x",
-                Json::String(b64::b64url_encode(holder_point.x().unwrap().as_slice())),
-            ),
-            (
-                "y",
-                Json::String(b64::b64url_encode(holder_point.y().unwrap().as_slice())),
-            ),
-            ("d", Json::String(holder_d.clone())),
-        ])
-        .to_string();
+        let holder_secret = private_jwk(&holder).unwrap();
         let same_doc = sd_document(&holder, "https://verifier.example", "same-host");
         let other_holder = SigningKey::random(&mut OsRng);
         let other_doc = sd_document(&other_holder, "https://other.example", "other-host");
-        let other_point = other_holder.verifying_key().to_encoded_point(false);
-        let other_secret = object(&[
-            ("kty", Json::String("EC".to_string())),
-            ("crv", Json::String("P-256".to_string())),
-            (
-                "x",
-                Json::String(b64::b64url_encode(other_point.x().unwrap().as_slice())),
-            ),
-            (
-                "y",
-                Json::String(b64::b64url_encode(other_point.y().unwrap().as_slice())),
-            ),
-            (
-                "d",
-                Json::String(b64::b64url_encode(other_holder.to_bytes().as_slice())),
-            ),
-        ])
-        .to_string();
+        let other_secret = private_jwk(&other_holder).unwrap();
         let redirect = br#"{"redirect_uri":"https://verifier.example/authn/wallet/wait?authn=1&state=state-1&response_code=code-1"}"#;
         Fixture {
             script: Script {
@@ -2829,7 +2826,7 @@ mod tests {
             .and_then(Json::as_str)
             .unwrap()
             .to_string();
-        assert!(!scalar.is_empty());
+        assert_ne!(scalar, "");
         assert!(!body.contains(&scalar), "the private scalar was posted");
     }
 
@@ -2898,7 +2895,7 @@ mod tests {
         } else {
             "A"
         };
-        broken.replace_range(at..at + 1, next);
+        broken.replace_range(at..=at, next);
         assert!(ensure_self_issued_certificate(&broken, &holder).is_none());
 
         let foreign_payload = object(&[
@@ -3083,16 +3080,14 @@ mod tests {
 
     fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
         let mut out = vec![tag];
-        let len = body.len();
+        let len = u16::try_from(body.len()).expect("test DER fits two length bytes");
+        let [high, low] = len.to_be_bytes();
         if len < 128 {
-            out.push(len as u8);
+            out.push(low);
         } else if len < 256 {
-            out.push(0x81);
-            out.push(len as u8);
+            out.extend_from_slice(&[0x81, low]);
         } else {
-            out.push(0x82);
-            out.push((len >> 8) as u8);
-            out.push((len & 0xff) as u8);
+            out.extend_from_slice(&[0x82, high, low]);
         }
         out.extend_from_slice(body);
         out
@@ -3148,7 +3143,7 @@ mod tests {
         let Presentation::NeedsApproval(pending) = step else {
             panic!("the key was used before approval");
         };
-        let outcome = refuse_with(*pending, &fixture.script);
+        let outcome = refuse_with(&pending, &fixture.script);
         assert!(!outcome.ok);
         assert!(outcome.message.contains("declined to present"));
         let body = posted_body(&fixture);
@@ -3258,15 +3253,14 @@ mod tests {
         // Big-endian base-256 digits, multiplied by 58 and added to per symbol.
         let mut number: Vec<u8> = Vec::new();
         for symbol in text.chars() {
-            let value = ALPHABET.find(symbol)? as u32;
-            let mut carry = value;
+            let mut carry = u32::try_from(ALPHABET.find(symbol)?).ok()?;
             for digit in number.iter_mut().rev() {
                 let next = u32::from(*digit) * 58 + carry;
-                *digit = (next % 256) as u8;
+                *digit = next.to_le_bytes()[0];
                 carry = next / 256;
             }
             while carry > 0 {
-                number.insert(0, (carry % 256) as u8);
+                number.insert(0, carry.to_le_bytes()[0]);
                 carry /= 256;
             }
         }
@@ -3499,7 +3493,7 @@ mod tests {
         let mut out = token.to_string();
         let at = out.rfind('.').unwrap() + 3;
         let next = if out.as_bytes()[at] == b'A' { "B" } else { "A" };
-        out.replace_range(at..at + 1, next);
+        out.replace_range(at..=at, next);
         out
     }
 

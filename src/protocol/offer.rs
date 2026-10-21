@@ -93,6 +93,12 @@ impl std::error::Error for OfferError {}
 impl OfferPassing {
     /// Read the offer from the query of an
     /// `openid-credential-offer://` or `haip-vci://` URI.
+    ///
+    /// # Errors
+    ///
+    /// `credential_offer` or `credential_offer_uri` is repeated, both or
+    /// neither are present, the offer is not a valid Credential Offer, or the
+    /// offer URI is not HTTP(S).
     pub fn from_query(params: &[QueryParam]) -> Result<Self, OfferError> {
         let by_value = values(params, "credential_offer");
         let by_reference = values(params, "credential_offer_uri");
@@ -119,6 +125,11 @@ impl OfferPassing {
 }
 
 /// Parse a Credential Offer object.
+///
+/// # Errors
+///
+/// `text` is not a JSON object, or it lacks or misuses a member a Credential
+/// Offer requires.
 pub fn parse_offer_json(text: &str) -> Result<CredentialOffer, OfferError> {
     let value = Json::parse(text).map_err(|error: JsonError| {
         tra(

@@ -65,10 +65,24 @@ impl std::fmt::Debug for RetiredKey {
 /// returns an empty list. Writing a non-empty list fails, so a rotation
 /// cannot drop the previous key.
 pub trait EncryptionKeyStore {
+    /// # Errors
+    ///
+    /// The store is not running, refuses the read, or holds something that is
+    /// not a key. An error never means "no key": `Ok(None)` is the only signal
+    /// to create one.
     fn load_key(&self) -> Result<Option<Aes256Key>, KeyStoreError>;
+
+    /// # Errors
+    ///
+    /// The store is not running or refuses the write.
     fn store_key(&self, key: &Aes256Key) -> Result<(), KeyStoreError>;
 
     /// Every retired key, including entries whose `expires_at` has passed.
+    ///
+    /// # Errors
+    ///
+    /// The store is not running, refuses the read, or holds a list that cannot
+    /// be decoded.
     fn load_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
         Ok(Vec::new())
     }
@@ -77,6 +91,11 @@ pub trait EncryptionKeyStore {
     ///
     /// An empty list is a no-op. A non-empty list must be stored by the
     /// implementation. Succeeding here would drop the previous key.
+    ///
+    /// # Errors
+    ///
+    /// The store is not running or refuses the write. This default refuses any
+    /// non-empty list.
     fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
         if keys.is_empty() {
             Ok(())
@@ -195,6 +214,7 @@ pub struct DesktopKeyStore {
 
 impl DesktopKeyStore {
     /// The stores the installed wallet uses.
+    #[must_use]
     pub fn wallet() -> Self {
         Self {
             secret_service: SecretServiceKeyStore::wallet(),
@@ -330,8 +350,8 @@ impl DesktopKeyStore {
         match (plan_prompt(presence(&opened)), opened) {
             (LoadPlan::UseKWallet, Probe::Found(key)) => Ok(Some(key)),
             (LoadPlan::Missing, Probe::Empty) => Ok(None),
-            (LoadPlan::NoStore, Probe::Absent) => Err(KeyStoreError::Unavailable),
             (LoadPlan::Deny, Probe::Failed(err)) => Err(err),
+            // Includes `NoStore` with `Absent`: neither store is running.
             _ => Err(KeyStoreError::Unavailable),
         }
     }
@@ -411,13 +431,10 @@ impl EncryptionKeyStore for MemoryKeyStore {
 }
 
 pub(super) fn key_from_store(mut bytes: Vec<u8>) -> Result<Aes256Key, KeyStoreError> {
-    let copied = match <[u8; KEY_LEN]>::try_from(bytes.as_slice()) {
-        Ok(array) => array,
-        Err(_) => {
-            let len = bytes.len();
-            bytes.zeroize();
-            return Err(KeyStoreError::WrongLength(len));
-        }
+    let Ok(copied) = <[u8; KEY_LEN]>::try_from(bytes.as_slice()) else {
+        let len = bytes.len();
+        bytes.zeroize();
+        return Err(KeyStoreError::WrongLength(len));
     };
     bytes.zeroize();
     Ok(Aes256Key::from_bytes(copied))
@@ -563,6 +580,7 @@ impl std::fmt::Display for KeyStoreError {
 
 impl KeyStoreError {
     /// The storage key is wrapped to a security key and this process has not unwrapped it.
+    #[must_use]
     pub fn is_locked(&self) -> bool {
         matches!(self, Self::Locked)
     }

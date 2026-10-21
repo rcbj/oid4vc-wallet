@@ -63,6 +63,13 @@ pub trait IssuerHttp {
 /// Redeem `offer` at its issuer. `tx_code` is what the person typed. Pass
 /// `None` only when the offer did not ask for one. One entry is returned
 /// for each credential the issuer issued.
+///
+/// # Errors
+///
+/// The offer has no pre-authorized grant, `tx_code` does not fit what the offer
+/// asked for, the issuer or authorization server metadata is missing or
+/// invalid, a request fails, or the issuer refuses, defers, or returns a
+/// credential that is not bound to the proof key.
 pub fn redeem_pre_authorized(
     offer: &CredentialOffer,
     tx_code: Option<&str>,
@@ -85,7 +92,7 @@ pub(crate) fn redeem_with(
     let issuer_metadata_url = well_known(&offer.credential_issuer, "openid-credential-issuer")?;
     let issuer_metadata = json_ok(
         &issuer_metadata_url,
-        http.get(&issuer_metadata_url)?,
+        &http.get(&issuer_metadata_url)?,
         "wallet.redeem.metadata",
     )?;
     let credential_issuer = required_string(&issuer_metadata, "credential_issuer")?;
@@ -107,25 +114,70 @@ pub(crate) fn redeem_with(
             &[("name", "authorization_servers")],
         )));
     }
-    let as_metadata_url = well_known(&authorization_server, "oauth-authorization-server")?;
+    let (token, access_token) = request_token(
+        http,
+        &authorization_server,
+        &grant.pre_authorized_code,
+        typed.as_deref(),
+    )?;
+    let nonce = fetch_nonce(
+        http,
+        issuer_metadata.get("nonce_endpoint"),
+        token.get("c_nonce"),
+    )?;
+    let identifier = granted_identifier(&token, &configuration)?;
+    let proofs: Vec<proof::Proof> = (0..proof_count(&issuer_metadata))
+        .map(|_| proof::sign_proof(&credential_issuer, &nonce, now))
+        .collect();
+    let credential_http = http.post(
+        &credential_endpoint,
+        "application/json",
+        Some(&access_token),
+        &credential_request(identifier, configuration, &proofs).to_string(),
+    )?;
+    if credential_http.status == 202 {
+        return Err(err(t("wallet.redeem.deferred")));
+    }
+    let credential_json = json_ok(
+        &credential_endpoint,
+        &credential_http,
+        "wallet.redeem.credential",
+    )?;
+    bind_issued(
+        format,
+        credential_issuer,
+        credential_documents(&credential_json)?,
+        proofs,
+    )
+}
+
+/// The token response and its access token. The token goes into an HTTP
+/// header, so a line break or NUL in it is refused.
+fn request_token(
+    http: &dyn IssuerHttp,
+    authorization_server: &str,
+    pre_authorized_code: &str,
+    typed: Option<&str>,
+) -> Result<(Json, String), RedeemError> {
+    let as_metadata_url = well_known(authorization_server, "oauth-authorization-server")?;
     let as_metadata = json_ok(
         &as_metadata_url,
-        http.get(&as_metadata_url)?,
+        &http.get(&as_metadata_url)?,
         "wallet.redeem.metadata",
     )?;
     let token_endpoint = required_http(&as_metadata, "token_endpoint")?;
     let mut form = format!(
         "grant_type={}&pre-authorized_code={}",
         encode_uri_component(PRE_AUTHORIZED_CODE_GRANT),
-        encode_uri_component(&grant.pre_authorized_code)
+        encode_uri_component(pre_authorized_code)
     );
-    if let Some(code) = &typed {
+    if let Some(code) = typed {
         form.push_str("&tx_code=");
         form.push_str(&encode_uri_component(code));
     }
     let token = json_ok(
         &token_endpoint,
-        http.post(
+        &http.post(
             &token_endpoint,
             "application/x-www-form-urlencoded",
             None,
@@ -148,59 +200,35 @@ pub(crate) fn redeem_with(
             )));
         }
     }
-    let nonce = fetch_nonce(
-        http,
-        issuer_metadata.get("nonce_endpoint"),
-        token.get("c_nonce"),
-    )?;
-    let identifier = granted_identifier(&token, &configuration)?;
-    let proofs: Vec<proof::Proof> = (0..proof_count(&issuer_metadata))
-        .map(|_| proof::sign_proof(&credential_issuer, &nonce, now))
-        .collect();
-    let mut body = Vec::new();
-    if let Some(identifier) = identifier {
-        body.push((
-            "credential_identifier".to_string(),
-            Json::String(identifier),
-        ));
-    } else {
-        body.push((
-            "credential_configuration_id".to_string(),
-            Json::String(configuration),
-        ));
-    }
-    body.push((
-        "proofs".to_string(),
-        Json::Object(vec![(
-            "jwt".to_string(),
-            Json::Array(
-                proofs
-                    .iter()
-                    .map(|proof| Json::String(proof.jwt.clone()))
-                    .collect(),
-            ),
-        )]),
-    ));
-    let credential_http = http.post(
-        &credential_endpoint,
-        "application/json",
-        Some(&access_token),
-        &Json::Object(body).to_string(),
-    )?;
-    if credential_http.status == 202 {
-        return Err(err(t("wallet.redeem.deferred")));
-    }
-    let credential_json = json_ok(
-        &credential_endpoint,
-        credential_http,
-        "wallet.redeem.credential",
-    )?;
-    bind_issued(
-        format,
-        credential_issuer,
-        credential_documents(&credential_json)?,
-        proofs,
-    )
+    Ok((token, access_token))
+}
+
+/// An issuer that granted a `credential_identifier` is asked for that, not
+/// for the configuration.
+fn credential_request(
+    identifier: Option<String>,
+    configuration: String,
+    proofs: &[proof::Proof],
+) -> Json {
+    let requested = match identifier {
+        Some(identifier) => ("credential_identifier", identifier),
+        None => ("credential_configuration_id", configuration),
+    };
+    Json::Object(vec![
+        (requested.0.to_string(), Json::String(requested.1)),
+        (
+            "proofs".to_string(),
+            Json::Object(vec![(
+                "jwt".to_string(),
+                Json::Array(
+                    proofs
+                        .iter()
+                        .map(|proof| Json::String(proof.jwt.clone()))
+                        .collect(),
+                ),
+            )]),
+        ),
+    ])
 }
 
 fn checked_tx_code(
@@ -215,7 +243,7 @@ fn checked_tx_code(
         return Err(err(t("wallet.redeem.tx_required")));
     }
     if let Some(length) = spec.length {
-        if code.chars().count() != length as usize {
+        if u64::try_from(code.chars().count()) != Ok(length) {
             return Err(err(t_args(
                 "wallet.redeem.tx_length",
                 &[("length", &length.to_string())],
@@ -242,7 +270,7 @@ fn fetch_nonce(
             )));
         }
         let fetched = http.post(endpoint, "", None, "")?;
-        let json = json_ok(endpoint, fetched, "wallet.redeem.nonce")?;
+        let json = json_ok(endpoint, &fetched, "wallet.redeem.nonce")?;
         return required_string(&json, "c_nonce");
     }
     match token_nonce.and_then(|value| value.as_str()) {
@@ -366,7 +394,7 @@ fn bind_issued(
         }]);
     }
     let mut unused: Vec<Option<proof::Proof>> = proofs.into_iter().map(Some).collect();
-    let mut issued = Vec::with_capacity(documents.len());
+    let mut bound = Vec::with_capacity(documents.len());
     for document in documents {
         let Some(point) = bound_point(&document) else {
             return Err(err(t("wallet.redeem.key_match")));
@@ -381,14 +409,14 @@ fn bind_issued(
             return Err(err(t("wallet.redeem.key_match")));
         };
         let proof = unused[index].take().expect("unused proof");
-        issued.push(Redeemed {
+        bound.push(Redeemed {
             format: format.clone(),
             issuer: issuer.clone(),
             document,
             holder_key: proof.private_jwk,
         });
     }
-    Ok(issued)
+    Ok(bound)
 }
 
 /// The P-256 point a credential names as its holder, from `cnf.jwk` or from
@@ -431,7 +459,7 @@ fn jwk_point(jwk: &Json) -> Option<(Vec<u8>, Vec<u8>)> {
     }
 }
 
-fn json_ok(url: &str, fetched: Fetched, error_key: &str) -> Result<Json, RedeemError> {
+fn json_ok(url: &str, fetched: &Fetched, error_key: &str) -> Result<Json, RedeemError> {
     if !(200..300).contains(&fetched.status) {
         return Err(err(t_args(
             error_key,
@@ -689,8 +717,8 @@ mod tests {
         assert!(seen[2].2.contains("tx_code=12345"));
         assert!(!seen[2].2.contains("client_id"));
         assert_eq!(seen[3].0, "POST ");
-        assert!(seen[3].2.is_empty());
-        assert!(seen[2].3.is_empty());
+        assert_eq!(seen[3].2, "");
+        assert_eq!(seen[2].3, "");
         assert_eq!(seen[4].3, "access-1");
         let request = Json::parse(&seen[4].2).unwrap();
         assert_eq!(
@@ -714,9 +742,8 @@ mod tests {
     #[test]
     fn a_short_code_does_not_call_the_issuer() {
         let script = Script::new(vec![]);
-        let error = match redeem_with(&offer(), Some("12"), &script, 0) {
-            Err(error) => error,
-            Ok(_) => panic!("a short code must be refused before the issuer is called"),
+        let Err(error) = redeem_with(&offer(), Some("12"), &script, 0) else {
+            panic!("a short code must be refused before the issuer is called");
         };
         assert!(error.message.contains('5'), "{}", error.message);
         assert!(script.seen.lock().unwrap().is_empty());
@@ -732,9 +759,8 @@ mod tests {
                 body: r#"{"error":"invalid_grant","error_description":"The Transaction Code is not correct."}"#.to_string(),
             },
         ]);
-        let error = match redeem_with(&offer(), Some("00000"), &script, 0) {
-            Err(error) => error,
-            Ok(_) => panic!("the issuer error must be returned"),
+        let Err(error) = redeem_with(&offer(), Some("00000"), &script, 0) else {
+            panic!("the issuer error must be returned");
         };
         assert!(error.message.contains("invalid_grant"), "{}", error.message);
         assert!(error.message.contains("not correct"), "{}", error.message);
@@ -788,9 +814,8 @@ mod tests {
                 body: r#"{"transaction_id":"later"}"#.to_string(),
             },
         ]);
-        let error = match redeem_with(&offer(), Some("12345"), &script, 1) {
-            Err(error) => error,
-            Ok(_) => panic!("a deferred credential must not be stored"),
+        let Err(error) = redeem_with(&offer(), Some("12345"), &script, 1) else {
+            panic!("a deferred credential must not be stored");
         };
         assert!(error.message.contains("later"), "{}", error.message);
     }
@@ -1035,9 +1060,8 @@ mod tests {
             returned: 1,
             mismatch: true,
         };
-        let error = match redeem_with(&offer(), Some("12345"), &http, 1_700_000_000) {
-            Err(error) => error,
-            Ok(_) => panic!("an unmatched credential must not be stored"),
+        let Err(error) = redeem_with(&offer(), Some("12345"), &http, 1_700_000_000) else {
+            panic!("an unmatched credential must not be stored");
         };
         assert!(error.message.contains("not bound"), "{}", error.message);
     }

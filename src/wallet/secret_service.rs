@@ -23,6 +23,7 @@ pub struct SecretServiceKeyStore {
 
 impl SecretServiceKeyStore {
     /// The item the installed wallet uses.
+    #[must_use]
     pub fn wallet() -> Self {
         Self::new(KEY_SERVICE, KEY_USER)
     }
@@ -52,6 +53,11 @@ impl SecretServiceKeyStore {
     }
 
     /// Remove the item. Used by tests so a trial key is not left behind.
+    ///
+    /// # Errors
+    ///
+    /// The Secret Service is not running or refuses the delete. A missing item
+    /// is success.
     pub fn delete(&self) -> Result<(), KeyStoreError> {
         let user = self.user.clone();
         self.delete_user(&user)
@@ -65,8 +71,7 @@ impl SecretServiceKeyStore {
     fn delete_user(&self, user: &str) -> Result<(), KeyStoreError> {
         let entry = self.entry_for(user)?;
         match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(err) if secret_service_is_absent(&err) => Err(KeyStoreError::Unavailable),
             Err(err) => Err(KeyStoreError::Store(err.to_string())),
         }

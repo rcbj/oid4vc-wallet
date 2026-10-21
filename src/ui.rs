@@ -209,7 +209,7 @@ pub(super) fn run(uris: &[String], no_save: bool) -> Result<(), Failure> {
                 let ctx = cc.egui_ctx.clone();
                 incoming.set_wake(move || ctx.request_repaint());
             }
-            Ok(Box::new(WalletApp::new(uris, no_save, handoff)))
+            Ok(Box::new(WalletApp::new(&uris, no_save, handoff)))
         }),
     )
     .map_err(|err| {
@@ -228,9 +228,8 @@ enum SingleClaim {
 
 /// Claim the UI socket. A failure still opens a window, with no handoff.
 fn single_claim(uris: &[String]) -> SingleClaim {
-    let dir = match super::single::runtime_dir() {
-        Ok(dir) => dir,
-        Err(_) => return SingleClaim::Alone,
+    let Ok(dir) = super::single::runtime_dir() else {
+        return SingleClaim::Alone;
     };
     match super::single::claim_ui(&dir, uris) {
         Ok(super::single::Claim::HandedOff) => SingleClaim::HandedOff,
@@ -364,7 +363,7 @@ struct Recall {
 }
 
 impl WalletApp {
-    fn new(uris: Vec<String>, no_save: bool, handoff: Option<Incoming>) -> Self {
+    fn new(uris: &[String], no_save: bool, handoff: Option<Incoming>) -> Self {
         let mut app = Self {
             section: Section::Credentials,
             banner: None,
@@ -422,7 +421,7 @@ impl WalletApp {
         app.reload_subject();
         app.reload_credentials();
         app.reload_inbox();
-        app.apply_launch(&uris);
+        app.apply_launch(uris);
         app
     }
 
@@ -437,7 +436,7 @@ impl WalletApp {
         self.redeem = None;
         if !uris.is_empty() {
             let report = accept_all(uris, self.no_save, false);
-            self.accept_output = report.text.clone();
+            self.accept_output.clone_from(&report.text);
             if report.error {
                 self.fail(report.text);
             } else if let [uri] = uris {
@@ -524,7 +523,7 @@ impl WalletApp {
         let outcome = if allow {
             approve_presentation(prompt.pending, &self.credentials)
         } else {
-            refuse_presentation(prompt.pending)
+            refuse_presentation(&prompt.pending)
         };
         let stored = self.settle_present(&prompt.uri, outcome);
         if remember {
@@ -760,7 +759,7 @@ impl WalletApp {
             return;
         }
         let report = accept_all(std::slice::from_ref(&uri), self.no_save, self.accept_json);
-        self.accept_output = report.text.clone();
+        self.accept_output.clone_from(&report.text);
         if report.error {
             self.accept_parsed = None;
             self.fail(report.text);
@@ -880,11 +879,11 @@ impl WalletApp {
         };
         match result {
             Ok(text) => {
-                self.registration_log = text.clone();
+                self.registration_log.clone_from(&text);
                 self.note(text);
             }
             Err(err) => {
-                self.registration_log = err.message.clone();
+                self.registration_log.clone_from(&err.message);
                 self.fail(err.message);
             }
         }
@@ -1706,8 +1705,7 @@ impl WalletApp {
             .enrolled
             .iter()
             .find(|item| item.id != remove)
-            .map(|item| item.label.clone())
-            .unwrap_or_else(|| remove.clone());
+            .map_or_else(|| remove.clone(), |item| item.label.clone());
         wrapped(
             ui,
             t_args("wallet.ui.fido_replace_help", &[("keep", &keep)]),
@@ -1861,8 +1859,7 @@ impl WalletApp {
             .protection
             .as_ref()
             .and_then(|status| status.enrolled.iter().find(|item| item.id == remove))
-            .map(|item| item.label.clone())
-            .unwrap_or_else(|| remove.clone());
+            .map_or_else(|| remove.clone(), |item| item.label.clone());
         let mut pin = self.take_pin();
         let result = finish_replace(&remove, &pin);
         pin.zeroize();
@@ -2655,7 +2652,7 @@ impl WalletApp {
                 self.inbox_body.clear();
                 self.reload_inbox();
             }
-            Err(err) => self.fail(err.to_string()),
+            Err(err) => self.fail(err.clone()),
         }
     }
 }
@@ -3283,7 +3280,10 @@ mod tests {
         assert_eq!(ids, ["a", "c"]);
         let all = super::credentials_for_export(&credentials, &checked, true);
         assert_eq!(all.len(), 3);
-        assert!(super::credentials_for_export(&credentials, &HashSet::new(), false).is_empty());
+        assert_eq!(
+            super::credentials_for_export(&credentials, &HashSet::new(), false),
+            [] as [oid4vc_wallet::wallet::Credential; 0]
+        );
         super::retain_export_checks(&mut checked, &credentials);
         assert!(checked.contains("a") && checked.contains("c"));
         assert!(!checked.contains("missing"));

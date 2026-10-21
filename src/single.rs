@@ -71,7 +71,10 @@ impl Incoming {
     /// Ask the window to repaint after the next handoff. Replaces any
     /// previous hook. The hook runs on the accept thread.
     pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
-        *self.wake.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::new(wake));
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(wake));
     }
 
     pub fn try_recv(&self) -> Result<Vec<String>, TryRecvError> {
@@ -308,7 +311,7 @@ fn start_incoming(listener: UnixListener) -> io::Result<Incoming> {
     let (tx, rx) = mpsc::channel();
     let thread = thread::Builder::new()
         .name("oid4vc-ui-socket".to_string())
-        .spawn(move || accept_loop(thread_listener, stop_read, thread_wake, tx))?;
+        .spawn(move || accept_loop(&thread_listener, &stop_read, &thread_wake, &tx))?;
     Ok(Incoming {
         listener: Some(listener),
         rx,
@@ -319,13 +322,13 @@ fn start_incoming(listener: UnixListener) -> io::Result<Incoming> {
 }
 
 fn accept_loop(
-    listener: Arc<UnixListener>,
-    stop: UnixStream,
-    wake: Arc<Mutex<Option<Wake>>>,
-    tx: Sender<Vec<String>>,
+    listener: &UnixListener,
+    stop: &UnixStream,
+    wake: &Mutex<Option<Wake>>,
+    tx: &Sender<Vec<String>>,
 ) {
     loop {
-        match accept_ready(&listener, &stop) {
+        match accept_ready(listener, stop) {
             Ok(false) | Err(_) => break,
             Ok(true) => match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -339,7 +342,7 @@ fn accept_loop(
                         break;
                     }
                     let _ = write_ok(&mut stream);
-                    fire_wake(&wake);
+                    fire_wake(wake);
                 }
                 Err(err)
                     if err.kind() == io::ErrorKind::WouldBlock
@@ -427,7 +430,7 @@ fn read_line_capped(reader: &mut impl BufRead, max: usize) -> io::Result<Vec<u8>
             return Ok(buf);
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
-        let take = newline.map(|pos| pos + 1).unwrap_or(available.len());
+        let take = newline.map_or(available.len(), |pos| pos + 1);
         if buf.len().saturating_add(take) > max {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -449,7 +452,10 @@ fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
 }
 
 fn fire_wake(wake: &Mutex<Option<Wake>>) {
-    let wake = wake.lock().unwrap_or_else(|err| err.into_inner()).clone();
+    let wake = wake
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     if let Some(wake) = wake {
         wake();
     }
@@ -505,10 +511,10 @@ mod tests {
             Claim::HandedOff => {}
             Claim::Primary(_) => panic!("an empty claim should hand off"),
         }
-        assert!(incoming
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            incoming.recv_timeout(Duration::from_secs(2)).unwrap(),
+            [] as [std::string::String; 0]
+        );
         assert!(socket_present(&dir.path().join("ui.sock")).unwrap());
         let pid = fs::read_to_string(dir.path().join("ui.lock")).unwrap();
         assert_eq!(pid.trim(), std::process::id().to_string());

@@ -20,6 +20,10 @@ pub struct StoredAnchor {
 }
 
 /// `$XDG_CONFIG_HOME/oid4vc-wallet/trust-anchors`.
+///
+/// # Errors
+///
+/// The configuration directory cannot be found.
 pub fn default_dir() -> Result<PathBuf, String> {
     Ok(crate::xdg::config_home()?
         .join("oid4vc-wallet")
@@ -36,7 +40,7 @@ pub(crate) fn anchor_ders(dir: &Path) -> Vec<Vec<u8>> {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if !name.ends_with(".der") {
+        if Path::new(&name).extension().is_none_or(|ext| ext != "der") {
             continue;
         }
         let Ok(bytes) = fs::read(entry.path()) else {
@@ -51,6 +55,7 @@ pub(crate) fn anchor_ders(dir: &Path) -> Vec<Vec<u8>> {
 }
 
 /// Name and fingerprint of each certificate in `dir`.
+#[must_use]
 pub fn list(dir: &Path) -> Vec<StoredAnchor> {
     anchor_ders(dir)
         .into_iter()
@@ -67,6 +72,11 @@ pub fn list(dir: &Path) -> Vec<StoredAnchor> {
 /// Store every certificate in a PEM document or a DER body.
 ///
 /// A blank document and a document with no certificate are different errors.
+///
+/// # Errors
+///
+/// `text` is blank, holds no certificate this wallet can parse, or a
+/// certificate cannot be written to `dir`.
 pub fn install_pem(dir: &Path, text: &str) -> Result<usize, String> {
     if text.trim().is_empty() {
         return Err(crate::i18n::t("wallet.anchor.empty"));
@@ -86,6 +96,11 @@ pub fn install_pem(dir: &Path, text: &str) -> Result<usize, String> {
 }
 
 /// Remove the certificate whose subject-key fingerprint is `fingerprint`.
+///
+/// # Errors
+///
+/// `fingerprint` is not a hex SHA-256, no certificate with it is stored, or the
+/// file cannot be removed.
 pub fn remove(dir: &Path, fingerprint: &str) -> Result<(), String> {
     if !is_fingerprint(fingerprint) {
         return Err(crate::i18n::t("wallet.anchor.invalid"));

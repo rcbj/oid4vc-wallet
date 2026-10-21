@@ -32,6 +32,10 @@ impl std::fmt::Display for PercentError {
 impl std::error::Error for PercentError {}
 
 /// Decode a query component. `+` becomes a space.
+///
+/// # Errors
+///
+/// A `%` is not followed by two hex digits, or the decoded bytes are not UTF-8.
 pub fn form_decode(input: &str) -> Result<String, PercentError> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -67,6 +71,7 @@ pub fn form_decode(input: &str) -> Result<String, PercentError> {
 
 /// Encode the way JavaScript `encodeURIComponent` does, so tests can build
 /// the same URIs iya-sts builds.
+#[must_use]
 pub fn encode_uri_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {

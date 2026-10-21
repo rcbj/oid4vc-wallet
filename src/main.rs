@@ -172,16 +172,17 @@ fn activate_language() -> Result<(), Failure> {
                 1,
             ));
         }
-        LangPeek::Value(raw) => match i18n::canonical_offered(&raw) {
-            Some(tag) => i18n::set_active(Some(tag), preferences),
-            None => {
+        LangPeek::Value(raw) => {
+            if let Some(tag) = i18n::canonical_offered(&raw) {
+                i18n::set_active(Some(tag), preferences);
+            } else {
                 i18n::set_active(None, preferences);
                 return Err(fail(
                     t_args("wallet.cli.language_unknown", &[("tag", &raw)]),
                     1,
                 ));
             }
-        },
+        }
     }
     Ok(())
 }

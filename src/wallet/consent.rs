@@ -13,6 +13,10 @@ use std::path::{Path, PathBuf};
 use crate::i18n::{t, t_args};
 
 /// `$XDG_CONFIG_HOME/oid4vc-wallet/presentation-approvals`.
+///
+/// # Errors
+///
+/// The configuration directory cannot be found.
 pub fn default_path() -> Result<PathBuf, String> {
     Ok(crate::xdg::config_home()?
         .join("oid4vc-wallet")
@@ -31,6 +35,11 @@ pub fn approved_ids(path: &Path) -> Vec<String> {
 }
 
 /// Remember that `id` may be presented again without a prompt.
+///
+/// # Errors
+///
+/// `id` is not a credential id, or the approvals file cannot be read or
+/// written.
 pub fn remember(path: &Path, id: &str) -> Result<(), String> {
     if !valid_id(id) {
         return Err(t("wallet.consent.bad_id"));
@@ -123,7 +132,7 @@ mod tests {
         let path = root.join("presentation-approvals");
         let kept = "0123456789abcdef0123456789abcdef";
         let other = "fedcba9876543210fedcba9876543210";
-        assert!(approved_ids(&path).is_empty());
+        assert_eq!(approved_ids(&path), Vec::<String>::new());
         remember(&path, kept).unwrap();
         assert_eq!(approved_ids(&path), vec![kept.to_string()]);
         assert!(!approved_ids(&path).iter().any(|id| id == other));

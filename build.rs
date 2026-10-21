@@ -6,6 +6,7 @@
 //! `YYYYMMDDHHMMSS` unless `BUILD_NUMBER` names one. It is stamped here so a
 //! restarted window reports the build that was made, not a new number.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -17,10 +18,10 @@ fn main() {
     let locales = Path::new(&manifest).join("locales");
     println!("cargo:rerun-if-changed={}", locales.display());
     let mut out = String::new();
-    out.push_str(&format!(
-        "pub const INDEX_JSON: &str = include_str!(r\"{}/locales/catalogs.json\");\n",
-        manifest
-    ));
+    let _ = writeln!(
+        out,
+        "pub const INDEX_JSON: &str = include_str!(r\"{manifest}/locales/catalogs.json\");"
+    );
     out.push_str("pub fn catalog_json(namespace: &str, tag: &str) -> Option<&'static str> {\n");
     out.push_str("    match (namespace, tag) {\n");
     let entries = fs::read_dir(&locales).expect("locales directory");
@@ -38,10 +39,11 @@ fn main() {
                 continue;
             };
             println!("cargo:rerun-if-changed={}", file.path().display());
-            out.push_str(&format!(
-                "        (\"{ns}\", \"{tag}\") => Some(include_str!(r\"{path}\")),\n",
+            let _ = writeln!(
+                out,
+                "        (\"{ns}\", \"{tag}\") => Some(include_str!(r\"{path}\")),",
                 path = file.path().display()
-            ));
+            );
         }
     }
     out.push_str("        _ => None,\n    }\n}\n");
@@ -61,8 +63,7 @@ fn stamp_version(manifest: &str) {
     let major_minor = major_minor(manifest);
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let stamp = utc_stamp(secs);
     let build = match std::env::var("BUILD_NUMBER") {
         Ok(value) if printable(value.trim()) => value.trim().to_string(),
@@ -126,7 +127,7 @@ fn printable(value: &str) -> bool {
 }
 
 fn utc_stamp(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
+    let days = i64::try_from(secs / 86_400).expect("u64 seconds in days fits in i64");
     let rem = secs % 86_400;
     // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm),
     // because the build script has no date crate and should not gain one.

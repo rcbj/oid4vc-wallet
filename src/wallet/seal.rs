@@ -21,6 +21,7 @@ pub struct Aes256Key([u8; KEY_LEN]);
 
 impl Aes256Key {
     /// Draw a new key from the operating system's random source.
+    #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0u8; KEY_LEN];
         OsRng.fill_bytes(&mut bytes);
@@ -29,10 +30,12 @@ impl Aes256Key {
 
     /// Wrap 32 bytes that already exist, usually the bytes just read from
     /// the credential store.
+    #[must_use]
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
         Self(bytes)
     }
 
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
         &self.0
     }

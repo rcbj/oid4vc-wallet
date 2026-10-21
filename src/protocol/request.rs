@@ -23,6 +23,7 @@ pub enum RequestScheme {
 }
 
 impl RequestScheme {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SiopV2 => "siopv2",
@@ -31,6 +32,7 @@ impl RequestScheme {
         }
     }
 
+    #[must_use]
     pub fn parse(scheme: &str) -> Option<Self> {
         match scheme {
             "siopv2" => Some(Self::SiopV2),
@@ -71,6 +73,7 @@ pub struct AuthorizationRequest {
 }
 
 impl AuthorizationRequest {
+    #[must_use]
     pub fn by_reference(&self) -> bool {
         self.request_uri.is_some()
     }
@@ -94,6 +97,11 @@ impl std::error::Error for RequestError {}
 
 /// Read the request from the query of a `siopv2://`, `openid4vp://` or
 /// `haip-vp://` URI.
+///
+/// # Errors
+///
+/// A parameter is repeated, a required parameter is missing, or a value is not
+/// one this wallet accepts.
 pub fn from_query(
     scheme: RequestScheme,
     params: &[QueryParam],
@@ -205,7 +213,7 @@ fn require_token(value: &str, field: &str) -> Result<String, RequestError> {
 /// `openid`).
 fn require_text(value: &str, field: &str) -> Result<String, RequestError> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
         return Err(tra("wallet.request.text", &[("field", field)]));
     }
     Ok(trimmed.to_string())

@@ -46,11 +46,13 @@ impl Translator {
     }
 
     /// `namespace.key`, with the parameters the message names.
+    #[must_use]
     pub fn text(&self, key: &str) -> String {
         self.text_args(key, &[])
     }
 
     /// `namespace.key`. A value is inserted as itself.
+    #[must_use]
     pub fn text_args(&self, key: &str, args: &[(&str, &str)]) -> String {
         if is_loading() {
             return key.to_string();
@@ -135,6 +137,7 @@ fn catalogs() -> &'static CatalogSet {
 }
 
 /// The message for `namespace.key` in the active language.
+#[must_use]
 pub fn t(key: &str) -> String {
     if is_loading() {
         return key.to_string();
@@ -143,6 +146,7 @@ pub fn t(key: &str) -> String {
 }
 
 /// The message for `namespace.key`, with parameters.
+#[must_use]
 pub fn t_args(key: &str, args: &[(&str, &str)]) -> String {
     if is_loading() {
         return key.to_string();
@@ -151,6 +155,7 @@ pub fn t_args(key: &str, args: &[(&str, &str)]) -> String {
 }
 
 /// The active translator.
+#[must_use]
 pub fn current() -> Translator {
     ACTIVE.with(|active| active.borrow().translator.clone())
 }
@@ -194,16 +199,19 @@ pub fn with_ui_locales<R>(locales: &[String], body: impl FnOnce() -> R) -> R {
 }
 
 /// The first preference a shipped catalog answers.
+#[must_use]
 pub fn negotiate(preferences: &[String], last_resort: &str) -> Translator {
     Translator::from_negotiated(match_tags(preferences, last_resort, &catalogs().parts))
 }
 
 /// The catalog chain for one tag.
+#[must_use]
 pub fn negotiate_tag(tag: &str) -> Translator {
     negotiate(&[tag.to_string()], "en")
 }
 
 /// `tag` when it is one the chooser offers, after canonicalisation.
+#[must_use]
 pub fn canonical_offered(tag: &str) -> Option<String> {
     let tag = canonical(tag);
     if tag.is_empty() {
@@ -217,11 +225,13 @@ pub fn canonical_offered(tag: &str) -> Option<String> {
 }
 
 /// The locales a person can switch to, in chooser order.
+#[must_use]
 pub fn offered() -> Vec<catalog::Offered> {
     catalogs().offered.clone()
 }
 
 /// The locale's own name. An offered tag uses the chooser name.
+#[must_use]
 pub fn endonym(tag: &str) -> String {
     let tag = canonical(tag);
     if let Some(offered) = catalogs().offered.iter().find(|offered| offered.tag == tag) {
@@ -238,6 +248,7 @@ pub fn endonym(tag: &str) -> String {
 
 /// The offered tag the chooser would mark: the exact tag, or else the first
 /// offered locale that reads the same catalog.
+#[must_use]
 pub fn selected_offered() -> Option<String> {
     let translator = current();
     let offered = catalogs().offered.clone();
@@ -257,6 +268,7 @@ pub fn selected_offered() -> Option<String> {
 }
 
 /// `LANGUAGE`, then `LC_ALL`, `LC_MESSAGES`, and `LANG`.
+#[must_use]
 pub fn system_tags() -> Vec<String> {
     tags_from_environment(
         nonempty("LANGUAGE").as_deref(),
@@ -271,6 +283,7 @@ fn nonempty(var: &str) -> Option<String> {
 }
 
 /// The same order as [`system_tags`], from values the caller supplies.
+#[must_use]
 pub fn tags_from_environment(
     language: Option<&str>,
     lc_all: Option<&str>,
@@ -316,12 +329,18 @@ fn environment_tag(raw: &str) -> Option<String> {
 }
 
 /// The saved tag, when the file holds one.
+#[must_use]
 pub fn saved_tag() -> Option<String> {
     let path = preference::language_path().ok()?;
     preference::read_tag(&path)
 }
 
 /// Remember `tag`. It has to be a locale the chooser offers.
+///
+/// # Errors
+///
+/// `tag` is not an offered locale, the configuration directory cannot be found,
+/// or the language file cannot be written.
 pub fn store_tag(tag: &str) -> Result<(), String> {
     let Some(tag) = canonical_offered(tag) else {
         return Err(t_args("wallet.cli.language_unknown", &[("tag", tag)]));
@@ -331,12 +350,18 @@ pub fn store_tag(tag: &str) -> Result<(), String> {
 }
 
 /// Forget the saved tag. The session language is used afterwards.
+///
+/// # Errors
+///
+/// The configuration directory cannot be found, or the language file cannot be
+/// removed. A missing file is not an error.
 pub fn clear_tag() -> Result<(), String> {
     let path = preference::language_path()?;
     preference::remove_tag(&path)
 }
 
 /// `Name`, `GenericName`, and `Comment` for every offered locale.
+#[must_use]
 pub fn desktop_translations() -> Vec<DesktopString> {
     catalogs()
         .offered
@@ -530,7 +555,10 @@ mod tests {
                 "sv-SE".to_string()
             ]
         );
-        assert!(tags_from_environment(Some(""), Some(""), None, Some("C.UTF-8")).is_empty());
+        assert_eq!(
+            tags_from_environment(Some(""), Some(""), None, Some("C.UTF-8")),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -575,13 +603,13 @@ mod tests {
 
     #[test]
     fn the_language_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
             "oid4vc-wallet-lang-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
         let path = root.join("language");
-        use std::os::unix::fs::PermissionsExt;
         preference::write_tag(&path, "fr-FR").unwrap();
         assert_eq!(preference::read_tag(&path).as_deref(), Some("fr-FR"));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

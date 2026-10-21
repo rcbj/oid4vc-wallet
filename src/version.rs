@@ -32,7 +32,7 @@ mod tests {
     #[test]
     fn version_is_major_minor_then_build() {
         assert_eq!(VERSION, format!("{MAJOR_MINOR}.{BUILD}"));
-        assert!(!BUILD.is_empty());
+        assert_ne!(BUILD, "");
         assert_eq!(BUILT_AT.len(), "2026-10-20T14:32:05Z".len());
         assert!(BUILT_AT.ends_with('Z'));
     }

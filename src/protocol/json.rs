@@ -38,6 +38,10 @@ impl std::error::Error for JsonError {}
 
 impl Json {
     /// Parse one JSON value and refuse trailing text.
+    ///
+    /// # Errors
+    ///
+    /// `input` is not exactly one well-formed JSON value.
     pub fn parse(input: &str) -> Result<Self, JsonError> {
         let mut parser = Parser {
             bytes: input.as_bytes(),
@@ -53,6 +57,7 @@ impl Json {
     }
 
     /// The member named `key`, or the last one when the name is repeated.
+    #[must_use]
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Self::Object(members) => members
@@ -65,6 +70,7 @@ impl Json {
     }
 
     /// Names of the members, in order, including duplicates.
+    #[must_use]
     pub fn keys(&self) -> Vec<&str> {
         match self {
             Self::Object(members) => members.iter().map(|(name, _)| name.as_str()).collect(),
@@ -72,6 +78,7 @@ impl Json {
         }
     }
 
+    #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(text) => Some(text),
@@ -79,6 +86,7 @@ impl Json {
         }
     }
 
+    #[must_use]
     pub fn as_array(&self) -> Option<&[Json]> {
         match self {
             Self::Array(items) => Some(items),
@@ -86,6 +94,7 @@ impl Json {
         }
     }
 
+    #[must_use]
     pub fn as_object(&self) -> Option<&[(String, Json)]> {
         match self {
             Self::Object(members) => Some(members),
@@ -95,6 +104,7 @@ impl Json {
 
     /// The number when it is a base-10 integer with no exponent and no
     /// fraction, and it fits in `u64`.
+    #[must_use]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Number(literal) => parse_u64_literal(literal),
@@ -169,7 +179,7 @@ struct Parser<'a> {
     index: usize,
 }
 
-impl<'a> Parser<'a> {
+impl Parser<'_> {
     fn error(&self, message: impl Into<String>) -> JsonError {
         JsonError {
             at: self.index,
@@ -207,7 +217,7 @@ impl<'a> Parser<'a> {
             Some(b'"') => Ok(Json::String(self.string()?)),
             Some(b'[') => self.array(),
             Some(b'{') => self.object(),
-            Some(b'-') | Some(b'0'..=b'9') => self.number(),
+            Some(b'-' | b'0'..=b'9') => self.number(),
             Some(_) => Err(self.error(crate::i18n::t("wallet.json.expected_value"))),
             None => Err(self.error(crate::i18n::t("wallet.json.unexpected_end"))),
         }
@@ -376,27 +386,26 @@ impl<'a> Parser<'a> {
 
     fn unicode_escape(&mut self) -> Result<char, JsonError> {
         let unit = self.hex4()?;
-        let ch = match char::from_u32(unit) {
-            Some(ch) => ch,
-            None => {
-                if !(0xD800..=0xDBFF).contains(&unit) {
-                    return Err(self.error(crate::i18n::t("wallet.json.unicode")));
-                }
-                if self.peek() != Some(b'\\') {
-                    return Err(self.error(crate::i18n::t("wallet.json.lone_surrogate")));
-                }
-                self.index += 1;
-                if self.bump()? != b'u' {
-                    return Err(self.error(crate::i18n::t("wallet.json.lone_surrogate")));
-                }
-                let low = self.hex4()?;
-                if !(0xDC00..=0xDFFF).contains(&low) {
-                    return Err(self.error(crate::i18n::t("wallet.json.surrogate_pair")));
-                }
-                let point = 0x10000 + (((unit - 0xD800) << 10) | (low - 0xDC00));
-                char::from_u32(point)
-                    .ok_or_else(|| self.error(crate::i18n::t("wallet.json.surrogate_pair")))?
+        let ch = if let Some(ch) = char::from_u32(unit) {
+            ch
+        } else {
+            if !(0xD800..=0xDBFF).contains(&unit) {
+                return Err(self.error(crate::i18n::t("wallet.json.unicode")));
             }
+            if self.peek() != Some(b'\\') {
+                return Err(self.error(crate::i18n::t("wallet.json.lone_surrogate")));
+            }
+            self.index += 1;
+            if self.bump()? != b'u' {
+                return Err(self.error(crate::i18n::t("wallet.json.lone_surrogate")));
+            }
+            let low = self.hex4()?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return Err(self.error(crate::i18n::t("wallet.json.surrogate_pair")));
+            }
+            let point = 0x10000 + (((unit - 0xD800) << 10) | (low - 0xDC00));
+            char::from_u32(point)
+                .ok_or_else(|| self.error(crate::i18n::t("wallet.json.surrogate_pair")))?
         };
         Ok(ch)
     }
@@ -463,7 +472,7 @@ mod tests {
             Some("😀")
         );
         assert!(Json::parse(r#"{"a":1,}"#).is_err());
-        assert!(Json::parse(r#"[1,]"#).is_err());
+        assert!(Json::parse(r"[1,]").is_err());
         assert!(Json::parse("01").is_err());
         assert!(Json::parse(r#""\uD800""#).is_err());
         assert!(Json::parse("{\"a\":1} true").is_err());

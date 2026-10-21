@@ -124,6 +124,7 @@ pub(crate) fn supported(alg: &str) -> bool {
 /// `proof.cryptosuite`, or with `proof.type` when the suite is absent.
 /// Several proofs keep each distinct name, in order. `None` means the
 /// document does not name an algorithm. The signature is not checked.
+#[must_use]
 pub fn signature_algorithm(format: &str, document: &str) -> Option<String> {
     let document = document.trim();
     if document.is_empty() {
@@ -753,6 +754,7 @@ enum Lattice {
     D87,
 }
 
+#[derive(Clone, Copy)]
 enum Prehash {
     Sha256,
     Sha512,
@@ -945,7 +947,7 @@ fn der_length(bytes: &[u8]) -> Option<(usize, usize)> {
         return None;
     }
     let mut len = 0usize;
-    for byte in &bytes[1..1 + count] {
+    for byte in &bytes[1..=count] {
         len = (len << 8) | *byte as usize;
     }
     Some((len, 1 + count))

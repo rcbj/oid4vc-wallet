@@ -123,7 +123,7 @@ impl Fido for HardwareFido {
     }
 }
 
-/// CTAP2_ERR_INVALID_CREDENTIAL (0x22). The crate has no named variant.
+/// `CTAP2_ERR_INVALID_CREDENTIAL` (0x22). The crate has no named variant.
 fn is_foreign(err: &ctap_fido2::error::Error) -> bool {
     matches!(
         err,
@@ -236,10 +236,11 @@ fn display_label(product: &str, id: &[u8]) -> String {
 }
 
 pub(super) fn fingerprint(id: &[u8]) -> String {
-    id.iter()
-        .take(4)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    use std::fmt::Write as _;
+    id.iter().take(4).fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
 }
 
 fn map_ctap(
@@ -265,9 +266,9 @@ fn map_ctap(
         ctap_fido2::error::Error::Ctap(CtapStatus::NoCredentials) => {
             plain("wallet.fido.not_enrolled")
         }
-        ctap_fido2::error::Error::Ctap(CtapStatus::ChannelBusy) => plain("wallet.fido.hid"),
+        ctap_fido2::error::Error::Ctap(CtapStatus::ChannelBusy)
+        | ctap_fido2::error::Error::Hid(_) => plain("wallet.fido.hid"),
         ctap_fido2::error::Error::MissingExtension(_) => plain("wallet.fido.no_extension"),
-        ctap_fido2::error::Error::Hid(_) => plain("wallet.fido.hid"),
         other => plain_args("wallet.fido.device", &[("message", &other.to_string())]),
     }
 }
@@ -327,8 +328,7 @@ impl SoftwareFido {
     pub(super) fn credential_count(&self, device: u32) -> usize {
         self.devices
             .get(&device)
-            .map(|device| device.creds.len())
-            .unwrap_or(0)
+            .map_or(0, |device| device.creds.len())
     }
 
     pub(super) fn has_credential(&self, device: u32, id: &[u8]) -> bool {

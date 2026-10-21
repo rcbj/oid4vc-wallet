@@ -23,9 +23,8 @@ enum Kind {
 
 /// Format `template` for `locale`. `locale` chooses the plural category.
 pub fn format_message(template: &str, params: &[(&str, &str)], locale: &str) -> String {
-    let nodes = match parse(template) {
-        Ok(nodes) => nodes,
-        Err(()) => return template.to_string(),
+    let Ok(nodes) = parse(template) else {
+        return template.to_string();
     };
     let mut slots = Vec::new();
     let rendered = render(&nodes, params, locale, None, &mut slots);
@@ -47,18 +46,18 @@ pub fn plural_category(locale: &str, number: f64) -> &'static str {
         return "other";
     }
     let whole = number.fract() == 0.0;
-    let integer = number.trunc() as i64;
     match language(locale) {
         "zh" => "other",
         "fr" | "fil" => {
-            if whole && (integer == 0 || integer == 1) {
+            if whole && (0.0..=1.0).contains(&number) {
                 "one"
             } else {
                 "other"
             }
         }
         _ => {
-            if whole && integer == 1 {
+            // `whole`, so the only number in this range is 1.
+            if whole && (0.5..1.5).contains(&number) {
                 "one"
             } else {
                 "other"
@@ -128,7 +127,7 @@ fn parse_argument(template: &str, at: &mut usize) -> Result<Node, ()> {
     let Some(close) = close else {
         return Err(());
     };
-    if comma.is_none() || comma.is_some_and(|comma| comma > close) {
+    if comma.is_none_or(|comma| comma > close) {
         let name = template[*at + 1..close].trim();
         if !is_name(name) {
             return Err(());
@@ -284,13 +283,12 @@ fn param<'a>(params: &'a [(&str, &str)], name: &str) -> &'a str {
     params
         .iter()
         .find(|(key, _)| *key == name)
-        .map(|(_, value)| *value)
-        .unwrap_or("")
+        .map_or("", |(_, value)| *value)
 }
 
 fn number_text(number: f64) -> String {
     if number.is_finite() && number.fract() == 0.0 && number.abs() < 1e15 {
-        format!("{}", number as i64)
+        whole_text(number)
     } else if number.is_finite() {
         format!("{number}")
     } else {
@@ -300,10 +298,16 @@ fn number_text(number: f64) -> String {
 
 fn number_text_exact(number: f64) -> String {
     if number.is_finite() && number.fract() == 0.0 && number.abs() < 1e15 {
-        format!("{}", number as i64)
+        whole_text(number)
     } else {
         String::new()
     }
+}
+
+// Below 1e15 every whole f64 is exact, so `{:.0}` prints the integer.
+// Adding 0.0 turns -0 into 0, which is what the reader expects.
+fn whole_text(number: f64) -> String {
+    format!("{:.0}", number + 0.0)
 }
 
 fn strip_tags(text: &str) -> String {
@@ -311,8 +315,7 @@ fn strip_tags(text: &str) -> String {
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '<'
-            && (chars.peek() == Some(&'/')
-                || chars.peek().is_some_and(|next| next.is_ascii_alphabetic()))
+            && (chars.peek() == Some(&'/') || chars.peek().is_some_and(char::is_ascii_alphabetic))
         {
             for next in chars.by_ref() {
                 if next == '>' {

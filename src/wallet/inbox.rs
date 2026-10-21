@@ -25,17 +25,26 @@ impl Inbox {
     }
 
     /// `$XDG_DATA_HOME/oid4vc-wallet/inbox`.
+    ///
+    /// # Errors
+    ///
+    /// The data directory cannot be found.
     pub fn default_location() -> Result<Self, String> {
         Ok(Self::new(
             crate::xdg::data_home()?.join("oid4vc-wallet").join("inbox"),
         ))
     }
 
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// Write one invocation. The file name sorts by the time it was received.
+    ///
+    /// # Errors
+    ///
+    /// The inbox directory or the new file cannot be created or written.
     pub fn save(&self, uri: &str, summary: &str) -> io::Result<PathBuf> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -58,6 +67,10 @@ impl Inbox {
     }
 
     /// Stored invocations, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// The inbox directory exists and cannot be read.
     pub fn list(&self) -> io::Result<Vec<InboxEntry>> {
         if !self.root.exists() {
             return Ok(Vec::new());
@@ -73,7 +86,7 @@ impl Inbox {
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
-            if text.ends_with(".txt") && file_type.is_file() {
+            if Path::new(text).extension().is_some_and(|ext| ext == "txt") && file_type.is_file() {
                 names.push(text.to_string());
             }
         }
@@ -89,6 +102,11 @@ impl Inbox {
     /// Remove one inbox file. `path` contributes only its file name, and that
     /// name has to be a regular `.txt` file directly inside the inbox. A
     /// symlink is left in place.
+    ///
+    /// # Errors
+    ///
+    /// `path` does not name a regular `.txt` file directly inside the inbox, or
+    /// the file cannot be removed.
     pub fn delete(&self, path: &Path) -> io::Result<()> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             return Err(not_inbox_file());
@@ -111,7 +129,7 @@ impl Inbox {
 }
 
 fn inbox_file_name(name: &str) -> bool {
-    name.ends_with(".txt")
+    Path::new(name).extension().is_some_and(|ext| ext == "txt")
         && name.len() > 4
         && !name.starts_with('.')
         && !name.contains('/')
@@ -163,14 +181,16 @@ fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// `YYYYMMDDTHHMMSS.mmmZ` for a Unix timestamp in milliseconds.
 pub fn utc_stamp(unix_ms: u64) -> String {
     let secs = unix_ms / 1000;
     let millis = unix_ms % 1000;
-    let days = (secs / 86_400) as i64;
+    let days = i64::try_from(secs / 86_400).expect("u64 seconds in days fits in i64");
     let tod = secs % 86_400;
     let hour = tod / 3600;
     let minute = (tod % 3600) / 60;
@@ -181,18 +201,18 @@ pub fn utc_stamp(unix_ms: u64) -> String {
 
 /// Howard Hinnant's `civil_from_days`. `days` is the number of days since
 /// 1970-01-01. Returns `(year, month, day)`.
-fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let z = days_since_epoch + 719_468;
     let shifted = if z >= 0 { z } else { z - 146_096 };
     let era = shifted / 146_097;
-    let doe = (z - era * 146_097) as u64;
+    let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
+    let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = (if month <= 2 { y + 1 } else { y }) as i32;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
     (year, month, day)
 }
 

@@ -91,6 +91,11 @@ impl std::error::Error for ValidateError {}
 
 /// Check the stored credential. A self-issued issuer is checked against the
 /// key named in the credential. Any other issuer is checked on the network.
+///
+/// # Errors
+///
+/// The trust file has no location, or the credential cannot be checked or does
+/// not verify. The error names which.
 pub fn validate_stored(
     format: &str,
     issuer: &str,
@@ -113,6 +118,11 @@ pub fn validate_stored(
 }
 
 /// Remember that `fingerprint` is trusted for `issuer`.
+///
+/// # Errors
+///
+/// The configuration directory cannot be found, or the trusted-issuers file
+/// cannot be written.
 pub fn remember_trust(issuer: &str, fingerprint: &str) -> Result<(), ValidateError> {
     let path = trust::default_path().map_err(ValidateError::TrustWrite)?;
     trust::remember(&path, issuer, fingerprint).map_err(ValidateError::TrustWrite)
@@ -456,10 +466,11 @@ fn try_keys(
 
 fn compatible(alg: &str, key: &KeyMaterial) -> bool {
     match (alg, key) {
-        ("ES256", KeyMaterial::P256 { x, y }) => x.len() == 32 && y.len() == 32,
+        ("ES256", KeyMaterial::P256 { x, y }) | ("ES256K", KeyMaterial::K256 { x, y }) => {
+            x.len() == 32 && y.len() == 32
+        }
         ("ES384", KeyMaterial::P384 { x, y }) => x.len() == 48 && y.len() == 48,
         ("ES512", KeyMaterial::P521 { x, y }) => x.len() == 66 && y.len() == 66,
-        ("ES256K", KeyMaterial::K256 { x, y }) => x.len() == 32 && y.len() == 32,
         ("RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512", KeyMaterial::Rsa { n, e }) => {
             !n.is_empty() && !e.is_empty()
         }
@@ -549,8 +560,9 @@ fn url_host(url: &str) -> Option<String> {
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]
@@ -677,16 +689,14 @@ mod tests {
 
     fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
         let mut out = vec![tag];
-        let len = body.len();
+        let len = u16::try_from(body.len()).expect("test DER fits two length bytes");
+        let [high, low] = len.to_be_bytes();
         if len < 128 {
-            out.push(len as u8);
+            out.push(low);
         } else if len < 256 {
-            out.push(0x81);
-            out.push(len as u8);
+            out.extend_from_slice(&[0x81, low]);
         } else {
-            out.push(0x82);
-            out.push((len >> 8) as u8);
-            out.push((len & 0xff) as u8);
+            out.extend_from_slice(&[0x82, high, low]);
         }
         out.extend_from_slice(body);
         out
@@ -735,18 +745,18 @@ mod tests {
         } else {
             "A"
         };
-        broken.replace_range(at..at + 1, next);
+        broken.replace_range(at..=at, next);
         broken
     }
 
     fn check(
-        routes: Routes,
+        routes: &Routes,
         format: &str,
         issuer: &str,
         document: &str,
         trust_path: &std::path::Path,
     ) -> Result<Outcome, ValidateError> {
-        validate_with(format, issuer, document, &routes, trust_path, NOW)
+        validate_with(format, issuer, document, routes, trust_path, NOW)
     }
 
     #[test]
@@ -759,7 +769,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(url.clone(), http(&url, 200, body.as_bytes(), Vec::new()));
         let outcome = check(
-            Routes(map),
+            &Routes(map),
             "dc+sd-jwt",
             ISSUER,
             &document,
@@ -958,7 +968,7 @@ mod tests {
             http(&aia, 200, ca_cert.der().as_ref(), Vec::new()),
         );
         let outcome = check(
-            Routes(map),
+            &Routes(map),
             "jwt_vc_json",
             ISSUER,
             &document,
@@ -991,7 +1001,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(url.clone(), http(&url, 404, b"", Vec::new()));
         let outcome = check(
-            Routes(map),
+            &Routes(map),
             "dc+sd-jwt",
             ISSUER,
             &document,
@@ -1028,7 +1038,7 @@ mod tests {
             url.clone(),
             http(&url, 404, b"", vec![ca_cert.der().to_vec()]),
         );
-        let outcome = check(Routes(map), "dc+sd-jwt", ISSUER, &document, &trust).unwrap();
+        let outcome = check(&Routes(map), "dc+sd-jwt", ISSUER, &document, &trust).unwrap();
         match outcome {
             Outcome::Fallback(text) => {
                 assert!(text.contains("ES256"), "{text}");
@@ -1039,7 +1049,7 @@ mod tests {
         let mut plain = HashMap::new();
         plain.insert(url.clone(), http(&url, 404, b"", Vec::new()));
         let asked = check(
-            Routes(plain.clone()),
+            &Routes(plain.clone()),
             "dc+sd-jwt",
             ISSUER,
             &document,
@@ -1050,7 +1060,7 @@ mod tests {
             panic!("expected a prompt, got {asked:?}");
         };
         trust::remember(&trust, ISSUER, &fingerprint).unwrap();
-        let again = check(Routes(plain), "dc+sd-jwt", ISSUER, &document, &trust).unwrap();
+        let again = check(&Routes(plain), "dc+sd-jwt", ISSUER, &document, &trust).unwrap();
         match again {
             Outcome::Accepted(text) => assert!(text.contains(ISSUER), "{text}"),
             other => panic!("expected the saved trust decision, got {other:?}"),
@@ -1074,7 +1084,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(url, http(&meta(), 404, b"", Vec::new()));
         let outcome = check(
-            Routes(map),
+            &Routes(map),
             "dc+sd-jwt",
             ISSUER,
             &document,
@@ -1094,7 +1104,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(url.clone(), http(&url, 200, body.as_bytes(), Vec::new()));
         let outcome = check(
-            Routes(map),
+            &Routes(map),
             "dc+sd-jwt",
             ISSUER,
             &document,
@@ -1158,7 +1168,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(url.clone(), http(&url, 200, body.as_bytes(), Vec::new()));
         let outcome = check(
-            Routes(map),
+            &Routes(map),
             "dc+sd-jwt",
             ISSUER,
             &document,

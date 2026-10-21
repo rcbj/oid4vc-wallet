@@ -1,0 +1,20 @@
+# Protocol and product names that doc_markdown would otherwise ask to put
+# in backticks. ".." keeps clippy's default list.
+doc-valid-idents = [
+    "..",
+    "AppImage",
+    "EdDSA",
+    "FreeDesktop",
+    "KeePassXC",
+    "KWallet",
+    "OpenID",
+    "OpenID4VC",
+    "OpenID4VCI",
+    "OpenID4VP",
+    "SIOPv2",
+]
+
+# The command-line options, the window state, and a parsed presentation
+# request each hold independent switches. Folding them into enums would
+# invent states that do not exist.
+max-struct-bools = 11

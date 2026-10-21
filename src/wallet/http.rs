@@ -6,6 +6,7 @@
 //! process CA that the browser already trusts and the system store does not.
 //! Any other host still has to chain to a trusted CA.
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Once, OnceLock};
@@ -169,13 +170,13 @@ fn build_request(
         path = parts.path
     );
     if let Some(content_type) = content_type {
-        text.push_str(&format!("Content-Type: {content_type}\r\n"));
+        let _ = write!(text, "Content-Type: {content_type}\r\n");
     }
     if let Some(authorization) = authorization {
-        text.push_str(&format!("Authorization: Bearer {authorization}\r\n"));
+        let _ = write!(text, "Authorization: Bearer {authorization}\r\n");
     }
     if method != "GET" || !body.is_empty() {
-        text.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        let _ = write!(text, "Content-Length: {}\r\n", body.len());
     }
     text.push_str("\r\n");
     let mut bytes = text.into_bytes();
@@ -269,7 +270,7 @@ fn tls_config() -> Arc<ClientConfig> {
             roots.roots.extend(
                 webpki_roots::TLS_SERVER_ROOTS
                     .iter()
-                    .map(|anchor| anchor.to_owned()),
+                    .map(rustls::pki_types::TrustAnchor::to_owned),
             );
             let native = rustls_native_certs::load_native_certs();
             roots.add_parsable_certificates(native.certs);

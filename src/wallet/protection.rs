@@ -157,11 +157,21 @@ struct Work<'a, F, D> {
 }
 
 /// Read `$XDG_DATA_HOME/oid4vc-wallet/key-protection.json` and the cache.
+///
+/// # Errors
+///
+/// The protection file cannot be read or is malformed, or the session lock is
+/// poisoned.
 pub fn protection_status() -> Result<ProtectionStatus, KeyStoreError> {
-    with_global(|work| work.status())
+    with_global(|mut work| work.status())
 }
 
 /// True when a credential command must ask for a FIDO2 PIN before it can read.
+///
+/// # Errors
+///
+/// The protection file cannot be read or is malformed, or the session lock is
+/// poisoned.
 pub fn fido_locked() -> Result<bool, KeyStoreError> {
     let doc = read_doc(&default_path()?)?;
     if doc.mechanism != Mechanism::Fido {
@@ -173,44 +183,87 @@ pub fn fido_locked() -> Result<bool, KeyStoreError> {
 
 /// Enroll the one connected authenticator. The storage key stays in the key
 /// ring until [`activate_fido`]. The returned text is the label.
+///
+/// # Errors
+///
+/// The PIN is too short or too long, not exactly one authenticator is
+/// connected, it lacks `hmac-secret` or a PIN, it is already pending, two are
+/// already pending, the device refuses, or the protection file cannot be
+/// written.
 pub fn enroll_fido(pin: &str) -> Result<String, KeyStoreError> {
-    with_global(|work| work.enroll(pin))
+    with_global(|mut work| work.enroll(pin))
 }
 
 /// Wrap the storage key to the two enrolled authenticators and remove the desktop copy.
+///
+/// # Errors
+///
+/// Two authenticators are not pending, this process no longer holds both HMAC
+/// outputs, the desktop key cannot be read, or the protection file or the
+/// desktop delete fails.
 pub fn activate_fido() -> Result<(), KeyStoreError> {
-    with_global(|work| work.activate())
+    with_global(|mut work| work.activate())
 }
 
 /// Forget authenticators enrolled while the key ring is still in use.
+///
+/// # Errors
+///
+/// Security keys are already in use, or the protection file cannot be read or
+/// written.
 pub fn discard_pending() -> Result<(), KeyStoreError> {
-    with_global(|work| work.discard())
+    with_global(|mut work| work.discard())
 }
 
 /// Unwrap with one connected enrolled authenticator and cache the storage key.
+///
+/// # Errors
+///
+/// The PIN is refused, not exactly one authenticator is connected, it holds no
+/// enrolled credential, or the wrapped key does not open.
 pub fn unlock_fido(pin: &str) -> Result<(), KeyStoreError> {
-    with_global(|work| work.unlock(pin))
+    with_global(|mut work| work.unlock(pin))
 }
 
 /// Cache the HMAC output of the enrolled authenticator this session has not
 /// unlocked yet. The storage key is already unwrapped.
+///
+/// # Errors
+///
+/// Security keys are not in use, the storage key is not unwrapped, not exactly
+/// one authenticator is connected, or the connected one is already unlocked.
 pub fn unlock_other_fido(pin: &str) -> Result<(), KeyStoreError> {
-    with_global(|work| work.unlock_other(pin))
+    with_global(|mut work| work.unlock_other(pin))
 }
 
 /// Check the authenticator that will stay, before the other one is replaced.
 ///
 /// `remove_id` is the base64 credential id from [`ProtectionStatus`].
+///
+/// # Errors
+///
+/// The PIN is refused, not exactly one authenticator is connected, or it does
+/// not hold the credential that stays.
 pub fn begin_replace(remove_id: &str, staying_pin: &str) -> Result<(), KeyStoreError> {
-    with_global(|work| work.begin_replace(remove_id, staying_pin))
+    with_global(|mut work| work.begin_replace(remove_id, staying_pin))
 }
 
 /// Enroll the new authenticator and drop `remove_id` from the protection file.
+///
+/// # Errors
+///
+/// [`begin_replace`] was not called for `remove_id`, the protection file
+/// changed since, the connected authenticator is the one that stays, the device
+/// refuses, or the protection file cannot be written.
 pub fn finish_replace(remove_id: &str, pin: &str) -> Result<String, KeyStoreError> {
-    with_global(|work| work.finish_replace(remove_id, pin))
+    with_global(|mut work| work.finish_replace(remove_id, pin))
 }
 
 /// Stop a replacement without changing the enrolled authenticators.
+///
+/// # Errors
+///
+/// The protection file has no location, or the session lock is poisoned.
 pub fn cancel_replace() -> Result<(), KeyStoreError> {
     with_global(|work| {
         work.session.replacing = None;
@@ -220,8 +273,14 @@ pub fn cancel_replace() -> Result<(), KeyStoreError> {
 
 /// Unwrap with an authenticator, store that key in the desktop key ring, and
 /// stop using the authenticators. The FIDO credentials stay on the devices.
+///
+/// # Errors
+///
+/// The PIN is refused, not exactly one enrolled authenticator is connected, the
+/// desktop store refuses the key or reads back something else, or the
+/// protection file cannot be written.
 pub fn switch_to_keyring(pin: &str) -> Result<(), KeyStoreError> {
-    with_global(|work| work.switch_to_keyring(pin))
+    with_global(|mut work| work.switch_to_keyring(pin))
 }
 
 pub(super) fn protects_with_fido() -> Result<bool, KeyStoreError> {
@@ -251,20 +310,22 @@ pub(super) fn rewrap_stored_retired(keys: &[RetiredKey]) -> Result<(), KeyStoreE
     rewrap_retired_at(&default_path()?, &mut session, keys)
 }
 
+// `body` takes the `Work` by value. With `&mut Work<'_, ..>` clippy asks for
+// `Work::status` in place of `|work| work.status()`, and a method path is
+// not general over the borrowed lifetime, so that suggestion does not compile.
 fn with_global<T>(
-    body: impl FnOnce(&mut Work<'_, HardwareFido, DesktopKeyStore>) -> Result<T, KeyStoreError>,
+    body: impl FnOnce(Work<'_, HardwareFido, DesktopKeyStore>) -> Result<T, KeyStoreError>,
 ) -> Result<T, KeyStoreError> {
     let mut session = lock_session()?;
     let path = default_path()?;
     let mut fido = HardwareFido;
     let desktop = DesktopKeyStore::wallet();
-    let mut work = Work {
+    body(Work {
         fido: &mut fido,
         desktop: &desktop,
         session: &mut session,
         path: &path,
-    };
-    body(&mut work)
+    })
 }
 
 fn lock_session() -> Result<MutexGuard<'static, Session>, KeyStoreError> {
@@ -336,7 +397,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
             return Err(plain("wallet.fido.pending_full"));
         }
         let enrollment = self.fido.enroll(pin)?;
-        let (pending, mut kek) = pending_of(enrollment);
+        let (pending, mut kek) = pending_of(&enrollment);
         let label = pending.label.clone();
         doc.pending.push(pending);
         doc.generation = match bump(doc.generation) {
@@ -453,7 +514,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
     fn unlock(&mut self, pin: &str) -> Result<(), KeyStoreError> {
         check_pin(pin)?;
         let doc = read_doc(self.path)?;
-        self.require_pair(&doc)?;
+        require_pair(&doc)?;
         let ids: Vec<Vec<u8>> = doc.keys.iter().map(|key| key.id.clone()).collect();
         let held = self
             .fido
@@ -479,7 +540,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
     fn unlock_other(&mut self, pin: &str) -> Result<(), KeyStoreError> {
         check_pin(pin)?;
         let doc = read_doc(self.path)?;
-        self.require_pair(&doc)?;
+        require_pair(&doc)?;
         if !cache_matches(self.session, &doc) {
             return Err(KeyStoreError::Locked);
         }
@@ -511,7 +572,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
         check_pin(pin)?;
         let remove = decode_id(remove_id)?;
         let doc = read_doc(self.path)?;
-        self.require_pair(&doc)?;
+        require_pair(&doc)?;
         if !doc.keys.iter().any(|key| key.id == remove) {
             return Err(plain("wallet.fido.not_enrolled"));
         }
@@ -542,7 +603,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
             return Err(plain("wallet.fido.always_two"));
         }
         let doc = read_doc(self.path)?;
-        self.require_pair(&doc)?;
+        require_pair(&doc)?;
         if !cache_matches(self.session, &doc) {
             forget_cache(self.session);
             return Err(KeyStoreError::Locked);
@@ -565,7 +626,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
             return Err(plain("wallet.fido.same"));
         }
         let enrollment = self.fido.enroll(pin)?;
-        let (pending, mut new_kek) = pending_of(enrollment);
+        let (pending, mut new_kek) = pending_of(&enrollment);
         let label = pending.label.clone();
         let dek = self.session.dek.clone().ok_or(KeyStoreError::Locked)?;
         let retired = self.session.retired.clone();
@@ -627,7 +688,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
     fn switch_to_keyring(&mut self, pin: &str) -> Result<(), KeyStoreError> {
         check_pin(pin)?;
         let doc = read_doc(self.path)?;
-        self.require_pair(&doc)?;
+        require_pair(&doc)?;
         let ids: Vec<Vec<u8>> = doc.keys.iter().map(|key| key.id.clone()).collect();
         let held = self
             .fido
@@ -701,17 +762,17 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
         let (dek, retired) = unbundle(opened)?;
         Ok((dek, retired, *kek))
     }
+}
 
-    fn require_pair(&self, doc: &Doc) -> Result<(), KeyStoreError> {
-        if doc.mechanism == Mechanism::Fido && doc.keys.len() == 2 {
-            Ok(())
-        } else {
-            Err(plain("wallet.fido.malformed"))
-        }
+fn require_pair(doc: &Doc) -> Result<(), KeyStoreError> {
+    if doc.mechanism == Mechanism::Fido && doc.keys.len() == 2 {
+        Ok(())
+    } else {
+        Err(plain("wallet.fido.malformed"))
     }
 }
 
-fn pending_of(enrollment: Enrollment) -> (Pending, [u8; 32]) {
+fn pending_of(enrollment: &Enrollment) -> (Pending, [u8; 32]) {
     let pending = Pending {
         id: enrollment.id.clone(),
         public_key: enrollment.public_key.clone(),
@@ -891,7 +952,7 @@ fn plain_args(key: &str, args: &[(&str, &str)]) -> KeyStoreError {
     KeyStoreError::Plain(crate::i18n::t_args(key, args))
 }
 
-fn file_err(err: io::Error) -> KeyStoreError {
+fn file_err(err: &io::Error) -> KeyStoreError {
     plain_args("wallet.fido.file", &[("error", &err.to_string())])
 }
 
@@ -907,7 +968,7 @@ fn read_doc(path: &Path) -> Result<Doc, KeyStoreError> {
     match fs::read_to_string(path) {
         Ok(text) => parse_doc(&text),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Doc::keyring()),
-        Err(err) => Err(file_err(err)),
+        Err(err) => Err(file_err(&err)),
     }
 }
 
@@ -1042,9 +1103,7 @@ fn required_label(value: &Json) -> Result<String, KeyStoreError> {
         .get("label")
         .and_then(Json::as_str)
         .ok_or_else(|| plain("wallet.fido.malformed"))?;
-    if label.is_empty()
-        || label.chars().count() > MAX_LABEL
-        || label.chars().any(|ch| ch.is_control())
+    if label.is_empty() || label.chars().count() > MAX_LABEL || label.chars().any(char::is_control)
     {
         return Err(plain("wallet.fido.malformed"));
     }
@@ -1131,8 +1190,9 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KeyStoreError> {
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true);
             builder.mode(0o700);
-            builder.create(parent).map_err(file_err)?;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(file_err)?;
+            builder.create(parent).map_err(|err| file_err(&err))?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|err| file_err(&err))?;
         }
     }
     let temporary = path.with_extension("json.new");
@@ -1143,12 +1203,14 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KeyStoreError> {
             .truncate(true)
             .mode(0o600)
             .open(&temporary)
-            .map_err(file_err)?;
-        file.write_all(bytes).map_err(file_err)?;
-        file.sync_all().map_err(file_err)?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).map_err(file_err)?;
-        fs::rename(&temporary, path).map_err(file_err)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(file_err)?;
+            .map_err(|err| file_err(&err))?;
+        file.write_all(bytes).map_err(|err| file_err(&err))?;
+        file.sync_all().map_err(|err| file_err(&err))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+            .map_err(|err| file_err(&err))?;
+        fs::rename(&temporary, path).map_err(|err| file_err(&err))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| file_err(&err))?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -1160,7 +1222,7 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KeyStoreError> {
 fn restore_bytes(path: &Path, previous: Option<&[u8]>) -> Result<(), KeyStoreError> {
     match previous {
         Some(bytes) => write_bytes(path, bytes),
-        None => fs::remove_file(path).map_err(file_err),
+        None => fs::remove_file(path).map_err(|err| file_err(&err)),
     }
 }
 
@@ -1589,9 +1651,8 @@ mod tests {
         let lab = Lab::new("fido-piv");
         fs::create_dir_all(lab.path.parent().unwrap()).unwrap();
         fs::write(&lab.path, "{\"mechanism\":\"yubikey\"}\n").unwrap();
-        let err = match read_doc(&lab.path) {
-            Err(err) => err,
-            Ok(_) => panic!("an old PIV file was opened"),
+        let Err(err) = read_doc(&lab.path) else {
+            panic!("an old PIV file was opened");
         };
         assert_eq!(err.to_string(), message("wallet.fido.retired_piv"));
     }

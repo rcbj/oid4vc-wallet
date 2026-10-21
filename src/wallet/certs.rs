@@ -56,6 +56,7 @@ pub(crate) enum Chain {
     Incomplete(Vec<OwnedCert>),
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum ChainFault {
     Bad,
     Name,
@@ -81,8 +82,7 @@ impl OwnedCert {
             .next()
             .and_then(|cn| cn.as_str().ok())
             .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| cert.subject().to_string());
+            .map_or_else(|| cert.subject().to_string(), str::to_string);
         Some(Self {
             subject_der: cert.subject().as_raw().to_vec(),
             issuer_der: cert.issuer().as_raw().to_vec(),
@@ -146,9 +146,8 @@ where
         if top.subject_der == top.issuer_der {
             return match link(top, &top.key, &top.sig_oid) {
                 // The root arrived inside the credential. It was not retrieved.
-                Link::Verified => Chain::Incomplete(certs),
+                Link::Verified | Link::Unknown => Chain::Incomplete(certs),
                 Link::Bad => Chain::Broken(ChainFault::Bad),
-                Link::Unknown => Chain::Incomplete(certs),
             };
         }
         let urls = top.aia.clone();
@@ -549,6 +548,7 @@ pub struct SignerCertificate {
 ///
 /// Reads the issuer JWS `x5c` header. A credential with no `x5c`, and an
 /// entry that is not a certificate, are omitted. Nothing is fetched.
+#[must_use]
 pub fn signer_certificates(document: &str) -> Vec<SignerCertificate> {
     jws::header_x5c(document)
         .into_iter()
@@ -675,10 +675,10 @@ fn identity_extension(values: &mut Vec<String>, parsed: &ParsedExtension<'_>) ->
         ParsedExtension::AuthorityKeyIdentifier(aki) => push_aki(values, aki),
         ParsedExtension::SubjectKeyIdentifier(id) => values.push(hex_bytes(id.0)),
         ParsedExtension::SubjectAlternativeName(names) => {
-            push_general_names(values, &names.general_names)
+            push_general_names(values, &names.general_names);
         }
         ParsedExtension::IssuerAlternativeName(names) => {
-            push_general_names(values, &names.general_names)
+            push_general_names(values, &names.general_names);
         }
         ParsedExtension::AuthorityInfoAccess(access) => push_access(values, &access.accessdescs),
         ParsedExtension::SubjectInfoAccess(access) => push_access(values, &access.accessdescs),
@@ -697,10 +697,10 @@ fn status_extension(values: &mut Vec<String>, parsed: &ParsedExtension<'_>) {
         ParsedExtension::KeyUsage(usage) => values.push(usage.to_string()),
         ParsedExtension::ExtendedKeyUsage(usage) => push_extended_usage(values, usage),
         ParsedExtension::BasicConstraints(constraints) => {
-            push_basic_constraints(values, constraints)
+            push_basic_constraints(values, constraints);
         }
         ParsedExtension::PolicyConstraints(constraints) => {
-            push_policy_constraints(values, constraints)
+            push_policy_constraints(values, constraints);
         }
         ParsedExtension::InhibitAnyPolicy(policy) => values.push(policy.skip_certs.to_string()),
         ParsedExtension::NSCertType(kind) => values.push(kind.to_string()),
@@ -709,9 +709,7 @@ fn status_extension(values: &mut Vec<String>, parsed: &ParsedExtension<'_>) {
         ParsedExtension::ReasonCode(code) => values.push(code.to_string()),
         ParsedExtension::InvalidityDate(when) => values.push(when.to_string()),
         ParsedExtension::SCT(timestamps) => push_timestamps(values, timestamps),
-        ParsedExtension::UnsupportedExtension { .. }
-        | ParsedExtension::ParseError { .. }
-        | ParsedExtension::Unparsed => {}
+        // Unsupported, unparsed, and unreadable extensions have no value to show.
         _ => {}
     }
 }
@@ -898,14 +896,16 @@ fn parameter_text(value: &asn1_rs::Any<'_>) -> String {
     if value.tag() == asn1_rs::Tag::Null {
         return "NULL".to_string();
     }
-    if value.tag() == asn1_rs::Tag::Oid && value.as_bytes().len() < 128 {
+    if value.tag() == asn1_rs::Tag::Oid {
         let content = value.as_bytes();
-        let mut encoded = Vec::with_capacity(content.len() + 2);
-        encoded.push(0x06);
-        encoded.push(content.len() as u8);
-        encoded.extend_from_slice(content);
-        if let Ok((_, oid)) = Oid::from_der(&encoded) {
-            return oid_label(&oid);
+        if let Ok(short @ 0..=127) = u8::try_from(content.len()) {
+            let mut encoded = Vec::with_capacity(content.len() + 2);
+            encoded.push(0x06);
+            encoded.push(short);
+            encoded.extend_from_slice(content);
+            if let Ok((_, oid)) = Oid::from_der(&encoded) {
+                return oid_label(&oid);
+            }
         }
     }
     format!("tag {} {}", value.tag().0, hex_bytes(value.as_bytes()))
@@ -921,8 +921,7 @@ fn oid_label(oid: &Oid<'_>) -> String {
 fn oid_short(oid: &Oid<'_>) -> String {
     oid_registry()
         .get(oid)
-        .map(|entry| entry.sn().to_string())
-        .unwrap_or_else(|| oid.to_id_string())
+        .map_or_else(|| oid.to_id_string(), |entry| entry.sn().to_string())
 }
 
 fn upper_hex(value: &impl std::fmt::UpperHex) -> String {
@@ -1059,26 +1058,26 @@ fn der_time(unix: i64) -> Vec<u8> {
 }
 
 /// Gregorian UTC date from a Unix time. Years before 1970 become 1970-01-01.
-fn civil_utc(unix: i64) -> (i32, u32, u32, u32, u32, u32) {
-    let secs = unix.max(0) as u64;
-    let days = (secs / 86_400) as i64;
+fn civil_utc(unix: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let secs = unix.max(0);
+    let days = secs / 86_400;
     let tod = secs % 86_400;
-    let hour = (tod / 3_600) as u32;
-    let minute = ((tod % 3_600) / 60) as u32;
-    let second = (tod % 60) as u32;
+    let hour = tod / 3_600;
+    let minute = (tod % 3_600) / 60;
+    let second = tod % 60;
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
+    let doe = z - era * 146_097;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe as i64 + era * 400;
+    let mut year = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
     if month <= 2 {
         year += 1;
     }
-    (year as i32, month, day, hour, minute, second)
+    (year, month, day, hour, minute, second)
 }
 
 fn der_unsigned(bytes: &[u8]) -> Vec<u8> {
@@ -1115,16 +1114,16 @@ fn der_explicit(number: u8, body: &[u8]) -> Vec<u8> {
 
 fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
-    let len = body.len();
-    if len < 128 {
-        out.push(len as u8);
-    } else if len < 256 {
-        out.push(0x81);
-        out.push(len as u8);
+    if let Ok(short @ 0..=127) = u8::try_from(body.len()) {
+        out.push(short);
     } else {
-        out.push(0x82);
-        out.push((len >> 8) as u8);
-        out.push((len & 0xff) as u8);
+        // Long form: the count of length bytes, then the length without
+        // leading zeros. A usize has at most eight bytes, so the count fits.
+        let bytes = body.len().to_be_bytes();
+        let skip = bytes.iter().take_while(|byte| **byte == 0).count();
+        let count = u8::try_from(bytes.len() - skip).unwrap_or(u8::MAX);
+        out.push(0x80 | count);
+        out.extend_from_slice(&bytes[skip..]);
     }
     out.extend_from_slice(body);
     out
@@ -1191,8 +1190,7 @@ mod tests {
         cert.fields
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
-            .unwrap_or("")
+            .map_or("", |(_, value)| value.as_str())
     }
 
     #[test]

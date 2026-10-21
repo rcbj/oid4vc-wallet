@@ -5,6 +5,7 @@
 ///
 /// This is the check the wallet applies before it is willing to remember an
 /// address. It does not resolve the name and it does not fetch it.
+#[must_use]
 pub fn is_http_url(value: &str) -> bool {
     let rest = value
         .strip_prefix("https://")

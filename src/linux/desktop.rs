@@ -10,6 +10,7 @@
 //! `haip-vci` and `haip-vp` are registered only when the install is asked for
 //! HAIP. The parser accepts them either way.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -55,6 +56,10 @@ pub struct Layout {
 impl Layout {
     /// Per-user install: `~/.local/bin`, `~/.local/share/applications`,
     /// `~/.config/mimeapps.list`.
+    ///
+    /// # Errors
+    ///
+    /// `HOME` is unset or empty, so the per-user directories have no location.
     pub fn user() -> Result<Self, String> {
         let home = crate::xdg::home()?;
         Ok(Self {
@@ -68,6 +73,7 @@ impl Layout {
     /// System install. The desktop file is discovered from
     /// `/usr/share/applications`. The default handlers are written to
     /// `/etc/xdg/mimeapps.list`, which is the spec's system `mimeapps.list`.
+    #[must_use]
     pub fn system() -> Self {
         Self {
             applications_dir: PathBuf::from("/usr/share/applications"),
@@ -120,6 +126,9 @@ impl std::error::Error for InstallError {}
 
 /// Runs a program. Tests pass a recorder; the real installer runs the command.
 pub trait CommandRunner {
+    /// # Errors
+    ///
+    /// The program cannot be started, or it exits with a failure status.
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), String>;
 }
 
@@ -147,6 +156,12 @@ impl CommandRunner for SystemRunner {
 
 /// Write the desktop file and the default-handler entries, then ask the
 /// desktop cache to reload.
+///
+/// # Errors
+///
+/// A directory, an icon, the desktop file, or `mimeapps.list` cannot be
+/// created, read, or written. A failed cache refresh is a warning in the
+/// report.
 pub fn install_handlers(
     layout: &Layout,
     schemes: &[&str],
@@ -186,6 +201,11 @@ pub fn install_handlers(
 }
 
 /// Remove this wallet's desktop file and its handler lines.
+///
+/// # Errors
+///
+/// The desktop file, an icon, the binary, or `mimeapps.list` cannot be read,
+/// rewritten, or removed.
 pub fn uninstall_handlers(
     layout: &Layout,
     runner: &mut dyn CommandRunner,
@@ -224,13 +244,14 @@ pub fn desktop_entry(binary: &Path, schemes: &[&str]) -> String {
     }
     let mut localized = String::new();
     for line in crate::i18n::desktop_translations() {
-        localized.push_str(&format!(
-            "Name[{locale}]={name}\nGenericName[{locale}]={generic}\nComment[{locale}]={comment}\n",
+        let _ = writeln!(
+            localized,
+            "Name[{locale}]={name}\nGenericName[{locale}]={generic}\nComment[{locale}]={comment}",
             locale = line.locale,
             name = line.name,
             generic = line.generic_name,
             comment = line.comment,
-        ));
+        );
     }
     format!(
         "[Desktop Entry]\n\
@@ -451,6 +472,7 @@ fn remove_if_present(path: &Path) -> Result<(), InstallError> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Upsert {
     /// The default handler is one desktop file.
     Replace,
@@ -525,7 +547,7 @@ impl Doc {
                 *line = match mode {
                     Upsert::Replace => format!("{key}={value}"),
                     Upsert::AppendDesktop => {
-                        let current = line.split_once('=').map(|(_, value)| value).unwrap_or("");
+                        let current = line.split_once('=').map_or("", |(_, value)| value);
                         format!(
                             "{key}={}",
                             append_desktop(current, value.trim_end_matches(';'))
@@ -550,10 +572,7 @@ impl Doc {
         };
         section.body.retain(|line| match line_key(line) {
             Some(key) if keys.iter().any(|wanted| wanted == key) => {
-                let value = line
-                    .split_once('=')
-                    .map(|(_, value)| value.trim())
-                    .unwrap_or("");
+                let value = line.split_once('=').map_or("", |(_, value)| value.trim());
                 value != desktop_name
             }
             _ => true,
@@ -578,7 +597,7 @@ impl Doc {
                 kept.push(line);
                 continue;
             }
-            let value = line.split_once('=').map(|(_, value)| value).unwrap_or("");
+            let value = line.split_once('=').map_or("", |(_, value)| value);
             let next = remove_desktop(value, desktop_name);
             if !next.is_empty() && next != ";" {
                 kept.push(format!("{key}={next}"));

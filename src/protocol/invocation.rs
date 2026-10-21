@@ -33,8 +33,17 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Parse a wallet invocation URI.
+///
+/// # Errors
+///
+/// `input` is not a URI, its scheme is not one this wallet handles, or its
+/// offer or request parameters are invalid.
 pub fn parse(input: &str) -> Result<Invocation, ParseError> {
     let uri = parse_uri(input).map_err(ParseError::Uri)?;
+    if let Some(scheme) = RequestScheme::parse(&uri.scheme) {
+        let request = from_query(scheme, &uri.query).map_err(|err| request_error(&err))?;
+        return Ok(Invocation::Presentation(Box::new(request)));
+    }
     match uri.scheme.as_str() {
         "openid-credential-offer" | "haip-vci" => {
             let offer = OfferPassing::from_query(&uri.query)
@@ -44,11 +53,6 @@ pub fn parse(input: &str) -> Result<Invocation, ParseError> {
                 offer,
             })
         }
-        "siopv2" | "openid4vp" | "haip-vp" => {
-            let scheme = RequestScheme::parse(&uri.scheme).expect("scheme was just matched");
-            let request = from_query(scheme, &uri.query).map_err(request_error)?;
-            Ok(Invocation::Presentation(Box::new(request)))
-        }
         other => Err(ParseError::Message(crate::i18n::t_args(
             "wallet.invocation.unknown_scheme",
             &[("scheme", other)],
@@ -56,12 +60,13 @@ pub fn parse(input: &str) -> Result<Invocation, ParseError> {
     }
 }
 
-fn request_error(err: RequestError) -> ParseError {
+fn request_error(err: &RequestError) -> ParseError {
     ParseError::Message(err.to_string())
 }
 
 /// `ui_locales` from a URI, when the query can be read. A URI that cannot be
 /// read leaves the caller's language alone.
+#[must_use]
 pub fn ui_locales_of_uri(uri: &str) -> Vec<String> {
     let Ok(parsed) = parse_uri(uri) else {
         return Vec::new();
@@ -78,6 +83,7 @@ pub fn ui_locales_of_uri(uri: &str) -> Vec<String> {
 }
 
 /// A short report for the terminal the desktop opens.
+#[must_use]
 pub fn summary(invocation: &Invocation) -> String {
     match invocation {
         Invocation::CredentialOffer { scheme, offer } => summarize_offer(scheme, offer),
@@ -86,6 +92,7 @@ pub fn summary(invocation: &Invocation) -> String {
 }
 
 /// The same report as one JSON object, for a harness.
+#[must_use]
 pub fn to_json(invocation: &Invocation) -> String {
     json_value(invocation).to_string()
 }
@@ -132,10 +139,10 @@ fn summarize_offer(scheme: &str, offer: &OfferPassing) -> String {
                         .input_mode
                         .clone()
                         .unwrap_or_else(|| crate::i18n::t("wallet.summary.unspecified"));
-                    let length = tx
-                        .length
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| crate::i18n::t("wallet.summary.unspecified"));
+                    let length = tx.length.map_or_else(
+                        || crate::i18n::t("wallet.summary.unspecified"),
+                        |n| n.to_string(),
+                    );
                     lines.push(line(
                         "wallet.summary.tx_code",
                         &[("mode", mode.as_str()), ("length", length.as_str())],

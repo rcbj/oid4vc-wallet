@@ -97,14 +97,8 @@ fn choose(procs: &[Proc], peers: &[u32], self_pid: u32, url: &str) -> Option<Lau
     }
     let (pid, _) = counts.into_iter().max_by(|left, right| {
         left.1.cmp(&right.1).then_with(|| {
-            let left_start = by_pid
-                .get(&left.0)
-                .map(|proc| proc.start)
-                .unwrap_or(u64::MAX);
-            let right_start = by_pid
-                .get(&right.0)
-                .map(|proc| proc.start)
-                .unwrap_or(u64::MAX);
+            let left_start = by_pid.get(&left.0).map_or(u64::MAX, |proc| proc.start);
+            let right_start = by_pid.get(&right.0).map_or(u64::MAX, |proc| proc.start);
             right_start.cmp(&left_start)
         })
     })?;
@@ -187,8 +181,7 @@ fn endpoint_of(url: &str) -> Option<Vec<SocketAddr>> {
         let (host, rest) = inner.split_once(']')?;
         let port = rest
             .strip_prefix(':')
-            .map(|text| text.parse().ok())
-            .unwrap_or(Some(default_port))?;
+            .map_or(Some(default_port), |text| text.parse().ok())?;
         (host.to_string(), port)
     } else if let Some((host, port)) = authority.rsplit_once(':') {
         if host.contains(':') {
@@ -344,7 +337,7 @@ fn process_table() -> Vec<Proc> {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let Some((ppid, start)) = read_stat(pid) else {
+        let Some((parent, start)) = read_stat(pid) else {
             continue;
         };
         let exe = fs::read_link(format!("/proc/{pid}/exe"))
@@ -362,7 +355,7 @@ fn process_table() -> Vec<Proc> {
             .unwrap_or_default();
         procs.push(Proc {
             pid,
-            ppid,
+            ppid: parent,
             exe,
             args,
             start,
@@ -389,10 +382,10 @@ fn stat_ppid_start(text: &str) -> Option<(u32, u64)> {
 mod tests {
     use super::*;
 
-    fn proc(pid: u32, ppid: u32, exe: &str, args: &[&str], start: u64) -> Proc {
+    fn proc(pid: u32, parent: u32, exe: &str, args: &[&str], start: u64) -> Proc {
         Proc {
             pid,
-            ppid,
+            ppid: parent,
             exe: exe.to_string(),
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
             start,

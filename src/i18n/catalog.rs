@@ -49,9 +49,10 @@ impl CatalogSet {
     pub fn load() -> Self {
         let index = parse_json(embedded::INDEX_JSON, "locales/catalogs.json");
         let source = require_string(&index, "source", "locales/catalogs.json");
-        if source != "en" {
-            panic!("locales/catalogs.json source is {source}, and this wallet's source is en");
-        }
+        assert!(
+            source == "en",
+            "locales/catalogs.json source is {source}, and this wallet's source is en"
+        );
         let mut catalogs = Vec::new();
         for entry in require_array(&index, "catalogs", "locales/catalogs.json") {
             let tag = require_string(entry, "tag", "catalogs");
@@ -84,12 +85,11 @@ impl CatalogSet {
                 let Some(message) = member.as_str() else {
                     panic!("locales/wallet/{}.json key {key} is not a string", meta.tag);
                 };
-                if super::format::placeholder_names(message).is_err() {
-                    panic!(
-                        "locales/wallet/{}.json key {key} is not a message this wallet can format",
-                        meta.tag
-                    );
-                }
+                assert!(
+                    super::format::placeholder_names(message).is_ok(),
+                    "locales/wallet/{}.json key {key} is not a message this wallet can format",
+                    meta.tag
+                );
                 map.insert(key.clone(), message.to_string());
             }
             messages.insert(("wallet".to_string(), meta.tag.clone()), map);
@@ -150,20 +150,16 @@ fn require_string(value: &Json, key: &str, what: &str) -> String {
         .get(key)
         .and_then(Json::as_str)
         .filter(|text| !text.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| panic!("{what} is missing {key}"))
+        .map_or_else(|| panic!("{what} is missing {key}"), str::to_string)
 }
 
 fn optional_string(value: &Json, key: &str, what: &str) -> Option<String> {
     match value.get(key) {
         None | Some(Json::Null) => None,
-        Some(other) => Some(
-            other
-                .as_str()
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| panic!("{what} has a {key} that is not a string")),
-        ),
+        Some(other) => Some(other.as_str().filter(|text| !text.is_empty()).map_or_else(
+            || panic!("{what} has a {key} that is not a string"),
+            str::to_string,
+        )),
     }
 }
 
