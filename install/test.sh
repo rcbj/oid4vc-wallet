@@ -2,7 +2,7 @@
 # Headless suite for this wallet. GitHub Actions runs this same script.
 #
 # The suite does not open a window. It also does not read or write this
-# user's wallet files, language choice, trust anchors, or desktop key store.
+# user's wallet files, language choice, trust anchors, desktop key store, or YubiKeys.
 # A temporary home is used for the whole run. The Secret Service and KWallet
 # live-bus checks skip, because this script does not connect to the session bus.
 #

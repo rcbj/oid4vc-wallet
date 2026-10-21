@@ -4,15 +4,19 @@
 //! That window lists credentials and runs the same operations as the
 //! command line. `install` registers that launch with the session.
 //! Credentials are sealed with AES-256-GCM. The key lives in GNOME Keyring,
-//! or in KWallet when the Secret Service is not running. Display text
+//! or in KWallet when the Secret Service is not running. Settings can wrap
+//! it to two YubiKeys instead, which needs pcscd. Display text
 //! follows the languages iya-sts ships. `--lang` and `language` choose one.
 
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
+
+use zeroize::Zeroize;
 
 use oid4vc_wallet::i18n::{self, t, t_args};
 use oid4vc_wallet::linux::{
@@ -21,7 +25,8 @@ use oid4vc_wallet::linux::{
 };
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Json};
 use oid4vc_wallet::wallet::{
-    accept, signature_algorithm, Credential, CredentialVault, Inbox, NewCredential,
+    accept, signature_algorithm, unlock_yubikey, yubikey_locked, Credential, CredentialVault,
+    Inbox, NewCredential,
 };
 
 mod browser;
@@ -782,7 +787,78 @@ fn handle(uris: &[String], options: &Options) -> Result<(), Failure> {
 }
 
 fn open_vault() -> Result<CredentialVault<oid4vc_wallet::wallet::DesktopKeyStore>, Failure> {
+    if yubikey_locked().map_err(|err| fail(err.to_string(), 1))? {
+        let mut pin = prompt_yubi_pin()?;
+        let unlocked = unlock_yubikey(&pin);
+        pin.zeroize();
+        unlocked.map_err(|err| fail(err.to_string(), 1))?;
+    }
     CredentialVault::open_default().map_err(|err| fail(err.to_string(), 1))
+}
+
+/// The PIN is read from the terminal, not stdin. Stdin may be the credential
+/// document. Echo is turned off so the PIN is not shown.
+fn prompt_yubi_pin() -> Result<String, Failure> {
+    let mut guard = EchoGuard::silence()?;
+    let pin = read_hidden_line(&guard.tty)?;
+    let _ = writeln!(guard.tty);
+    Ok(pin)
+}
+
+struct EchoGuard {
+    tty: std::fs::File,
+}
+
+impl EchoGuard {
+    fn silence() -> Result<Self, Failure> {
+        let tty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .map_err(|_| fail(t("wallet.yubi.tty"), 1))?;
+        let guard = Self { tty };
+        if !guard.stty("-echo") {
+            return Err(fail(t("wallet.yubi.tty"), 1));
+        }
+        Ok(guard)
+    }
+
+    fn stty(&self, arg: &str) -> bool {
+        let Ok(cloned) = self.tty.try_clone() else {
+            return false;
+        };
+        Command::new("stty")
+            .arg(arg)
+            .stdin(Stdio::from(cloned))
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        let _ = self.stty("echo");
+    }
+}
+
+fn read_hidden_line(tty: &std::fs::File) -> Result<String, Failure> {
+    let mut out = tty.try_clone().map_err(|_| fail(t("wallet.yubi.tty"), 1))?;
+    writeln!(out, "{}", t("wallet.yubi.prompt")).map_err(|_| fail(t("wallet.yubi.tty"), 1))?;
+    out.flush().map_err(|_| fail(t("wallet.yubi.tty"), 1))?;
+    let mut line = String::new();
+    let read = BufReader::new(tty.try_clone().map_err(|_| fail(t("wallet.yubi.tty"), 1))?)
+        .read_line(&mut line);
+    if read.is_err() {
+        line.zeroize();
+        return Err(fail(t("wallet.yubi.tty"), 1));
+    }
+    if line.ends_with('\n') {
+        line.pop();
+    }
+    if line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(line)
 }
 
 fn add_credential(options: &Options) -> Result<(), Failure> {

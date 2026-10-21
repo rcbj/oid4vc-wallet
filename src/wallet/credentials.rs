@@ -1,5 +1,6 @@
 //! Verifiable credentials sealed with the AES-256 key from GNOME Keyring
-//! or KWallet.
+//! or KWallet. Settings can instead wrap that key to two YubiKeys, and the
+//! process then needs a PIN before it can read. That path needs pcscd.
 //!
 //! Each credential is one file under the wallet's data directory. The file
 //! holds the nonce and the AES-256-GCM ciphertext. The format, the issuer,
@@ -566,6 +567,13 @@ impl std::fmt::Display for VaultError {
                 ],
             )),
         }
+    }
+}
+
+impl VaultError {
+    /// The storage key is wrapped to a YubiKey and has not been unwrapped.
+    pub fn is_locked(&self) -> bool {
+        matches!(self, Self::Key(err) if err.is_locked())
     }
 }
 

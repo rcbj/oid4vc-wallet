@@ -23,6 +23,7 @@ oid4vc-wallet --ui
 - [Approve a sign-in or a presentation](guide.md#present)
 - [Create a sign-in identity](guide.md#identity)
 - [Change the language, the registration, or the storage key](guide.md#settings)
+- [Keep the storage key on two YubiKeys](guide.md#security)
 - [Move credentials to another computer](guide.md#move)
 
 People who build or install the program use the repository README. This site is for using the wallet.

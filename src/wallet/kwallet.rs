@@ -129,16 +129,32 @@ impl KWalletKeyStore {
         result
     }
 
+    /// Remove the history entry, then the key entry.
+    ///
+    /// History goes first so removing the key does not drop the folder while
+    /// the other entry is still in it. A missing daemon is success. A closed
+    /// wallet on the quiet path is success and deletes nothing: that probe
+    /// does not show whether the key is there.
+    pub(super) fn delete_secrets(&self, prompt: Prompt) -> Result<(), KeyStoreError> {
+        let session = match Session::open(prompt) {
+            Ok(session) => session,
+            Err(Probe::Absent) => return Ok(()),
+            Err(Probe::Empty) if prompt == Prompt::Never => return Ok(()),
+            Err(Probe::Empty | Probe::Found(_)) => {
+                return Err(KeyStoreError::Store(crate::i18n::t(
+                    "wallet.keystore.kwallet_closed",
+                )))
+            }
+            Err(Probe::Failed(err)) => return Err(err),
+        };
+        session.remove(&self.folder, KEY_HISTORY_USER)?;
+        session.remove(&self.folder, &self.entry)
+    }
+
     /// Remove the entry and, when the folder is then empty, the folder.
     #[cfg(test)]
     fn delete(&self) -> Result<(), KeyStoreError> {
-        let session = match Session::open(Prompt::Never) {
-            Ok(session) => session,
-            Err(Probe::Absent | Probe::Empty) => return Ok(()),
-            Err(Probe::Failed(err)) => return Err(err),
-            Err(Probe::Found(_)) => return Ok(()),
-        };
-        session.remove(&self.folder, &self.entry)
+        self.delete_secrets(Prompt::Never)
     }
 
     /// True when a daemon is running and its network wallet is already open.
@@ -288,7 +304,6 @@ impl Session {
         Ok(())
     }
 
-    #[cfg(test)]
     fn remove(&self, folder: &str, entry: &str) -> Result<(), KeyStoreError> {
         let (has,): (bool,) = call(
             &self.conn,

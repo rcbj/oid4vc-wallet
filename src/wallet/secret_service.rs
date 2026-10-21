@@ -53,7 +53,17 @@ impl SecretServiceKeyStore {
 
     /// Remove the item. Used by tests so a trial key is not left behind.
     pub fn delete(&self) -> Result<(), KeyStoreError> {
-        let entry = self.entry()?;
+        let user = self.user.clone();
+        self.delete_user(&user)
+    }
+
+    /// Remove the retired-key item. A missing item is success.
+    pub(super) fn delete_retired(&self) -> Result<(), KeyStoreError> {
+        self.delete_user(KEY_HISTORY_USER)
+    }
+
+    fn delete_user(&self, user: &str) -> Result<(), KeyStoreError> {
+        let entry = self.entry_for(user)?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),

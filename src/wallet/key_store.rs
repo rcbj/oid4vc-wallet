@@ -7,6 +7,12 @@
 //! second key in KWallet while the first store might still hold the real one.
 //! The key is created the first time a credential is stored, and it is not
 //! written into the credential files.
+//!
+//! YubiKey protection is the other choice. The same key is wrapped to a key
+//! on each of two YubiKeys, and this store then returns the copy cached for
+//! the process. A locked cache is an error, so a second key is not created
+//! while those YubiKeys still hold the real one. That path needs pcscd, and
+//! building it needs libpcsclite.
 
 use zeroize::Zeroize;
 
@@ -200,6 +206,38 @@ impl DesktopKeyStore {
 
 impl EncryptionKeyStore for DesktopKeyStore {
     fn load_key(&self) -> Result<Option<Aes256Key>, KeyStoreError> {
+        if super::protection::protects_with_yubikey()? {
+            return Ok(Some(super::protection::cached_key()?));
+        }
+        self.load_desktop_key()
+    }
+
+    fn store_key(&self, key: &Aes256Key) -> Result<(), KeyStoreError> {
+        if super::protection::protects_with_yubikey()? {
+            return super::protection::rewrap_stored_key(key);
+        }
+        self.store_desktop_key(key)
+    }
+
+    fn load_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
+        if super::protection::protects_with_yubikey()? {
+            return super::protection::cached_retired();
+        }
+        self.load_desktop_retired()
+    }
+
+    fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
+        if super::protection::protects_with_yubikey()? {
+            return super::protection::rewrap_stored_retired(keys);
+        }
+        self.store_desktop_retired(keys)
+    }
+}
+
+impl DesktopKeyStore {
+    /// The desktop key ring only. YubiKey mode must not call this, or a
+    /// missing cache would look like a missing key.
+    pub(super) fn load_desktop_key(&self) -> Result<Option<Aes256Key>, KeyStoreError> {
         let secret = self.secret_service.probe();
         match (plan_load(presence(&secret)), secret) {
             (LoadPlan::UseSecretService, Probe::Found(key)) => Ok(Some(key)),
@@ -210,7 +248,7 @@ impl EncryptionKeyStore for DesktopKeyStore {
         }
     }
 
-    fn store_key(&self, key: &Aes256Key) -> Result<(), KeyStoreError> {
+    pub(super) fn store_desktop_key(&self, key: &Aes256Key) -> Result<(), KeyStoreError> {
         let secret = self.secret_service.probe();
         match plan_store(presence(&secret)) {
             StorePlan::SecretService => self.secret_service.store_key(key),
@@ -222,7 +260,7 @@ impl EncryptionKeyStore for DesktopKeyStore {
         }
     }
 
-    fn load_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
+    pub(super) fn load_desktop_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
         let secret = self.secret_service.probe();
         match plan_load(presence(&secret)) {
             LoadPlan::UseSecretService => self.secret_service.load_retired(),
@@ -235,7 +273,7 @@ impl EncryptionKeyStore for DesktopKeyStore {
         }
     }
 
-    fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
+    pub(super) fn store_desktop_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
         let secret = self.secret_service.probe();
         match plan_store(presence(&secret)) {
             StorePlan::SecretService => self.secret_service.store_retired(keys),
@@ -243,9 +281,41 @@ impl EncryptionKeyStore for DesktopKeyStore {
             StorePlan::Deny => Err(probe_failure(secret)),
         }
     }
-}
 
-impl DesktopKeyStore {
+    /// Remove the copies the desktop load would have used.
+    ///
+    /// A locked KWallet on a GNOME session is left alone. The Secret Service
+    /// is where that session keeps the key, and opening KWallet would prompt
+    /// for a store this wallet is not using.
+    pub(super) fn delete_desktop_secrets(&self) -> Result<(), KeyStoreError> {
+        let secret = self.secret_service.probe();
+        match presence(&secret) {
+            Presence::Denied => Err(probe_failure(secret)),
+            Presence::Found => self.delete_secret_service(),
+            Presence::Empty => {
+                self.delete_secret_service()?;
+                self.delete_quiet_kwallet()
+            }
+            Presence::Absent => self.kwallet.delete_secrets(Prompt::IfLocked),
+        }
+    }
+
+    fn delete_secret_service(&self) -> Result<(), KeyStoreError> {
+        self.secret_service.delete_retired()?;
+        self.secret_service.delete()
+    }
+
+    /// KWallet is only removed when a quiet probe already sees the key.
+    /// A closed wallet is not proof that the key is gone, and it is not a
+    /// reason to prompt.
+    fn delete_quiet_kwallet(&self) -> Result<(), KeyStoreError> {
+        match self.kwallet.probe(Prompt::Never) {
+            Probe::Found(_) => self.kwallet.delete_secrets(Prompt::Never),
+            Probe::Empty | Probe::Absent => Ok(()),
+            Probe::Failed(err) => Err(err),
+        }
+    }
+
     fn after_quiet_check(&self) -> Result<Option<Aes256Key>, KeyStoreError> {
         let quiet = self.kwallet.probe(Prompt::Never);
         match (plan_quiet(presence(&quiet)), quiet) {
@@ -465,6 +535,12 @@ pub enum KeyStoreError {
     Unavailable,
     /// An item was found, and it is not a 32-byte AES-256 key.
     WrongLength(usize),
+    /// YubiKey protection is on, and this process has not unwrapped the key.
+    Locked,
+    /// PIV slot 82 already holds a key this wallet will not replace.
+    SlotBusy,
+    /// A sentence that is already the message to show.
+    Plain(String),
 }
 
 impl std::fmt::Display for KeyStoreError {
@@ -482,7 +558,17 @@ impl std::fmt::Display for KeyStoreError {
                     ("expected", &KEY_LEN.to_string()),
                 ],
             )),
+            Self::Locked => f.write_str(&crate::i18n::t("wallet.keystore.locked")),
+            Self::SlotBusy => f.write_str(&crate::i18n::t("wallet.yubi.slot_busy")),
+            Self::Plain(message) => f.write_str(message),
         }
+    }
+}
+
+impl KeyStoreError {
+    /// The storage key is wrapped to a YubiKey and this process has not unwrapped it.
+    pub fn is_locked(&self) -> bool {
+        matches!(self, Self::Locked)
     }
 }
 
