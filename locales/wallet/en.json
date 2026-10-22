@@ -349,7 +349,7 @@
   "ui.fido_applet": "Security key application",
   "ui.fido_applet_fido2": "FIDO2 hmac-secret (recommended)",
   "ui.fido_applet_help": "FIDO2 hmac-secret is the common choice: most security keys from most vendors support it over USB, with a FIDO2 PIN and a touch. PIV is less common: it needs a YubiKey with the PIV application, the pcscd service, and a PIV PIN of six to eight digits, and it does not ask for a touch. Both keys use the same application.",
-  "ui.fido_applet_in_use": "Application: {applet}",
+  "ui.fido_applet_locked": "The application is fixed while security keys are pending or enrolled. To use the other one, discard the pending keys, or move the storage key back to the key ring and enroll two keys again.",
   "ui.fido_applet_piv": "PIV slot 82 (YubiKey only)",
   "ui.fido_cancel_replace": "Cancel replacement",
   "ui.fido_choice": "How the storage key is protected",
