@@ -349,7 +349,7 @@
   "ui.fido_applet": "Säkerhetsnyckelns program",
   "ui.fido_applet_fido2": "FIDO2 hmac-secret (rekommenderas)",
   "ui.fido_applet_help": "FIDO2 hmac-secret är det vanliga valet: de flesta säkerhetsnycklar från de flesta tillverkare stöder det via USB, med en FIDO2-PIN och en beröring. PIV är mindre vanligt: det kräver en YubiKey med PIV-programmet, tjänsten pcscd och en PIV-PIN på sex till åtta siffror, och det ber inte om beröring. Båda nycklarna använder samma program.",
-  "ui.fido_applet_in_use": "Program: {applet}",
+  "ui.fido_applet_locked": "Programmet är låst medan säkerhetsnycklar väntar eller är registrerade. För att använda det andra, släng de väntande nycklarna, eller flytta tillbaka lagringsnyckeln till nyckelringen och registrera två nycklar igen.",
   "ui.fido_applet_piv": "PIV plats 82 (endast YubiKey)",
   "ui.fido_cancel_replace": "Avbryt bytet",
   "ui.fido_choice": "Hur lagringsnyckeln skyddas",

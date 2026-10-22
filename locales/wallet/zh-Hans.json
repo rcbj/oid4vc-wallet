@@ -349,7 +349,7 @@
   "ui.fido_applet": "安全密钥应用",
   "ui.fido_applet_fido2": "FIDO2 hmac-secret（推荐）",
   "ui.fido_applet_help": "FIDO2 hmac-secret 是常见的选择：大多数厂商的大多数安全密钥都通过 USB 支持它，使用 FIDO2 PIN 并需要触摸。PIV 较少见：它需要带 PIV 应用的 YubiKey、pcscd 服务以及六到八位数字的 PIV PIN，并且不要求触摸。两把密钥使用相同的应用。",
-  "ui.fido_applet_in_use": "应用：{applet}",
+  "ui.fido_applet_locked": "在有待处理或已登记的安全密钥时，应用是固定的。要使用另一种应用，请放弃待处理的密钥，或将存储密钥移回密钥环后重新登记两把密钥。",
   "ui.fido_applet_piv": "PIV 槽位 82（仅限 YubiKey）",
   "ui.fido_cancel_replace": "取消更换",
   "ui.fido_choice": "存储密钥的保护方式",

@@ -349,7 +349,7 @@
   "ui.fido_applet": "Aplicación de la llave de seguridad",
   "ui.fido_applet_fido2": "FIDO2 hmac-secret (recomendado)",
   "ui.fido_applet_help": "FIDO2 hmac-secret es la opción habitual: la mayoría de las llaves de seguridad de la mayoría de los fabricantes lo admiten por USB, con un PIN FIDO2 y un toque. PIV es menos común: requiere una YubiKey con la aplicación PIV, el servicio pcscd y un PIN PIV de seis a ocho dígitos, y no pide un toque. Ambas llaves usan la misma aplicación.",
-  "ui.fido_applet_in_use": "Aplicación: {applet}",
+  "ui.fido_applet_locked": "La aplicación queda fija mientras haya llaves de seguridad pendientes o inscritas. Para usar la otra, descarte las llaves pendientes, o devuelva la clave de almacenamiento al llavero e inscriba dos llaves de nuevo.",
   "ui.fido_applet_piv": "PIV ranura 82 (solo YubiKey)",
   "ui.fido_cancel_replace": "Cancelar el reemplazo",
   "ui.fido_choice": "Cómo se protege la clave de almacenamiento",

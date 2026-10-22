@@ -1627,21 +1627,11 @@ impl WalletApp {
     }
 
     fn enroll_panel(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus) {
-        ui.label(t("wallet.ui.fido_applet"));
-        wrapped(ui, t("wallet.ui.fido_applet_help"));
         if status.pending.is_empty() {
-            ui.radio_value(
-                &mut self.applet_choice,
-                Applet::Fido2,
-                t("wallet.ui.fido_applet_fido2"),
-            );
-            ui.radio_value(
-                &mut self.applet_choice,
-                Applet::Piv,
-                t("wallet.ui.fido_applet_piv"),
-            );
+            applet_block(ui, &mut self.applet_choice, true);
         } else {
-            applet_line(ui, status.applet);
+            let mut fixed = status.applet;
+            applet_block(ui, &mut fixed, false);
         }
         ui.add_space(6.0);
         if self.active_applet() == Applet::Piv {
@@ -1699,7 +1689,10 @@ impl WalletApp {
 
     fn fido_active_panel(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus) {
         ui.label(t("wallet.ui.fido_status_fido"));
-        applet_line(ui, status.applet);
+        ui.add_space(6.0);
+        let mut fixed = status.applet;
+        applet_block(ui, &mut fixed, false);
+        ui.add_space(6.0);
         for item in &status.enrolled {
             ui.label(t_args("wallet.ui.fido_label", &[("label", &item.label)]));
         }
@@ -2805,12 +2798,19 @@ fn label_list(items: &[AuthenticatorRef]) -> String {
         .join(", ")
 }
 
-fn applet_line(ui: &mut egui::Ui, applet: Applet) {
-    let name = match applet {
-        Applet::Fido2 => t("wallet.ui.fido_applet_fido2"),
-        Applet::Piv => t("wallet.ui.fido_applet_piv"),
-    };
-    ui.label(t_args("wallet.ui.fido_applet_in_use", &[("applet", &name)]));
+/// FIDO2 or PIV, always on screen so the alternative is visible. A pending
+/// or enrolled pair fixes the application, so the radios are then read-only
+/// and say how to change it.
+fn applet_block(ui: &mut egui::Ui, applet: &mut Applet, enabled: bool) {
+    ui.label(t("wallet.ui.fido_applet"));
+    wrapped(ui, t("wallet.ui.fido_applet_help"));
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.radio_value(applet, Applet::Fido2, t("wallet.ui.fido_applet_fido2"));
+        ui.radio_value(applet, Applet::Piv, t("wallet.ui.fido_applet_piv"));
+    });
+    if !enabled {
+        wrapped(ui, t("wallet.ui.fido_applet_locked"));
+    }
 }
 
 /// Metadata rows on the Credentials detail pane.

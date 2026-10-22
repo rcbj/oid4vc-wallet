@@ -349,7 +349,7 @@
   "ui.fido_applet": "Application ng security key",
   "ui.fido_applet_fido2": "FIDO2 hmac-secret (inirerekomenda)",
   "ui.fido_applet_help": "Ang FIDO2 hmac-secret ang karaniwang pinipili: sinusuportahan ito ng karamihan ng security key mula sa karamihan ng vendor sa USB, gamit ang FIDO2 PIN at isang pindot. Mas bihira ang PIV: kailangan nito ng YubiKey na may PIV application, ng serbisyong pcscd, at ng PIV PIN na anim hanggang walong digit, at hindi ito humihingi ng pindot. Iisang application ang gamit ng dalawang susi.",
-  "ui.fido_applet_in_use": "Application: {applet}",
+  "ui.fido_applet_locked": "Nakapirmi ang application habang may nakabinbin o naka-enroll na security key. Para gamitin ang isa pa, i-discard ang mga nakabinbing susi, o ibalik ang susi ng imbakan sa key ring at mag-enroll ulit ng dalawang susi.",
   "ui.fido_applet_piv": "PIV slot 82 (YubiKey lang)",
   "ui.fido_cancel_replace": "Kanselahin ang pagpapalit",
   "ui.fido_choice": "Paano pinoprotektahan ang susi ng imbakan",

@@ -349,7 +349,7 @@
   "ui.fido_applet": "Application de la clé de sécurité",
   "ui.fido_applet_fido2": "FIDO2 hmac-secret (recommandé)",
   "ui.fido_applet_help": "FIDO2 hmac-secret est le choix courant : la plupart des clés de sécurité de la plupart des fabricants le prennent en charge par USB, avec un PIN FIDO2 et un toucher. PIV est moins courant : il faut une YubiKey avec l'application PIV, le service pcscd et un PIN PIV de six à huit chiffres, et aucun toucher n'est demandé. Les deux clés utilisent la même application.",
-  "ui.fido_applet_in_use": "Application : {applet}",
+  "ui.fido_applet_locked": "L'application est fixée tant que des clés de sécurité sont en attente ou enrôlées. Pour utiliser l'autre, supprimez les clés en attente, ou ramenez la clé de stockage dans le trousseau et enrôlez de nouveau deux clés.",
   "ui.fido_applet_piv": "PIV emplacement 82 (YubiKey uniquement)",
   "ui.fido_cancel_replace": "Annuler le remplacement",
   "ui.fido_choice": "Comment la clé de stockage est protégée",
