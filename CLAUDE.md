@@ -8,7 +8,7 @@ The UI is native egui (`eframe` 0.37). It is not a web app. Do not verify it in 
 
 ## Hard rules
 
-- OpenID4VCI, OpenID4VP, SIOPv2, SD-JWT, and JOSE are implemented in this crate. Do not add a crate whose job is to implement them. The allowed signature and TLS crates are listed in the `Cargo.toml` header. `p256` with the `ecdh` feature is for proofs of possession (`present.rs`). `ctap-fido2` 0.1.3 speaks CTAP2 over USB HID and returns the hmac-secret. Do not add the `yubikey` crate or a PIV client.
+- OpenID4VCI, OpenID4VP, SIOPv2, SD-JWT, and JOSE are implemented in this crate. Do not add a crate whose job is to implement them. The allowed signature and TLS crates are listed in the `Cargo.toml` header. `p256` with the `ecdh` feature is for proofs of possession (`present.rs`). `ctap-fido2` 0.1.3 speaks CTAP2 over USB HID and returns the hmac-secret. `yubikey` 0.8 (feature `untested`, the gate for PIV decipher) talks to PIV slot 82 over PC/SC for the PIV alternative (issue #7). FIDO2 stays the default. Do not add another PIV client or a second PC/SC crate.
 - Protocol JSON is `protocol::Json` (`src/protocol/json.rs`). Numbers stay as their literal text. There is no serde. `Json::get` returns the last duplicate key. There is no `as_bool`; match `Json::Bool`. `as_u64` accepts only a base-10 integer literal that fits in `u64`.
 - User-visible sentences go through `i18n::t` / `t_args`. Catalog keys in `locales/wallet/*.json` omit the `wallet.` prefix. Call sites use `wallet.<key>`.
 - Comments and module docs say why a constraint exists. Do not restate what the next line does.
@@ -43,11 +43,11 @@ The UI is native egui (`eframe` 0.37). It is not a web app. Do not verify it in 
 | `install/install.sh` | Release build, then `oid4vc-wallet install`. |
 | `install/appimage.sh` | x86_64 AppImage. |
 | `docs/guide.md` | End-user guide, including the Security / security-key section. |
-| `.github/workflows/ci.yml` | `./install/test.sh` on ubuntu-latest. Apt-installs `libudev-dev` and the X11/font libraries. |
-| `.github/workflows/appimage.yml` | AppImage artifact `oid4vc-wallet-x86_64`, built on Ubuntu 22.04. Also installs `libudev-dev`. |
+| `.github/workflows/ci.yml` | `./install/test.sh` on ubuntu-latest. Apt-installs `libudev-dev`, `libpcsclite-dev`, and the X11/font libraries. |
+| `.github/workflows/appimage.yml` | AppImage artifact `oid4vc-wallet-x86_64`, built on Ubuntu 22.04. Also installs `libudev-dev` and `libpcsclite-dev`. |
 | `.github/workflows/pages.yml` | Publishes `docs/` the same way iya-sts does. |
 
-`src/wallet/` modules, in the order declared in `mod.rs`: `anchors`, `b64`, `certs`, `consent`, `credentials`, `fido`, `http`, `inbox`, `jws`, `kek`, `key_store`, `kwallet`, `portable`, `present`, `proof`, `protection`, `redeem`, `seal`, `secret_service`, `subject`, `trust`, `validate`. The protection API is re-exported from `wallet`.
+`src/wallet/` modules, in the order declared in `mod.rs`: `anchors`, `b64`, `certs`, `consent`, `credentials`, `fido`, `http`, `inbox`, `jws`, `kek`, `key_store`, `kwallet`, `piv`, `portable`, `present`, `proof`, `protection`, `redeem`, `seal`, `secret_service`, `subject`, `trust`, `validate`. The protection API is re-exported from `wallet`.
 
 `src/protocol/` modules: `http_url`, `json`, `percent`, `query`, `uri`, and public `invocation`, `offer`, `request`. Fetching an offer by reference is not implemented. Redeeming a pre-authorized offer is `wallet::redeem_pre_authorized`. Answering a same-device presentation is `wallet::present_same_device`. Checking an issued credential is `wallet::validate_stored`.
 
@@ -55,7 +55,7 @@ The UI is native egui (`eframe` 0.37). It is not a web app. Do not verify it in 
 
 `pkg-config --exists libudev` fails here. The runtime library is present (`/lib/x86_64-linux-gnu/libudev.so.1`). `libudev.h` and the `libudev.so` linker name are not installed, and `sudo apt-get install libudev-dev` cannot be run from this agent. CI installs `libudev-dev`, so CI does not need a local tree.
 
-Local compiles use a tree that is outside the repo and must stay there: `/tmp/oid4vc-libudev`. It is the `libudev-dev` package extracted without root, plus `libudev.pc` whose `prefix` points at that extract, and `libudev.so` symlinked to the system `libudev.so.1`. hidapi compiles `hid.c` with `cc` and does not pass pkg-config's include path to the compiler, so `libudev.h` also has to be on `C_INCLUDE_PATH`.
+Local compiles use a tree that is outside the repo and must stay there: `/tmp/oid4vc-libudev`. It is the `libudev-dev` package extracted without root, plus `libudev.pc` whose `prefix` points at that extract, and `libudev.so` symlinked to the system `libudev.so.1`. hidapi compiles `hid.c` with `cc` and does not pass pkg-config's include path to the compiler, so `libudev.h` also has to be on `C_INCLUDE_PATH`. The same tree holds `libpcsclite.pc` and a `libpcsclite.so` symlink to the system `libpcsclite.so.1`, because `pcsc-sys` probes pkg-config for `libpcsclite` and `libpcsclite-dev` is not installed here either.
 
 ```sh
 export PKG_CONFIG_PATH=/tmp/oid4vc-libudev
@@ -64,7 +64,7 @@ export LIBRARY_PATH=/tmp/oid4vc-libudev/root/usr/lib/x86_64-linux-gnu
 ./install/test.sh
 ```
 
-`install/test.sh` does not set those variables. A plain `./install/test.sh` fails to compile hidapi on this machine until `libudev-dev` exists. `--offline` is valid only after `ctap-fido2` 0.1.3 is already in the cargo cache. The first fetch of that crate must be online. Running the wallet does not need `pcscd`.
+`install/test.sh` does not set those variables. A plain `./install/test.sh` fails to compile hidapi on this machine until `libudev-dev` exists. `--offline` is valid only after `ctap-fido2` 0.1.3 is already in the cargo cache. The first fetch of that crate must be online. Running the wallet needs `pcscd` only for PIV.
 
 ## Version
 
@@ -160,7 +160,7 @@ The section is `fido_section`, after `storage_key_section`, inside the existing 
 | Security key | Security key | Status, unlock row when locked, other-key row when `other_needed` and not replacing, key-ring-copy warning when removal is still pending, enrolled labels, replace flow. |
 | Security key | Key ring | PIN and the button that calls `switch_to_keyring`. |
 
-Public API (`src/wallet/protection.rs`, re-exported from `wallet`): `protection_status`, `fido_locked() -> Result<bool, KeyStoreError>`, `enroll_fido(pin) -> label`, `activate_fido`, `discard_pending`, `unlock_fido(pin)`, `unlock_other_fido(pin)`, `begin_replace(remove_id, staying_pin)`, `finish_replace(remove_id, pin) -> new label`, `cancel_replace`, `switch_to_keyring(pin)`. Types: `Mechanism::{Keyring, Fido}`, `AuthenticatorRef { id, label }`, `ProtectionStatus { mechanism, enrolled, pending, unlocked, keyring_pending_removal, other_needed }`. `id` is the base64 credential id. Production wrappers use `DesktopKeyStore` + `HardwareFido` + the global `SESSION` + the default path. Tests pass `SoftwareFido`, `MemDesktop`, and a private `Session`. `Work::load_cached` is `#[cfg(test)]` because only tests call it and clippy denies dead code.
+Public API (`src/wallet/protection.rs`, re-exported from `wallet`): `protection_status`, `fido_locked() -> Result<bool, KeyStoreError>`, `enroll_fido(pin, applet) -> label`, `activate_fido`, `discard_pending`, `unlock_fido(pin)`, `unlock_other_fido(pin)`, `begin_replace(remove_id, staying_pin)`, `finish_replace(remove_id, pin) -> new label`, `cancel_replace`, `switch_to_keyring(pin)`. Types: `Mechanism::{Keyring, Fido}`, `Applet::{Fido2, Piv}`, `AuthenticatorRef { id, label }`, `ProtectionStatus { mechanism, applet, enrolled, pending, unlocked, keyring_pending_removal, other_needed }`. `id` is the base64 credential id. Production wrappers use `DesktopKeyStore` + `HardwareFido` or `HardwarePiv` (as `Box<dyn Fido>`, so `Work`'s device is `?Sized`) + the global `SESSION` + the default path. Tests pass `SoftwareFido` or `SoftwarePiv`, `MemDesktop`, and a private `Session`. `Work::load_cached` is `#[cfg(test)]` because only tests call it and clippy denies dead code.
 
 ### Two keys, always
 
@@ -171,6 +171,16 @@ Enroll, while the mechanism is still the key ring, requires exactly one connecte
 Unlock requires exactly one device, probes which enrolled credential it holds, and remembers that output without clearing the other. None of the enrolled ids: `fido.not_enrolled`. Several devices: `fido.many`.
 
 `begin_replace(remove_id, staying_pin)` requires exactly one device and that it holds the staying credential (`fido.missing` otherwise). It caches that output and sets `replacing`. It does not write the file. `finish_replace` requires that flag, a matching generation, and the session key. If the one connected device holds the staying credential, refuse with `fido.same` rather than creating a second credential on the key being kept. A device that holds the removed credential, or neither, may `makeCredential`. Finish without begin: `fido.always_two`. A normal unlock clears `replacing`. Cancel clears the flag and may leave the session unlocked. The window clears the shared PIN between the two steps and shows `wallet.fido.insert_new` after verify. `{old}` and `{new}` are labels, not ids.
+
+### PIV alternative (issue #7)
+
+PIV slot 82 on a YubiKey is the second application, chosen under the security-key radio (`applet_choice` in `ui.rs`, `Applet` in `protection.rs`). FIDO2 hmac-secret is the default and is labelled recommended, because far more keys ship FIDO2 than PIV. The UI and docs say that.
+
+`src/wallet/piv.rs` is restored from `91302a0^` and adapted: `HardwarePiv` implements the same `Fido` trait, so the two-key, pending, replace, unlock-other, activate, and switch-back logic is shared and unchanged. Do not fork that logic per applet. `with_global(applet, ..)` takes the person's choice for enroll and the file's `applet` for every other call.
+
+PIV KEK: the card does ECDH between its slot-82 key and a point hashed from the stored 32-byte salt (try-and-increment over SHA-256 with domain `oid4vc-wallet piv salt point v1`), then HKDF-SHA256 (salt `oid4vc-wallet piv kek v1`, info = the stored salt). Nobody knows that point's discrete log, so the salt is still not a secret. Do not derive an ephemeral private key from the salt; that would let anyone with the file compute the KEK. The output is deterministic per salt, like hmac-secret, so the KEK cache and file layout are shared. The credential id and `public` are both the 65-byte uncompressed slot-82 point. `holds` reads slot metadata (no PIN) and compares points. Label is `YubiKey {serial} PIV`.
+
+`Fido::check_pin` is the per-applet client PIN rule: FIDO2 is 4–63 bytes; PIV is 6–8 ASCII digits (`piv.pin_digits`, `piv.pin_short`, `piv.pin_long`). Enroll verifies the PIN, authenticates with the default 3DES management key, refuses a slot that holds a key or a certificate (`piv.slot_busy`; the wallet never overwrites slot 82), generates P-256 with PIN policy always and touch never, then verifies the PIN again right before decipher (policy always needs PIN then decipher as consecutive commands). A discarded or replaced PIV key stays in its slot, so enrolling that YubiKey again needs `ykman piv keys delete 82`. Pending keys must share one applet (`fido.applet_mixed`, checked after the mechanism check and before the device count). Old `mechanism: "yubikey"` files are still `fido.retired_piv`. The CLI prompt is `piv.prompt` when the file's applet is PIV.
 
 ### PIN
 
@@ -200,7 +210,7 @@ Activate uses the cached outputs and takes no PIN. If a process restart dropped 
 }
 ```
 
-`mechanism` is `keyring` or `fido`. A file whose mechanism is `yubikey` is `fido.retired_piv`, checked before the other fields, so an old PIV file is not called malformed. There is no migration. Fields use `b64::b64_encode` / `b64_decode`. Unknown extra fields are ignored. A missing file is the key ring, generation 0, `keyring_cleared` true, no pending, and is not an error. A missing `generation` is 0. A missing `keyring_cleared` is false when the mechanism is `fido` and true otherwise. When the mechanism is `fido`, there are exactly two key records and `pending` is empty. Pending records have no `wrapped`. Anything else that does not match is `fido.malformed`.
+`mechanism` is `keyring` or `fido`. `applet` is `fido2` or `piv`; missing is `fido2`, anything else is `fido.malformed`. A file whose mechanism is `yubikey` is `fido.retired_piv`, checked before the other fields, so an old PIV file is not called malformed. There is no migration. Fields use `b64::b64_encode` / `b64_decode`. Unknown extra fields are ignored. A missing file is the key ring, generation 0, `keyring_cleared` true, no pending, and is not an error. A missing `generation` is 0. A missing `keyring_cleared` is false when the mechanism is `fido` and true otherwise. When the mechanism is `fido`, there are exactly two key records and `pending` is empty. Pending records have no `wrapped`. Anything else that does not match is `fido.malformed`.
 
 ### Activate, unlock, switch back
 
@@ -241,6 +251,6 @@ Import and export (`wallet::portable`) seal a copy with a fresh AES-256 key that
 
 Temp directories follow the `credentials.rs` pattern: `oid4vc-wallet-{name}-{pid}-{millis}`, removed on drop. FIDO tests construct `SoftwareFido` (`new`, `set_connected`, `credential_count`, `has_credential`) and `MemDesktop`. They never touch `SESSION`, the XDG protection file, the desktop keyring, or `/dev/hidraw`.
 
-Covered invariants worth not re-breaking: a PIN shorter than 4 bytes, including empty, and one longer than 63 bytes are refused before a credential exists, and a letter PIN is accepted; two keys unwrap the same storage key and one is not enough; a pending key is `already` even when two are pending, and a third device is `pending_full` with no credential created; replace keeps two, the key being kept is `fido.same`, and the removed credential cannot unwrap; switching back stores the key, clears the cached outputs, and leaves the credentials on the devices; a generation change locks the cache and keeps the outputs; discard forgets the pending id and the same device can enroll again; a failed desktop delete rolls the file back only while the desktop key is still there; activate with no cached outputs returns `fido.session` and does not write mechanism `fido`; rotate without both outputs is `fido.both`, and `unlock_other_fido` of the missing device restores it; mechanism `yubikey` is `fido.retired_piv`.
+Covered invariants worth not re-breaking: a PIN shorter than 4 bytes, including empty, and one longer than 63 bytes are refused before a credential exists, and a letter PIN is accepted; two keys unwrap the same storage key and one is not enough; a pending key is `already` even when two are pending, and a third device is `pending_full` with no credential created; replace keeps two, the key being kept is `fido.same`, and the removed credential cannot unwrap; switching back stores the key, clears the cached outputs, and leaves the credentials on the devices; a generation change locks the cache and keeps the outputs; discard forgets the pending id and the same device can enroll again; a failed desktop delete rolls the file back only while the desktop key is still there; activate with no cached outputs returns `fido.session` and does not write mechanism `fido`; rotate without both outputs is `fido.both`, and `unlock_other_fido` of the missing device restores it; mechanism `yubikey` is `fido.retired_piv`; two PIV keys wrap and either unlocks; a pending pair does not mix FIDO2 and PIV (`fido.applet_mixed`), and a discarded PIV key leaves slot 82 busy (`piv.slot_busy`); a file without `applet` is FIDO2.
 
-`install/test.sh` last known green run: 2026-10-20, rustc 1.99.1, with the `/tmp/oid4vc-libudev` variables above. 154 library tests and 21 binary tests passed, and clippy with `-D warnings` and the pedantic group was clean. That run did not open the window and did not use a security key.
+`install/test.sh` last known green run: 2026-10-22, rustc 1.99.1, with the `/tmp/oid4vc-libudev` variables above. 160 library tests and 21 binary tests passed, and clippy with `-D warnings` and the pedantic group was clean. That run did not open the window and did not use a security key.

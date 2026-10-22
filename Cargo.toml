@@ -26,8 +26,11 @@ categories = ["command-line-utilities", "gui"]
 # OpenID4VCI proof of possession. ctap-fido2 speaks CTAP2 over USB HID
 # and returns the FIDO2 hmac-secret this wallet uses as a key-encryption
 # key. That crate implements the FIDO messages only, so another vendor's
-# authenticator works when it supports the same extension. rustls is the
-# TLS stack. The signature
+# authenticator works when it supports the same extension. yubikey talks
+# to PIV slot 82 through PC/SC, the less common alternative to hmac-secret;
+# p256 runs the ECDH and HKDF around that card's decipher. The `untested`
+# feature is the crate's gate for PIV decipher; the call itself is the
+# standard GENERAL AUTHENTICATE. rustls is the TLS stack. The signature
 # crates (p256, p384, p521, k256, rsa, ed25519-dalek, ed448-goldilocks-plus,
 # fips204, fips205) and x509-parser check credential signatures and
 # certificate chains. None of these crates implements OpenID4VCI, OpenID4VP,
@@ -57,6 +60,7 @@ sha2 = { version = "0.10", features = ["oid"] }
 sha3 = "0.10"
 webpki-roots = "1"
 x509-parser = "0.18.1"
+yubikey = { version = "0.8", features = ["untested"] }
 zeroize = "1"
 
 [lib]

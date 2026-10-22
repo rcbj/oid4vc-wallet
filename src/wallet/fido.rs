@@ -33,8 +33,11 @@ impl Drop for Enrollment {
     }
 }
 
-/// What an hmac-secret authenticator (or the test double) can do.
+/// What a security key (or a test double) can do. PIV is the other
+/// implementation, so the same two-key logic serves both applications.
 pub(super) trait Fido {
+    /// The client-side PIN rule, checked before any device call.
+    fn check_pin(&self, pin: &str) -> Result<(), KeyStoreError>;
     fn device_count(&mut self) -> Result<usize, KeyStoreError>;
     fn enroll(&mut self, pin: &str) -> Result<Enrollment, KeyStoreError>;
     fn hmac(
@@ -52,6 +55,10 @@ pub(super) trait Fido {
 pub(super) struct HardwareFido;
 
 impl Fido for HardwareFido {
+    fn check_pin(&self, pin: &str) -> Result<(), KeyStoreError> {
+        check_fido_pin(pin)
+    }
+
     fn device_count(&mut self) -> Result<usize, KeyStoreError> {
         Ok(listed()?.len())
     }
@@ -121,6 +128,19 @@ impl Fido for HardwareFido {
         }
         Ok(None)
     }
+}
+
+fn check_fido_pin(pin: &str) -> Result<(), KeyStoreError> {
+    // FIDO counts UTF-8 bytes. The device enforces its own minimum, which
+    // defaults to 4. Letters are allowed. 63 is the CTAP maximum.
+    let len = pin.len();
+    if len < 4 {
+        return Err(plain("wallet.fido.pin_short"));
+    }
+    if len > 63 {
+        return Err(plain("wallet.fido.pin_long"));
+    }
+    Ok(())
 }
 
 /// `CTAP2_ERR_INVALID_CREDENTIAL` (0x22). The crate has no named variant.
@@ -340,6 +360,10 @@ impl SoftwareFido {
 
 #[cfg(test)]
 impl Fido for SoftwareFido {
+    fn check_pin(&self, pin: &str) -> Result<(), KeyStoreError> {
+        check_fido_pin(pin)
+    }
+
     fn device_count(&mut self) -> Result<usize, KeyStoreError> {
         Ok(self.connected.len())
     }
