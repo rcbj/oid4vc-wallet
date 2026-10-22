@@ -26,8 +26,8 @@ use oid4vc_wallet::linux::{
 use oid4vc_wallet::protocol::{ui_locales_of_uri, Json};
 use oid4vc_wallet::version;
 use oid4vc_wallet::wallet::{
-    accept, fido_locked, signature_algorithm, unlock_fido, Credential, CredentialVault, Inbox,
-    NewCredential,
+    accept, fido_locked, protection_status, signature_algorithm, unlock_fido, Applet, Credential,
+    CredentialVault, Inbox, NewCredential,
 };
 
 mod browser;
@@ -800,7 +800,12 @@ fn handle(uris: &[String], options: &Options) -> Result<(), Failure> {
 
 fn open_vault() -> Result<CredentialVault<oid4vc_wallet::wallet::DesktopKeyStore>, Failure> {
     if fido_locked().map_err(|err| fail(err.to_string(), 1))? {
-        let mut pin = prompt_fido_pin()?;
+        // A PIV PIN and a FIDO2 PIN are different secrets on the same key.
+        let prompt = match protection_status().map(|status| status.applet) {
+            Ok(Applet::Piv) => "wallet.piv.prompt",
+            _ => "wallet.fido.prompt",
+        };
+        let mut pin = prompt_fido_pin(prompt)?;
         let unlocked = unlock_fido(&pin);
         pin.zeroize();
         unlocked.map_err(|err| fail(err.to_string(), 1))?;
@@ -810,9 +815,9 @@ fn open_vault() -> Result<CredentialVault<oid4vc_wallet::wallet::DesktopKeyStore
 
 /// The PIN is read from the terminal, not stdin. Stdin may be the credential
 /// document. Echo is turned off so the PIN is not shown.
-fn prompt_fido_pin() -> Result<String, Failure> {
+fn prompt_fido_pin(prompt: &str) -> Result<String, Failure> {
     let mut guard = EchoGuard::silence()?;
-    let pin = read_hidden_line(&guard.tty)?;
+    let pin = read_hidden_line(&guard.tty, prompt)?;
     let _ = writeln!(guard.tty);
     Ok(pin)
 }
@@ -853,9 +858,9 @@ impl Drop for EchoGuard {
     }
 }
 
-fn read_hidden_line(tty: &std::fs::File) -> Result<String, Failure> {
+fn read_hidden_line(tty: &std::fs::File, prompt: &str) -> Result<String, Failure> {
     let mut out = tty.try_clone().map_err(|_| fail(t("wallet.fido.tty"), 1))?;
-    writeln!(out, "{}", t("wallet.fido.prompt")).map_err(|_| fail(t("wallet.fido.tty"), 1))?;
+    writeln!(out, "{}", t(prompt)).map_err(|_| fail(t("wallet.fido.tty"), 1))?;
     out.flush().map_err(|_| fail(t("wallet.fido.tty"), 1))?;
     let mut line = String::new();
     let read = BufReader::new(tty.try_clone().map_err(|_| fail(t("wallet.fido.tty"), 1))?)

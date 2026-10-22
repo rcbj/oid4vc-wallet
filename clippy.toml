@@ -12,6 +12,8 @@ doc-valid-idents = [
     "OpenID4VCI",
     "OpenID4VP",
     "SIOPv2",
+    "YubiKey",
+    "YubiKeys",
 ]
 
 # The command-line options, the window state, and a parsed presentation

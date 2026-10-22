@@ -30,8 +30,8 @@ use oid4vc_wallet::wallet::{
     redeem_pre_authorized, refuse_presentation, remember_presentation, remember_trust,
     self_issued_identifier, signature_algorithm, signer_certificates, subject_setting_path,
     switch_to_keyring, trust_anchors_dir, unlock_fido, unlock_other_fido, validate_stored,
-    write_subject_setting, AnchorInfo, AuthenticatorRef, Credential, CredentialVault, Inbox,
-    KeyStoreError, Mechanism, NewCredential, Outcome, PendingPresentation, PortableError,
+    write_subject_setting, AnchorInfo, Applet, AuthenticatorRef, Credential, CredentialVault,
+    Inbox, KeyStoreError, Mechanism, NewCredential, Outcome, PendingPresentation, PortableError,
     Presentation, Presented, ProtectionStatus, Redeemed, SignerCertificate, SubjectSyntax,
 };
 use zeroize::Zeroize;
@@ -323,6 +323,9 @@ struct WalletApp {
     /// Desktop key ring or security keys, as the person selected it. This is
     /// not reset on every frame, or enrolling would snap back to the key ring.
     protection_choice: ProtectionChoice,
+    /// FIDO2 or PIV for the next enrollment. A pending or enrolled pair
+    /// fixes the application, and the file's value wins then.
+    applet_choice: Applet,
     fido_pin: String,
     /// Credential reads are waiting for a FIDO2 PIN.
     fido_locked: bool,
@@ -411,6 +414,7 @@ impl WalletApp {
             subject_choice: SubjectChoice::Thumbprint,
             did_web_input: String::new(),
             protection_choice: ProtectionChoice::Keyring,
+            applet_choice: Applet::Fido2,
             fido_pin: String::new(),
             fido_locked: false,
             replacing: None,
@@ -1574,6 +1578,7 @@ impl WalletApp {
                         Mechanism::Fido => ProtectionChoice::Fido,
                         Mechanism::Keyring => ProtectionChoice::Keyring,
                     };
+                    self.applet_choice = status.applet;
                 }
                 self.fido_locked = status.mechanism == Mechanism::Fido && !status.unlocked;
                 self.protection = Some(status);
@@ -1622,9 +1627,41 @@ impl WalletApp {
     }
 
     fn enroll_panel(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus) {
-        wrapped(ui, t("wallet.ui.fido_step1"));
-        wrapped(ui, t("wallet.ui.fido_step2"));
+        ui.label(t("wallet.ui.fido_applet"));
+        wrapped(ui, t("wallet.ui.fido_applet_help"));
+        if status.pending.is_empty() {
+            ui.radio_value(
+                &mut self.applet_choice,
+                Applet::Fido2,
+                t("wallet.ui.fido_applet_fido2"),
+            );
+            ui.radio_value(
+                &mut self.applet_choice,
+                Applet::Piv,
+                t("wallet.ui.fido_applet_piv"),
+            );
+        } else {
+            applet_line(ui, status.applet);
+        }
+        ui.add_space(6.0);
+        if self.active_applet() == Applet::Piv {
+            wrapped(ui, t("wallet.ui.fido_piv_steps"));
+        } else {
+            wrapped(ui, t("wallet.ui.fido_step1"));
+            wrapped(ui, t("wallet.ui.fido_step2"));
+        }
         self.pending_actions(ui, status, true);
+    }
+
+    /// The application the PIN field and enroll speak to. Once a key is
+    /// pending or enrolled, that is the file's; before, the radio's.
+    fn active_applet(&self) -> Applet {
+        match &self.protection {
+            Some(status) if status.mechanism == Mechanism::Fido || !status.pending.is_empty() => {
+                status.applet
+            }
+            _ => self.applet_choice,
+        }
     }
 
     fn pending_actions(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus, enroll: bool) {
@@ -1662,6 +1699,7 @@ impl WalletApp {
 
     fn fido_active_panel(&mut self, ui: &mut egui::Ui, status: &ProtectionStatus) {
         ui.label(t("wallet.ui.fido_status_fido"));
+        applet_line(ui, status.applet);
         for item in &status.enrolled {
             ui.label(t_args("wallet.ui.fido_label", &[("label", &item.label)]));
         }
@@ -1753,7 +1791,10 @@ impl WalletApp {
     }
 
     fn pin_field(&mut self, ui: &mut egui::Ui) {
-        ui.label(t("wallet.ui.fido_pin"));
+        ui.label(match self.active_applet() {
+            Applet::Fido2 => t("wallet.ui.fido_pin"),
+            Applet::Piv => t("wallet.ui.fido_pin_piv"),
+        });
         ui.add(
             egui::TextEdit::singleline(&mut self.fido_pin)
                 .password(true)
@@ -1772,7 +1813,7 @@ impl WalletApp {
 
     fn enroll_clicked(&mut self) {
         let mut pin = self.take_pin();
-        let result = enroll_fido(&pin);
+        let result = enroll_fido(&pin, self.active_applet());
         pin.zeroize();
         match result {
             Ok(label) => {
@@ -2762,6 +2803,14 @@ fn label_list(items: &[AuthenticatorRef]) -> String {
         .map(|item| item.label.clone())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn applet_line(ui: &mut egui::Ui, applet: Applet) {
+    let name = match applet {
+        Applet::Fido2 => t("wallet.ui.fido_applet_fido2"),
+        Applet::Piv => t("wallet.ui.fido_applet_piv"),
+    };
+    ui.label(t_args("wallet.ui.fido_applet_in_use", &[("applet", &name)]));
 }
 
 /// Metadata rows on the Credentials detail pane.

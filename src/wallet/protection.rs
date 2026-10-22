@@ -1,8 +1,10 @@
 //! Where the AES-256 storage key is kept.
 //!
-//! The desktop key ring is the default. FIDO protection replaces that with
-//! the hmac-secret of two authenticators and deletes the desktop copy only
-//! after both wrapped copies are on disk. Either authenticator can unwrap
+//! The desktop key ring is the default. Security-key protection replaces
+//! that with the hmac-secret of two FIDO2 authenticators, or with a key in
+//! PIV slot 82 of two YubiKeys, and deletes the desktop copy only after both
+//! wrapped copies are on disk. Both keys use the same application. FIDO2 is
+//! the default because far more keys ship it than PIV. Either authenticator can unwrap
 //! the storage key. Replacing one checks the one that stays, then enrolls
 //! the new one, so the file never holds fewer than two.
 //!
@@ -28,6 +30,7 @@ use super::kek;
 use super::key_store::{
     decode_retired, encode_retired, DesktopKeyStore, KeyStoreError, RetiredKey,
 };
+use super::piv::HardwarePiv;
 use super::seal::Aes256Key;
 
 const FILE_NAME: &str = "key-protection.json";
@@ -45,6 +48,15 @@ pub enum Mechanism {
     Fido,
 }
 
+/// Which application on the security keys wraps the storage key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applet {
+    /// FIDO2 hmac-secret over USB HID. Most security keys have it.
+    Fido2,
+    /// PIV slot 82 over PC/SC. YubiKey only, and needs pcscd.
+    Piv,
+}
+
 /// One authenticator the Security tab can name.
 ///
 /// `id` is the base64 credential id. The label is what the person sees.
@@ -58,6 +70,8 @@ pub struct AuthenticatorRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtectionStatus {
     pub mechanism: Mechanism,
+    /// The application of the enrolled or pending keys. FIDO2 when there are none.
+    pub applet: Applet,
     pub enrolled: Vec<AuthenticatorRef>,
     pub pending: Vec<AuthenticatorRef>,
     pub unlocked: bool,
@@ -122,6 +136,7 @@ struct Pending {
 #[derive(Clone)]
 struct Doc {
     mechanism: Mechanism,
+    applet: Applet,
     generation: u64,
     keyring_cleared: bool,
     keys: Vec<Record>,
@@ -132,6 +147,7 @@ impl Doc {
     fn keyring() -> Self {
         Self {
             mechanism: Mechanism::Keyring,
+            applet: Applet::Fido2,
             generation: 0,
             keyring_cleared: true,
             keys: Vec::new(),
@@ -149,8 +165,10 @@ impl Drop for SecretBytes {
 }
 
 /// The installed wallet's protection file and the process-wide cache.
-struct Work<'a, F, D> {
+struct Work<'a, F: ?Sized, D> {
     fido: &'a mut F,
+    /// The application `fido` speaks. Enroll records it in the file.
+    applet: Applet,
     desktop: &'a D,
     session: &'a mut Session,
     path: &'a Path,
@@ -163,7 +181,7 @@ struct Work<'a, F, D> {
 /// The protection file cannot be read or is malformed, or the session lock is
 /// poisoned.
 pub fn protection_status() -> Result<ProtectionStatus, KeyStoreError> {
-    with_global(|mut work| work.status())
+    with_global(None, |mut work| work.status())
 }
 
 /// True when a credential command must ask for a FIDO2 PIN before it can read.
@@ -181,17 +199,19 @@ pub fn fido_locked() -> Result<bool, KeyStoreError> {
     Ok(!cache_matches(&session, &doc))
 }
 
-/// Enroll the one connected authenticator. The storage key stays in the key
-/// ring until [`activate_fido`]. The returned text is the label.
+/// Enroll the one connected authenticator with `applet`. The storage key
+/// stays in the key ring until [`activate_fido`]. The returned text is the
+/// label.
 ///
 /// # Errors
 ///
-/// The PIN is too short or too long, not exactly one authenticator is
-/// connected, it lacks `hmac-secret` or a PIN, it is already pending, two are
-/// already pending, the device refuses, or the protection file cannot be
-/// written.
-pub fn enroll_fido(pin: &str) -> Result<String, KeyStoreError> {
-    with_global(|mut work| work.enroll(pin))
+/// The PIN does not fit the application's rule, a pending key uses the other
+/// application, not exactly one authenticator is connected, it lacks
+/// `hmac-secret` or a PIN (FIDO2) or slot 82 is taken (PIV), it is already
+/// pending, two are already pending, the device refuses, or the protection
+/// file cannot be written.
+pub fn enroll_fido(pin: &str, applet: Applet) -> Result<String, KeyStoreError> {
+    with_global(Some(applet), |mut work| work.enroll(pin))
 }
 
 /// Wrap the storage key to the two enrolled authenticators and remove the desktop copy.
@@ -202,7 +222,7 @@ pub fn enroll_fido(pin: &str) -> Result<String, KeyStoreError> {
 /// outputs, the desktop key cannot be read, or the protection file or the
 /// desktop delete fails.
 pub fn activate_fido() -> Result<(), KeyStoreError> {
-    with_global(|mut work| work.activate())
+    with_global(None, |mut work| work.activate())
 }
 
 /// Forget authenticators enrolled while the key ring is still in use.
@@ -212,7 +232,7 @@ pub fn activate_fido() -> Result<(), KeyStoreError> {
 /// Security keys are already in use, or the protection file cannot be read or
 /// written.
 pub fn discard_pending() -> Result<(), KeyStoreError> {
-    with_global(|mut work| work.discard())
+    with_global(None, |mut work| work.discard())
 }
 
 /// Unwrap with one connected enrolled authenticator and cache the storage key.
@@ -222,7 +242,7 @@ pub fn discard_pending() -> Result<(), KeyStoreError> {
 /// The PIN is refused, not exactly one authenticator is connected, it holds no
 /// enrolled credential, or the wrapped key does not open.
 pub fn unlock_fido(pin: &str) -> Result<(), KeyStoreError> {
-    with_global(|mut work| work.unlock(pin))
+    with_global(None, |mut work| work.unlock(pin))
 }
 
 /// Cache the HMAC output of the enrolled authenticator this session has not
@@ -233,7 +253,7 @@ pub fn unlock_fido(pin: &str) -> Result<(), KeyStoreError> {
 /// Security keys are not in use, the storage key is not unwrapped, not exactly
 /// one authenticator is connected, or the connected one is already unlocked.
 pub fn unlock_other_fido(pin: &str) -> Result<(), KeyStoreError> {
-    with_global(|mut work| work.unlock_other(pin))
+    with_global(None, |mut work| work.unlock_other(pin))
 }
 
 /// Check the authenticator that will stay, before the other one is replaced.
@@ -245,7 +265,7 @@ pub fn unlock_other_fido(pin: &str) -> Result<(), KeyStoreError> {
 /// The PIN is refused, not exactly one authenticator is connected, or it does
 /// not hold the credential that stays.
 pub fn begin_replace(remove_id: &str, staying_pin: &str) -> Result<(), KeyStoreError> {
-    with_global(|mut work| work.begin_replace(remove_id, staying_pin))
+    with_global(None, |mut work| work.begin_replace(remove_id, staying_pin))
 }
 
 /// Enroll the new authenticator and drop `remove_id` from the protection file.
@@ -256,7 +276,7 @@ pub fn begin_replace(remove_id: &str, staying_pin: &str) -> Result<(), KeyStoreE
 /// changed since, the connected authenticator is the one that stays, the device
 /// refuses, or the protection file cannot be written.
 pub fn finish_replace(remove_id: &str, pin: &str) -> Result<String, KeyStoreError> {
-    with_global(|mut work| work.finish_replace(remove_id, pin))
+    with_global(None, |mut work| work.finish_replace(remove_id, pin))
 }
 
 /// Stop a replacement without changing the enrolled authenticators.
@@ -265,7 +285,7 @@ pub fn finish_replace(remove_id: &str, pin: &str) -> Result<String, KeyStoreErro
 ///
 /// The protection file has no location, or the session lock is poisoned.
 pub fn cancel_replace() -> Result<(), KeyStoreError> {
-    with_global(|work| {
+    with_global(None, |work| {
         work.session.replacing = None;
         Ok(())
     })
@@ -280,7 +300,7 @@ pub fn cancel_replace() -> Result<(), KeyStoreError> {
 /// desktop store refuses the key or reads back something else, or the
 /// protection file cannot be written.
 pub fn switch_to_keyring(pin: &str) -> Result<(), KeyStoreError> {
-    with_global(|mut work| work.switch_to_keyring(pin))
+    with_global(None, |mut work| work.switch_to_keyring(pin))
 }
 
 pub(super) fn protects_with_fido() -> Result<bool, KeyStoreError> {
@@ -313,15 +333,27 @@ pub(super) fn rewrap_stored_retired(keys: &[RetiredKey]) -> Result<(), KeyStoreE
 // `body` takes the `Work` by value. With `&mut Work<'_, ..>` clippy asks for
 // `Work::status` in place of `|work| work.status()`, and a method path is
 // not general over the borrowed lifetime, so that suggestion does not compile.
+//
+// `applet` is the person's choice when enrolling. Every other call speaks
+// the application the file records. An unreadable file picks FIDO2, and the
+// body then reports that file.
 fn with_global<T>(
-    body: impl FnOnce(Work<'_, HardwareFido, DesktopKeyStore>) -> Result<T, KeyStoreError>,
+    applet: Option<Applet>,
+    body: impl FnOnce(Work<'_, dyn Fido, DesktopKeyStore>) -> Result<T, KeyStoreError>,
 ) -> Result<T, KeyStoreError> {
     let mut session = lock_session()?;
     let path = default_path()?;
-    let mut fido = HardwareFido;
+    let applet = applet
+        .or_else(|| read_doc(&path).ok().map(|doc| doc.applet))
+        .unwrap_or(Applet::Fido2);
+    let mut device: Box<dyn Fido> = match applet {
+        Applet::Fido2 => Box::new(HardwareFido),
+        Applet::Piv => Box::new(HardwarePiv),
+    };
     let desktop = DesktopKeyStore::wallet();
     body(Work {
-        fido: &mut fido,
+        fido: device.as_mut(),
+        applet,
         desktop: &desktop,
         session: &mut session,
         path: &path,
@@ -341,12 +373,13 @@ fn default_path() -> Result<PathBuf, KeyStoreError> {
         .join(FILE_NAME))
 }
 
-impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
+impl<F: Fido + ?Sized, D: DesktopSecrets> Work<'_, F, D> {
     fn status(&mut self) -> Result<ProtectionStatus, KeyStoreError> {
         let doc = read_doc(self.path)?;
         let unlocked = doc.mechanism != Mechanism::Fido || cache_matches(self.session, &doc);
         Ok(ProtectionStatus {
             mechanism: doc.mechanism,
+            applet: doc.applet,
             enrolled: doc
                 .keys
                 .iter()
@@ -364,10 +397,15 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
     }
 
     fn enroll(&mut self, pin: &str) -> Result<String, KeyStoreError> {
-        check_pin(pin)?;
+        self.fido.check_pin(pin)?;
         let mut doc = read_doc(self.path)?;
         if doc.mechanism != Mechanism::Keyring {
             return Err(plain("wallet.fido.always_two"));
+        }
+        // Activate wraps with both pending keys, and unlock speaks one
+        // application, so the pair cannot mix them.
+        if !doc.pending.is_empty() && doc.applet != self.applet {
+            return Err(plain("wallet.fido.applet_mixed"));
         }
         match self.fido.device_count()? {
             0 => return Err(plain("wallet.fido.none")),
@@ -399,6 +437,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
         let enrollment = self.fido.enroll(pin)?;
         let (pending, mut kek) = pending_of(&enrollment);
         let label = pending.label.clone();
+        doc.applet = self.applet;
         doc.pending.push(pending);
         doc.generation = match bump(doc.generation) {
             Ok(generation) => generation,
@@ -512,7 +551,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
     }
 
     fn unlock(&mut self, pin: &str) -> Result<(), KeyStoreError> {
-        check_pin(pin)?;
+        self.fido.check_pin(pin)?;
         let doc = read_doc(self.path)?;
         require_pair(&doc)?;
         let ids: Vec<Vec<u8>> = doc.keys.iter().map(|key| key.id.clone()).collect();
@@ -538,7 +577,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
     }
 
     fn unlock_other(&mut self, pin: &str) -> Result<(), KeyStoreError> {
-        check_pin(pin)?;
+        self.fido.check_pin(pin)?;
         let doc = read_doc(self.path)?;
         require_pair(&doc)?;
         if !cache_matches(self.session, &doc) {
@@ -569,7 +608,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
     }
 
     fn begin_replace(&mut self, remove_id: &str, pin: &str) -> Result<(), KeyStoreError> {
-        check_pin(pin)?;
+        self.fido.check_pin(pin)?;
         let remove = decode_id(remove_id)?;
         let doc = read_doc(self.path)?;
         require_pair(&doc)?;
@@ -595,7 +634,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
     }
 
     fn finish_replace(&mut self, remove_id: &str, pin: &str) -> Result<String, KeyStoreError> {
-        check_pin(pin)?;
+        self.fido.check_pin(pin)?;
         let remove = decode_id(remove_id)?;
         if self.session.replacing.as_deref() != Some(remove.as_slice())
             || self.session.dek.is_none()
@@ -686,7 +725,7 @@ impl<F: Fido, D: DesktopSecrets> Work<'_, F, D> {
     }
 
     fn switch_to_keyring(&mut self, pin: &str) -> Result<(), KeyStoreError> {
-        check_pin(pin)?;
+        self.fido.check_pin(pin)?;
         let doc = read_doc(self.path)?;
         require_pair(&doc)?;
         let ids: Vec<Vec<u8>> = doc.keys.iter().map(|key| key.id.clone()).collect();
@@ -925,19 +964,6 @@ fn same_retired(left: &[RetiredKey], right: &[RetiredKey]) -> bool {
         })
 }
 
-fn check_pin(pin: &str) -> Result<(), KeyStoreError> {
-    // FIDO counts UTF-8 bytes. The device enforces its own minimum, which
-    // defaults to 4. Letters are allowed. 63 is the CTAP maximum.
-    let len = pin.len();
-    if len < 4 {
-        return Err(plain("wallet.fido.pin_short"));
-    }
-    if len > 63 {
-        return Err(plain("wallet.fido.pin_long"));
-    }
-    Ok(())
-}
-
 fn bump(generation: u64) -> Result<u64, KeyStoreError> {
     generation
         .checked_add(1)
@@ -984,6 +1010,15 @@ fn parse_doc(text: &str) -> Result<Doc, KeyStoreError> {
         Some("fido") => Mechanism::Fido,
         _ => return Err(plain("wallet.fido.malformed")),
     };
+    // A file from before PIV came back has no applet, and was FIDO2.
+    let applet = match value.get("applet") {
+        None => Applet::Fido2,
+        Some(found) => match found.as_str() {
+            Some("fido2") => Applet::Fido2,
+            Some("piv") => Applet::Piv,
+            _ => return Err(plain("wallet.fido.malformed")),
+        },
+    };
     let generation = match value.get("generation") {
         None => 0,
         Some(number) => number
@@ -1023,6 +1058,7 @@ fn parse_doc(text: &str) -> Result<Doc, KeyStoreError> {
     }
     Ok(Doc {
         mechanism,
+        applet,
         generation,
         keyring_cleared,
         keys,
@@ -1132,6 +1168,10 @@ fn encode_doc(doc: &Doc) -> String {
         Mechanism::Keyring => "keyring",
         Mechanism::Fido => "fido",
     };
+    let applet = match doc.applet {
+        Applet::Fido2 => "fido2",
+        Applet::Piv => "piv",
+    };
     let pending = Json::Array(
         doc.pending
             .iter()
@@ -1170,6 +1210,7 @@ fn encode_doc(doc: &Doc) -> String {
     );
     Json::Object(vec![
         ("mechanism".to_string(), Json::String(mechanism.to_string())),
+        ("applet".to_string(), Json::String(applet.to_string())),
         (
             "generation".to_string(),
             Json::Number(doc.generation.to_string()),
@@ -1262,6 +1303,7 @@ impl DesktopSecrets for DesktopKeyStore {
 mod tests {
     use super::*;
     use crate::wallet::fido::SoftwareFido;
+    use crate::wallet::piv::SoftwarePiv;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct MemState {
@@ -1347,9 +1389,20 @@ mod tests {
             }
         }
 
+        fn piv<'a>(&'a mut self, piv: &'a mut SoftwarePiv) -> Work<'a, SoftwarePiv, MemDesktop> {
+            Work {
+                fido: piv,
+                applet: Applet::Piv,
+                desktop: &self.desktop,
+                session: &mut self.session,
+                path: &self.path,
+            }
+        }
+
         fn work(&mut self) -> Work<'_, SoftwareFido, MemDesktop> {
             Work {
                 fido: &mut self.fido,
+                applet: Applet::Fido2,
                 desktop: &self.desktop,
                 session: &mut self.session,
                 path: &self.path,
@@ -1655,5 +1708,73 @@ mod tests {
             panic!("an old PIV file was opened");
         };
         assert_eq!(err.to_string(), message("wallet.fido.retired_piv"));
+    }
+
+    #[test]
+    fn two_piv_keys_wrap_the_storage_key_and_either_unlocks_it() {
+        let mut lab = Lab::new("piv-two");
+        let dek = Aes256Key::from_bytes([0x77; 32]);
+        lab.desktop.store_key(&dek).unwrap();
+        let mut piv = SoftwarePiv::new();
+        piv.set_connected(&[11]);
+        let short = lab.piv(&mut piv).enroll("1234").unwrap_err();
+        assert_eq!(short.to_string(), message("wallet.piv.pin_short"));
+        let label = lab.piv(&mut piv).enroll("111111").unwrap();
+        assert_eq!(label, "YubiKey 11 PIV");
+        let again = lab.piv(&mut piv).enroll("111111").unwrap_err();
+        assert_eq!(again.to_string(), message("wallet.fido.already"));
+        piv.set_connected(&[22]);
+        lab.piv(&mut piv).enroll("222222").unwrap();
+        lab.piv(&mut piv).activate().unwrap();
+        let doc = read_doc(&lab.path).unwrap();
+        assert_eq!(doc.mechanism, Mechanism::Fido);
+        assert_eq!(doc.applet, Applet::Piv);
+        assert!(fs::read_to_string(&lab.path)
+            .unwrap()
+            .contains("\"applet\":\"piv\""));
+        assert!(lab.desktop.load_key().unwrap().is_none());
+        lab.session.dek = None;
+        let wrong = lab.piv(&mut piv).unlock("999999").unwrap_err();
+        assert_eq!(wrong.to_string(), message("wallet.piv.wrong_pin_plain"));
+        lab.piv(&mut piv).unlock("222222").unwrap();
+        let opened = lab.work().load_cached().unwrap().unwrap();
+        assert_eq!(opened.as_bytes(), dek.as_bytes());
+        lab.session.dek = None;
+        piv.set_connected(&[11]);
+        lab.piv(&mut piv).unlock("111111").unwrap();
+        assert_eq!(
+            lab.work().load_cached().unwrap().unwrap().as_bytes(),
+            dek.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_pending_pair_does_not_mix_fido2_and_piv() {
+        let mut lab = Lab::new("piv-mixed");
+        lab.fido.set_connected(&[11]);
+        lab.work().enroll("1111").unwrap();
+        let mut piv = SoftwarePiv::new();
+        piv.set_connected(&[22]);
+        let mixed = lab.piv(&mut piv).enroll("222222").unwrap_err();
+        assert_eq!(mixed.to_string(), message("wallet.fido.applet_mixed"));
+        assert_eq!(read_doc(&lab.path).unwrap().applet, Applet::Fido2);
+        lab.work().discard().unwrap();
+        lab.piv(&mut piv).enroll("222222").unwrap();
+        assert_eq!(read_doc(&lab.path).unwrap().applet, Applet::Piv);
+        // The discarded PIV key is still in slot 82, and this wallet does
+        // not overwrite a slot it no longer has a record for.
+        lab.work().discard().unwrap();
+        let busy = lab.piv(&mut piv).enroll("222222").unwrap_err();
+        assert_eq!(busy.to_string(), message("wallet.piv.slot_busy"));
+    }
+
+    #[test]
+    fn a_file_without_an_applet_is_fido2_and_an_unknown_one_is_malformed() {
+        let doc = parse_doc("{\"mechanism\":\"keyring\"}").unwrap();
+        assert_eq!(doc.applet, Applet::Fido2);
+        let Err(err) = parse_doc("{\"mechanism\":\"keyring\",\"applet\":\"otp\"}") else {
+            panic!("an unknown applet was accepted");
+        };
+        assert_eq!(err.to_string(), message("wallet.fido.malformed"));
     }
 }
