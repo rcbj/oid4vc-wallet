@@ -199,7 +199,6 @@
   "piv.pin_short": "Hindi bababa sa 6 na digit ang PIN.",
   "piv.prompt": "PIV PIN: ",
   "piv.slot_busy": "May susi na sa PIV slot 82 na hindi naghihintay na protektahan ang wallet na ito. Hindi ito papatungan ng wallet na ito. Burahin ito gamit ang ykman piv keys delete 82 at mag-enroll ulit.",
-  "piv.unsupported_version": "Iniuulat ng PIV application sa {reader} ang firmware {version}. Bumubukas lang ang yubikey library na gamit ng wallet na ito ng PIV firmware 4 at 5, kaya hindi nito magagamit ang susing ito para sa PIV. Gamitin ang FIDO2 hmac-secret sa susing ito.",
   "piv.wrong_pin": "Hindi tinanggap ang PIN. May {tries} na pagsubok na natitira.",
   "piv.wrong_pin_plain": "Hindi tinanggap ang PIN.",
   "present.cannot": "May tumutugmang nakaimbak na kredensyal, at hindi ito maipresenta ng application na ito. Naabisuhan ang verifier, at maaaring magpatuloy ang browser.",
