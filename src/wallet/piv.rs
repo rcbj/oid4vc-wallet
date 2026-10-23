@@ -26,7 +26,7 @@ use yubikey::piv::{decrypt_data, generate, metadata, AlgorithmId, RetiredSlotId,
 use yubikey::reader::Context;
 use yubikey::{MgmKey, PinPolicy, Serial, TouchPolicy, YubiKey};
 
-use super::fido::{Enrollment, Fido};
+use super::fido::{with_detail, Enrollment, Fido};
 use super::key_store::KeyStoreError;
 
 const SLOT: SlotId = SlotId::Retired(RetiredSlotId::R1);
@@ -49,7 +49,7 @@ impl Fido for HardwarePiv {
     fn enroll(&mut self, pin: &str) -> Result<Enrollment, KeyStoreError> {
         let serial = only_serial()?;
         let mut yk = open_serial(serial)?;
-        yk.verify_pin(pin.as_bytes()).map_err(map_pin)?;
+        yk.verify_pin(pin.as_bytes()).map_err(map_yubi)?;
         yk.authenticate(MgmKey::default()).map_err(map_mgmt)?;
         if slot_point(&mut yk)?.is_some() || slot_has_certificate(&mut yk)? {
             return Err(plain("wallet.piv.slot_busy"));
@@ -113,16 +113,83 @@ fn check_piv_pin(pin: &str) -> Result<(), KeyStoreError> {
 fn serials() -> Result<Vec<u32>, KeyStoreError> {
     let mut context = Context::open().map_err(map_yubi)?;
     let mut serials = Vec::new();
+    let mut refused = Vec::new();
     for reader in context.iter().map_err(map_yubi)? {
-        let Ok(yk) = YubiKey::try_from(&reader) else {
-            continue;
-        };
-        let serial = u32::from(yk.serial());
-        if serial != 0 && !serials.contains(&serial) {
-            serials.push(serial);
+        let name = reader.name().to_string();
+        match YubiKey::try_from(&reader) {
+            Ok(yk) => {
+                let serial = u32::from(yk.serial());
+                if serial == 0 {
+                    refused.push(plain_args(
+                        "wallet.piv.open_failed",
+                        &[("reader", &name), ("detail", "serial 0")],
+                    ));
+                } else if !serials.contains(&serial) {
+                    serials.push(serial);
+                }
+            }
+            Err(err) => refused.push(refusal(&name, err)),
+        }
+    }
+    // A reader whose key the library refused must not read as "no key".
+    if serials.is_empty() {
+        if let Some(first) = refused.into_iter().next() {
+            return Err(first);
         }
     }
     Ok(serials)
+}
+
+fn refusal(reader: &str, err: yubikey::Error) -> KeyStoreError {
+    if matches!(err, yubikey::Error::NotSupported) {
+        if let Some(version) = piv_version(reader) {
+            return with_detail(
+                plain_args(
+                    "wallet.piv.unsupported_version",
+                    &[("reader", reader), ("version", &version)],
+                ),
+                &detail(err),
+            );
+        }
+    }
+    plain_args(
+        "wallet.piv.open_failed",
+        &[("reader", reader), ("detail", &detail(err))],
+    )
+}
+
+/// The yubikey crate reads a serial only from PIV firmware 4 and 5, and
+/// returns `NotSupported` for any other version without saying which. SELECT
+/// and GET VERSION are read-only and need no PIN, so ask the card directly.
+fn piv_version(reader: &str) -> Option<String> {
+    let context = pcsc::Context::establish(pcsc::Scope::User).ok()?;
+    let name = std::ffi::CString::new(reader).ok()?;
+    let card = context
+        .connect(&name, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
+        .ok()?;
+    let mut buffer = [0u8; 258];
+    let select = [0x00, 0xA4, 0x04, 0x00, 0x05, 0xA0, 0x00, 0x00, 0x03, 0x08];
+    if !card
+        .transmit(&select, &mut buffer)
+        .ok()?
+        .ends_with(&[0x90, 0x00])
+    {
+        return None;
+    }
+    let reply = card
+        .transmit(&[0x00, 0xFD, 0x00, 0x00, 0x00], &mut buffer)
+        .ok()?;
+    if reply.len() >= 5 && reply.ends_with(&[0x90, 0x00]) {
+        Some(format!("{}.{}.{}", reply[0], reply[1], reply[2]))
+    } else {
+        None
+    }
+}
+
+/// The Yubico C library's error name, the crate's sentence, and the variant
+/// with its fields (the PC/SC code, the PIN tries), for looking the failure up.
+fn detail(err: yubikey::Error) -> String {
+    format!("{}: {err} ({err:?})", err.name().unwrap_or("YKPIV"))
 }
 
 fn only_serial() -> Result<u32, KeyStoreError> {
@@ -141,10 +208,10 @@ fn kek_on(yk: &mut YubiKey, pin: &str, salt: &[u8; 32]) -> Result<[u8; 32], KeyS
     let point = salt_point(salt)?;
     // PinPolicy::Always is satisfied only when the PIN and the decipher
     // are the next two commands. Metadata in between would ask again.
-    yk.verify_pin(pin.as_bytes()).map_err(map_pin)?;
+    yk.verify_pin(pin.as_bytes()).map_err(map_yubi)?;
     let shared = decrypt_data(yk, &point, AlgorithmId::EccP256, SLOT).map_err(|err| {
         if matches!(err, yubikey::Error::AuthenticationError) {
-            plain("wallet.piv.pin_again")
+            with_detail(plain("wallet.piv.pin_again"), &detail(err))
         } else {
             map_yubi(err)
         }
@@ -226,32 +293,23 @@ fn uncompressed_point(public: &PublicKey) -> [u8; POINT_LEN] {
 
 fn map_mgmt(err: yubikey::Error) -> KeyStoreError {
     if matches!(err, yubikey::Error::AuthenticationError) {
-        plain("wallet.piv.mgmt")
+        with_detail(plain("wallet.piv.mgmt"), &detail(err))
     } else {
         map_yubi(err)
     }
 }
 
-fn map_pin(err: yubikey::Error) -> KeyStoreError {
-    match err {
-        yubikey::Error::WrongPin { tries } => {
-            plain_args("wallet.piv.wrong_pin", &[("tries", &tries.to_string())])
-        }
-        yubikey::Error::PinLocked => plain("wallet.piv.pin_blocked"),
-        other => map_yubi(other),
-    }
-}
-
 fn map_yubi(err: yubikey::Error) -> KeyStoreError {
-    match err {
+    let mapped = match err {
         yubikey::Error::PcscError { .. } => plain("wallet.piv.pcsc"),
         yubikey::Error::WrongPin { tries } => {
             plain_args("wallet.piv.wrong_pin", &[("tries", &tries.to_string())])
         }
         yubikey::Error::PinLocked => plain("wallet.piv.pin_blocked"),
         yubikey::Error::NotSupported => plain("wallet.piv.firmware"),
-        other => plain_args("wallet.piv.device", &[("message", &other.to_string())]),
-    }
+        other => return plain_args("wallet.piv.device", &[("message", &detail(other))]),
+    };
+    with_detail(mapped, &detail(err))
 }
 
 fn plain(key: &str) -> KeyStoreError {

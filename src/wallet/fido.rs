@@ -268,7 +268,10 @@ fn map_ctap(
     err: ctap_fido2::error::Error,
 ) -> KeyStoreError {
     use ctap_fido2::error::CtapStatus;
-    match err {
+    // The CTAP status byte or the HID message goes with every sentence, so
+    // a failure can be looked up instead of guessed at.
+    let detail = err.to_string();
+    let mapped = match err {
         ctap_fido2::error::Error::Ctap(CtapStatus::PinInvalid) => pin_invalid(auth),
         ctap_fido2::error::Error::Ctap(CtapStatus::PinBlocked | CtapStatus::PinAuthBlocked) => {
             plain("wallet.fido.pin_blocked")
@@ -289,7 +292,19 @@ fn map_ctap(
         ctap_fido2::error::Error::Ctap(CtapStatus::ChannelBusy)
         | ctap_fido2::error::Error::Hid(_) => plain("wallet.fido.hid"),
         ctap_fido2::error::Error::MissingExtension(_) => plain("wallet.fido.no_extension"),
-        other => plain_args("wallet.fido.device", &[("message", &other.to_string())]),
+        other => return plain_args("wallet.fido.device", &[("message", &other.to_string())]),
+    };
+    with_detail(mapped, &detail)
+}
+
+/// Append the technical cause to a sentence that is already the message.
+pub(super) fn with_detail(err: KeyStoreError, detail: &str) -> KeyStoreError {
+    match err {
+        KeyStoreError::Plain(message) => plain_args(
+            "wallet.fido.with_detail",
+            &[("message", &message), ("detail", detail)],
+        ),
+        other => other,
     }
 }
 

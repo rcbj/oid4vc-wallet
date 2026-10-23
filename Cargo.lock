@@ -2949,6 +2949,7 @@ dependencies = [
  "p256",
  "p384 0.14.0",
  "p521",
+ "pcsc",
  "rand_core 0.6.4",
  "rcgen",
  "rfd",
