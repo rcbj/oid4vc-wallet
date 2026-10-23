@@ -30,7 +30,10 @@ categories = ["command-line-utilities", "gui"]
 # to PIV slot 82 through PC/SC, the less common alternative to hmac-secret;
 # p256 runs the ECDH and HKDF around that card's decipher. The `untested`
 # feature is the crate's gate for PIV decipher; the call itself is the
-# standard GENERAL AUTHENTICATE. rustls is the TLS stack. The signature
+# standard GENERAL AUTHENTICATE. pcsc is the same PC/SC client yubikey
+# uses; the wallet calls it directly only to read the PIV version of a key
+# the yubikey crate refuses to open, so the error can name the firmware.
+# rustls is the TLS stack. The signature
 # crates (p256, p384, p521, k256, rsa, ed25519-dalek, ed448-goldilocks-plus,
 # fips204, fips205) and x509-parser check credential signatures and
 # certificate chains. None of these crates implements OpenID4VCI, OpenID4VP,
@@ -51,6 +54,7 @@ keyring = { version = "3.6", default-features = false, features = ["sync-secret-
 p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "std"] }
 p384 = "0.14.0"
 p521 = "0.14.0"
+pcsc = "2.9"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rsa = "0.9.10"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
