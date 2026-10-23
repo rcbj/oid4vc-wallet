@@ -199,7 +199,6 @@
   "piv.pin_short": "PIN 至少為 6 位數字。",
   "piv.prompt": "PIV PIN：",
   "piv.slot_busy": "PIV 槽位 82 中已有一個並非等待保護本錢包的金鑰。本錢包不會覆寫它。請用 ykman piv keys delete 82 清除後再登錄。",
-  "piv.unsupported_version": "{reader} 上的 PIV 應用回報韌體版本 {version}。本錢包使用的 yubikey 函式庫只能開啟 PIV 韌體 4 和 5，因此無法將此金鑰用於 PIV。請對此金鑰使用 FIDO2 hmac-secret。",
   "piv.wrong_pin": "PIN 未被接受。還剩 {tries} 次嘗試。",
   "piv.wrong_pin_plain": "PIN 未被接受。",
   "present.cannot": "有一筆已保存的憑證相符，此應用程式無法出示它。已告知驗證方，瀏覽器可以繼續。",

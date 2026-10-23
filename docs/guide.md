@@ -267,11 +267,7 @@ The new key is the storage key. It is not the key shown after an export, and it 
 | PIN | FIDO2 PIN, 4 to 63 bytes | PIV PIN, 6 to 8 digits |
 | Touch | Yes, when the key blinks | No |
 
-The FIDO2 application is far more common than PIV, so choose FIDO2 unless you have a reason not to. For PIV, the wallet creates a P-256 key in PIV retired slot 82 with the factory management key (`010203040506070801020304050607080102030405060708`, 3DES). It does not overwrite a slot that already holds a key. If the slot is taken, for example after **Discard pending security keys** or when you replace a key and enroll the old YubiKey again, clear it with `ykman piv keys delete 82` and enroll again. A new YubiKey's factory PIV PIN is `123456`. Change it with `ykman piv access change-pin` before you enroll. Firmware 5.7 and later stores the factory management key as AES-192. Set it to 3DES before you enroll:
-
-```sh
-ykman piv access change-management-key --algorithm TDES --management-key 010203040506070801020304050607080102030405060708 --new-management-key 010203040506070801020304050607080102030405060708
-```
+The FIDO2 application is far more common than PIV, so choose FIDO2 unless you have a reason not to. For PIV, the wallet creates a P-256 key in PIV retired slot 82 with the factory management key `010203040506070801020304050607080102030405060708`, which the key holds as 3DES or, on newer firmware, as AES-192. Both work, so you do not need to change it. It does not overwrite a slot that already holds a key. If the slot is taken, for example after **Discard pending security keys** or when you replace a key and enroll the old YubiKey again, clear it with `ykman piv keys delete 82` and enroll again. A new YubiKey's factory PIV PIN is `123456`. Change it with `ykman piv access change-pin` before you enroll. If you changed the management key, the wallet cannot create the slot-82 key; it reports that, with the card's status word.
 
 The wallet does not change the PIV PIN or the management key, and it does not reset the PIV application.
 

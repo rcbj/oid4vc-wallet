@@ -199,7 +199,6 @@
   "piv.pin_short": "El PIN debe tener al menos 6 dígitos.",
   "piv.prompt": "PIN PIV: ",
   "piv.slot_busy": "La ranura PIV 82 ya contiene una clave que no está esperando proteger esta cartera. Esta cartera no la sobrescribe. Bórrela con ykman piv keys delete 82 e inscríbala de nuevo.",
-  "piv.unsupported_version": "La aplicación PIV de {reader} informa el firmware {version}. La biblioteca yubikey que usa esta cartera solo abre el firmware PIV 4 y 5, así que no puede usar esta llave para PIV. Use FIDO2 hmac-secret con esta llave.",
   "piv.wrong_pin": "El PIN no fue aceptado. Quedan {tries} intentos.",
   "piv.wrong_pin_plain": "El PIN no fue aceptado.",
   "present.cannot": "Una credencial guardada coincide y no se puede presentar. Se avisó al verificador y el navegador puede continuar.",

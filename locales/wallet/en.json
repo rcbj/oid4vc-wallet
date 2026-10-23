@@ -199,7 +199,6 @@
   "piv.pin_short": "The PIN must be at least 6 digits.",
   "piv.prompt": "PIV PIN: ",
   "piv.slot_busy": "PIV slot 82 already holds a key that is not waiting to protect this wallet. This wallet does not overwrite it. Clear it with ykman piv keys delete 82 and enroll again.",
-  "piv.unsupported_version": "The PIV application on {reader} reports firmware {version}. The yubikey library this wallet uses opens only PIV firmware 4 and 5, so it cannot use this key for PIV. Use FIDO2 hmac-secret with this key.",
   "piv.wrong_pin": "The PIN was not accepted. {tries} tries remain.",
   "piv.wrong_pin_plain": "The PIN was not accepted.",
   "present.cannot": "A stored credential matches, and this wallet cannot present it. The verifier was told, and the browser can continue.",
