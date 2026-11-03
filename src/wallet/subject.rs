@@ -73,6 +73,16 @@ impl SubjectSyntax {
         }
     }
 
+    /// The command line's `--subject`: `jwk` for the JWK thumbprint, or
+    /// anything the settings file accepts. A `did:web` must be well formed.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "jwk" => Some(Self::JwkThumbprint),
+            other => Self::from_line(other),
+        }
+    }
+
     /// The setting a line names. A `did:web` must be well formed.
     fn from_line(line: &str) -> Option<Self> {
         match line {
@@ -393,6 +403,28 @@ pub fn write(path: &Path, syntax: &SubjectSyntax) -> Result<(), String> {
 mod tests {
     use super::*;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+    #[test]
+    fn the_command_line_subject_names_each_choice() {
+        assert_eq!(
+            SubjectSyntax::parse("jwk"),
+            Some(SubjectSyntax::JwkThumbprint)
+        );
+        assert_eq!(
+            SubjectSyntax::parse(THUMBPRINT_TYPE),
+            Some(SubjectSyntax::JwkThumbprint)
+        );
+        assert_eq!(SubjectSyntax::parse("did:jwk"), Some(SubjectSyntax::DidJwk));
+        assert_eq!(SubjectSyntax::parse("did:key"), Some(SubjectSyntax::DidKey));
+        assert_eq!(
+            SubjectSyntax::parse("did:web:example.com:users:alice"),
+            Some(SubjectSyntax::DidWeb(
+                "did:web:example.com:users:alice".to_string()
+            ))
+        );
+        assert_eq!(SubjectSyntax::parse("did:web:"), None);
+        assert_eq!(SubjectSyntax::parse("thumbprint"), None);
+    }
 
     /// The P-256 example in the W3C did:key method specification, and the
     /// P-256 Multikey of the W3C ECDSA Cryptosuites test vectors.

@@ -22,7 +22,7 @@ use crate::protocol::Json;
 
 use super::inbox::utc_stamp;
 use super::key_store::{
-    DesktopKeyStore, EncryptionKeyStore, KeyStoreError, RetiredKey, RETIRED_KEY_SECS,
+    EncryptionKeyStore, KeyStoreError, RetiredKey, WalletKeyStore, RETIRED_KEY_SECS,
 };
 use super::seal::{self, Aes256Key, SealError};
 
@@ -61,9 +61,10 @@ pub struct CredentialVault<K> {
     keys: K,
 }
 
-impl CredentialVault<DesktopKeyStore> {
+impl CredentialVault<WalletKeyStore> {
     /// `$XDG_DATA_HOME/oid4vc-wallet/credentials`. The key is in GNOME Keyring,
-    /// or in KWallet when the Secret Service is not running.
+    /// or in KWallet when the Secret Service is not running, or in the file
+    /// `OID4VC_WALLET_KEY_FILE` names when that is set.
     ///
     /// # Errors
     ///
@@ -73,7 +74,7 @@ impl CredentialVault<DesktopKeyStore> {
             .map_err(VaultError::Message)?
             .join("oid4vc-wallet")
             .join("credentials");
-        Ok(Self::open(root, DesktopKeyStore::wallet()))
+        Ok(Self::open(root, WalletKeyStore::from_environment()))
     }
 }
 

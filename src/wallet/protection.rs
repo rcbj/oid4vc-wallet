@@ -174,6 +174,19 @@ struct Work<'a, F: ?Sized, D> {
     path: &'a Path,
 }
 
+/// A key file replaces the desktop key ring, and the security-key wrap
+/// starts from and returns to that key ring. Enrolling while the vault reads
+/// a file would wrap a key the vault never uses, so every change to the
+/// protection is refused while `OID4VC_WALLET_KEY_FILE` is set.
+fn refuse_with_key_file() -> Result<(), KeyStoreError> {
+    if super::key_file::uses_key_file() {
+        return Err(KeyStoreError::Plain(crate::i18n::t(
+            "wallet.keystore.file_no_fido",
+        )));
+    }
+    Ok(())
+}
+
 /// Read `$XDG_DATA_HOME/oid4vc-wallet/key-protection.json` and the cache.
 ///
 /// # Errors
@@ -191,6 +204,9 @@ pub fn protection_status() -> Result<ProtectionStatus, KeyStoreError> {
 /// The protection file cannot be read or is malformed, or the session lock is
 /// poisoned.
 pub fn fido_locked() -> Result<bool, KeyStoreError> {
+    if super::key_file::uses_key_file() {
+        return Ok(false);
+    }
     let doc = read_doc(&default_path()?)?;
     if doc.mechanism != Mechanism::Fido {
         return Ok(false);
@@ -211,6 +227,7 @@ pub fn fido_locked() -> Result<bool, KeyStoreError> {
 /// pending, two are already pending, the device refuses, or the protection
 /// file cannot be written.
 pub fn enroll_fido(pin: &str, applet: Applet) -> Result<String, KeyStoreError> {
+    refuse_with_key_file()?;
     with_global(Some(applet), |mut work| work.enroll(pin))
 }
 
@@ -222,6 +239,7 @@ pub fn enroll_fido(pin: &str, applet: Applet) -> Result<String, KeyStoreError> {
 /// outputs, the desktop key cannot be read, or the protection file or the
 /// desktop delete fails.
 pub fn activate_fido() -> Result<(), KeyStoreError> {
+    refuse_with_key_file()?;
     with_global(None, |mut work| work.activate())
 }
 
@@ -232,6 +250,7 @@ pub fn activate_fido() -> Result<(), KeyStoreError> {
 /// Security keys are already in use, or the protection file cannot be read or
 /// written.
 pub fn discard_pending() -> Result<(), KeyStoreError> {
+    refuse_with_key_file()?;
     with_global(None, |mut work| work.discard())
 }
 
@@ -242,6 +261,7 @@ pub fn discard_pending() -> Result<(), KeyStoreError> {
 /// The PIN is refused, not exactly one authenticator is connected, it holds no
 /// enrolled credential, or the wrapped key does not open.
 pub fn unlock_fido(pin: &str) -> Result<(), KeyStoreError> {
+    refuse_with_key_file()?;
     with_global(None, |mut work| work.unlock(pin))
 }
 
@@ -253,6 +273,7 @@ pub fn unlock_fido(pin: &str) -> Result<(), KeyStoreError> {
 /// Security keys are not in use, the storage key is not unwrapped, not exactly
 /// one authenticator is connected, or the connected one is already unlocked.
 pub fn unlock_other_fido(pin: &str) -> Result<(), KeyStoreError> {
+    refuse_with_key_file()?;
     with_global(None, |mut work| work.unlock_other(pin))
 }
 
@@ -265,6 +286,7 @@ pub fn unlock_other_fido(pin: &str) -> Result<(), KeyStoreError> {
 /// The PIN is refused, not exactly one authenticator is connected, or it does
 /// not hold the credential that stays.
 pub fn begin_replace(remove_id: &str, staying_pin: &str) -> Result<(), KeyStoreError> {
+    refuse_with_key_file()?;
     with_global(None, |mut work| work.begin_replace(remove_id, staying_pin))
 }
 
@@ -276,6 +298,7 @@ pub fn begin_replace(remove_id: &str, staying_pin: &str) -> Result<(), KeyStoreE
 /// changed since, the connected authenticator is the one that stays, the device
 /// refuses, or the protection file cannot be written.
 pub fn finish_replace(remove_id: &str, pin: &str) -> Result<String, KeyStoreError> {
+    refuse_with_key_file()?;
     with_global(None, |mut work| work.finish_replace(remove_id, pin))
 }
 
@@ -300,6 +323,7 @@ pub fn cancel_replace() -> Result<(), KeyStoreError> {
 /// desktop store refuses the key or reads back something else, or the
 /// protection file cannot be written.
 pub fn switch_to_keyring(pin: &str) -> Result<(), KeyStoreError> {
+    refuse_with_key_file()?;
     with_global(None, |mut work| work.switch_to_keyring(pin))
 }
 
