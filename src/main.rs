@@ -23,11 +23,15 @@ use oid4vc_wallet::linux::{
     install_handlers, uninstall_handlers, InstallReport, Layout, SystemRunner, ALL_SCHEMES,
     DEFAULT_SCHEMES,
 };
-use oid4vc_wallet::protocol::{ui_locales_of_uri, Json};
+use oid4vc_wallet::protocol::offer::{CredentialOffer, OfferPassing};
+use oid4vc_wallet::protocol::{ui_locales_of_uri, Invocation, Json};
 use oid4vc_wallet::version;
 use oid4vc_wallet::wallet::{
-    accept, fido_locked, protection_status, signature_algorithm, unlock_fido, Applet, Credential,
-    CredentialVault, Inbox, NewCredential,
+    accept, approve_presentation, create_self_issued_credential, did_web_publication, fido_locked,
+    prepare_presentation, protection_status, read_subject_setting, redeem_pre_authorized,
+    refuse_presentation, self_issued_identifier, signature_algorithm, subject_setting_path,
+    unlock_fido, uses_key_file, Applet, Credential, CredentialVault, Inbox, NewCredential,
+    Presentation, Presented, SubjectSyntax, WalletKeyStore,
 };
 
 mod browser;
@@ -74,6 +78,15 @@ struct Options {
     lang: Option<String>,
     /// `--user` or `--system` was present.
     saw_scope: bool,
+    /// `accept`: the transaction code the issuer is showing.
+    tx_code: Option<String>,
+    /// `present`: sign and send. Nothing is signed without it.
+    approve: bool,
+    /// `present`: tell the verifier no, without using a key.
+    refuse: bool,
+    /// `present` and `self-issued`: how a self-issued ID Token names its
+    /// subject, for this run only. The saved setting is used without it.
+    subject: Option<String>,
     positionals: Vec<String>,
 }
 
@@ -89,6 +102,7 @@ fn run() -> Result<(), Failure> {
         println!("{}", version_text(options.json));
         return Ok(());
     }
+    reject_stray_action_flags(&options)?;
     if options.ui {
         reject_ui_flags(&options)?;
         require_ui_arguments(&options)?;
@@ -131,6 +145,7 @@ fn run() -> Result<(), Failure> {
             reject_install_flags(&options)?;
             language_command(&options)
         }
+        Some(action @ ("accept" | "present" | "self-issued")) => wallet_action(action, &options),
         Some("handle") => {
             reject_credential_fields(&options)?;
             handle(&options.positionals[1..], &options)?;
@@ -231,6 +246,10 @@ fn options_from(args: impl IntoIterator<Item = String>) -> Result<Options, Failu
         document_file: None,
         lang: None,
         saw_scope: false,
+        tx_code: None,
+        approve: false,
+        refuse: false,
+        subject: None,
         positionals: Vec::new(),
     };
     let mut args = args.into_iter();
@@ -302,6 +321,7 @@ fn options_from(args: impl IntoIterator<Item = String>) -> Result<Options, Failu
                 "--lang",
                 take_value(inline, &mut args, "--lang")?,
             )?,
+            other if wallet_action_flag(other, inline, &mut args, &mut options)? => {}
             other if other.starts_with('-') => {
                 return Err(fail(
                     t_args("wallet.cli.unknown_option", &[("option", other)]),
@@ -798,8 +818,10 @@ fn handle(uris: &[String], options: &Options) -> Result<(), Failure> {
     }
 }
 
-fn open_vault() -> Result<CredentialVault<oid4vc_wallet::wallet::DesktopKeyStore>, Failure> {
-    if fido_locked().map_err(|err| fail(err.to_string(), 1))? {
+fn open_vault() -> Result<CredentialVault<WalletKeyStore>, Failure> {
+    // A key file has no security-key wrap to unlock, and `fido_locked`
+    // already says so; asking first keeps a test container off /dev/tty.
+    if !uses_key_file() && fido_locked().map_err(|err| fail(err.to_string(), 1))? {
         // A PIV PIN and a FIDO2 PIN are different secrets on the same key.
         let prompt = match protection_status().map(|status| status.applet) {
             Ok(Applet::Piv) => "wallet.piv.prompt",
@@ -1021,6 +1043,292 @@ fn delete_credential(id: &str, json: bool) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The flags only `accept`, `present` and `self-issued` read. Returns
+/// `false` when `name` is not one of them.
+fn wallet_action_flag(
+    name: &str,
+    inline: Option<&str>,
+    args: &mut impl Iterator<Item = String>,
+    options: &mut Options,
+) -> Result<bool, Failure> {
+    match name {
+        "--approve" => {
+            reject_inline(inline, name)?;
+            options.approve = true;
+        }
+        "--refuse" => {
+            reject_inline(inline, name)?;
+            options.refuse = true;
+        }
+        "--tx-code" => set_once(&mut options.tx_code, name, take_value(inline, args, name)?)?,
+        "--subject" => set_once(&mut options.subject, name, take_value(inline, args, name)?)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// Another command given one of those flags is a mistake worth saying,
+/// not a flag to ignore: `--approve` on the wrong command must not look
+/// as though something was approved.
+fn reject_stray_action_flags(options: &Options) -> Result<(), Failure> {
+    let action = options.positionals.first().map(String::as_str);
+    let takes_them = matches!(action, Some("accept" | "present" | "self-issued"));
+    let given =
+        options.tx_code.is_some() || options.approve || options.refuse || options.subject.is_some();
+    if given && (options.ui || !takes_them) {
+        Err(fail(t("wallet.cli.wallet_action_flags"), 1))
+    } else {
+        Ok(())
+    }
+}
+
+fn wallet_action(action: &str, options: &Options) -> Result<(), Failure> {
+    reject_credential_fields(options)?;
+    reject_install_flags(options)?;
+    match action {
+        "accept" => {
+            reject_extra(options, 2)?;
+            if options.approve || options.refuse || options.subject.is_some() {
+                return Err(fail(t("wallet.cli.present_flags"), 1));
+            }
+            accept_offer(options)
+        }
+        "present" => {
+            reject_extra(options, 2)?;
+            if options.tx_code.is_some() {
+                return Err(fail(t("wallet.cli.accept_flags"), 1));
+            }
+            present(options)
+        }
+        _ => {
+            reject_extra(options, 1)?;
+            if options.tx_code.is_some() || options.approve || options.refuse {
+                return Err(fail(t("wallet.cli.wallet_action_flags"), 1));
+            }
+            self_issued(options)
+        }
+    }
+}
+
+/// The one URI an `accept` or `present` names.
+fn action_uri(options: &Options) -> Result<&str, Failure> {
+    options
+        .positionals
+        .get(1)
+        .map(String::as_str)
+        .filter(|uri| !uri.is_empty())
+        .ok_or_else(|| fail(t("wallet.cli.need_uri"), 1))
+}
+
+/// The window's Accept page without the window: the code is what
+/// `--tx-code` carries rather than what was typed.
+fn accept_offer(options: &Options) -> Result<(), Failure> {
+    let uri = action_uri(options)?;
+    let locales = ui_locales_of_uri(uri);
+    i18n::with_ui_locales(&locales, || {
+        let offer = preauthorized_offer(uri)
+            .ok_or_else(|| fail(t_args("wallet.cli.accept_not_offer", &[("uri", uri)]), 1))?;
+        let redeemed = redeem_pre_authorized(&offer, options.tx_code.as_deref())
+            .map_err(|err| fail(err.to_string(), 2))?;
+        let vault = open_vault()?;
+        let mut stored = Vec::new();
+        for one in redeemed {
+            let credential = vault
+                .put(NewCredential {
+                    format: one.format,
+                    issuer: one.issuer,
+                    document: one.document,
+                    holder_key: Some(one.holder_key),
+                })
+                .map_err(|err| fail(err.to_string(), 1))?;
+            if !options.json {
+                println!("{}", t_args("wallet.cli.stored", &[("id", &credential.id)]));
+            }
+            stored.push(credential);
+        }
+        if options.json {
+            let value = Json::Array(stored.iter().map(Credential::to_json).collect());
+            println!("{value}");
+        } else {
+            println!(
+                "{}",
+                t_args(
+                    "wallet.redeem.stored",
+                    &[("count", &stored.len().to_string())]
+                )
+            );
+        }
+        Ok(())
+    })
+}
+
+fn preauthorized_offer(uri: &str) -> Option<CredentialOffer> {
+    let Ok(Invocation::CredentialOffer { offer, .. }) = oid4vc_wallet::protocol::parse(uri) else {
+        return None;
+    };
+    match offer {
+        OfferPassing::ByValue(offer) if offer.grants.pre_authorized_code.is_some() => Some(*offer),
+        OfferPassing::ByValue(_) | OfferPassing::ByReference { .. } => None,
+    }
+}
+
+/// `--subject` for this run, or what Settings → Security saved.
+fn chosen_subject(options: &Options) -> Result<SubjectSyntax, Failure> {
+    match options.subject.as_deref() {
+        Some(text) => SubjectSyntax::parse(text)
+            .ok_or_else(|| fail(t_args("wallet.cli.subject_invalid", &[("value", text)]), 1)),
+        None => subject_setting_path()
+            .and_then(|path| read_subject_setting(&path))
+            .map_err(|err| fail(err, 1)),
+    }
+}
+
+/// The window's consent dialog without the window. The person's answer is
+/// `--approve` or `--refuse`, and one of them is required, so a key is
+/// never used because a flag was forgotten. Saved "do not ask again"
+/// choices are not consulted and not written: the flag is this run's answer.
+/// The verifier's redirect is printed, not opened: whoever runs this holds
+/// the browser session that redirect belongs to.
+fn present(options: &Options) -> Result<(), Failure> {
+    let uri = action_uri(options)?;
+    let approve = match (options.approve, options.refuse) {
+        (true, true) => return Err(fail(t("wallet.cli.approve_and_refuse"), 1)),
+        (false, false) => return Err(fail(t("wallet.cli.present_choice"), 1)),
+        (approve, _) => approve,
+    };
+    let locales = ui_locales_of_uri(uri);
+    i18n::with_ui_locales(&locales, || {
+        if !matches!(
+            oid4vc_wallet::protocol::parse(uri),
+            Ok(Invocation::Presentation(_))
+        ) {
+            return Err(fail(
+                t_args("wallet.cli.not_presentation", &[("uri", uri)]),
+                1,
+            ));
+        }
+        let subject = chosen_subject(options)?;
+        let vault = open_vault()?;
+        let credentials = vault.list().map_err(|err| fail(err.to_string(), 1))?;
+        let outcome = match prepare_presentation(uri, &credentials, &[], &subject) {
+            Presentation::Finished(outcome) => outcome,
+            Presentation::NeedsApproval(pending) if approve => {
+                approve_presentation(*pending, &credentials)
+            }
+            Presentation::NeedsApproval(pending) => refuse_presentation(&pending),
+        };
+        report_presented(&vault, outcome, approve, options.json)
+    })
+}
+
+fn report_presented(
+    vault: &CredentialVault<WalletKeyStore>,
+    outcome: Presented,
+    approve: bool,
+    json: bool,
+) -> Result<(), Failure> {
+    // A new self-issued key is sealed before anything is printed, so a
+    // reported sign-in never names a key the wallet did not keep.
+    let stored_id = match outcome.store {
+        Some(new) => Some(vault.put(new).map_err(|err| fail(err.to_string(), 1))?.id),
+        None => None,
+    };
+    let optional =
+        |value: Option<&String>| value.map_or(Json::Null, |text| Json::String(text.clone()));
+    if json {
+        let value = Json::Object(vec![
+            ("ok".to_string(), Json::Bool(outcome.ok)),
+            ("answered".to_string(), Json::Bool(outcome.answered)),
+            ("message".to_string(), Json::String(outcome.message.clone())),
+            (
+                "credential_id".to_string(),
+                optional(outcome.credential_id.as_ref()),
+            ),
+            ("stored_id".to_string(), optional(stored_id.as_ref())),
+            (
+                "redirect_uri".to_string(),
+                optional(outcome.redirect_uri.as_ref()),
+            ),
+        ]);
+        println!("{value}");
+    } else {
+        println!("{}", outcome.message);
+        if let Some(redirect) = &outcome.redirect_uri {
+            println!("{}", t_args("wallet.cli.redirect", &[("uri", redirect)]));
+        }
+    }
+    // A refusal the verifier heard is what `--refuse` asked for.
+    if outcome.ok || (!approve && outcome.answered) {
+        Ok(())
+    } else {
+        Err(fail(t("wallet.cli.present_failed"), 2))
+    }
+}
+
+/// The identifier a `siopv2://` sign-in would present, creating the
+/// self-issued key first when there is none, the way Settings → Security
+/// does for `did:web`. A relying party that enrols the key ahead of the
+/// sign-in, and a `did:web` that has to be published first, both need it.
+fn self_issued(options: &Options) -> Result<(), Failure> {
+    let subject = chosen_subject(options)?;
+    let vault = open_vault()?;
+    let mut credentials = vault.list().map_err(|err| fail(err.to_string(), 1))?;
+    let mut created = None;
+    if self_issued_identifier(&credentials, &subject).is_none() {
+        let new = create_self_issued_credential()
+            .ok_or_else(|| fail(t("wallet.present.unsupported"), 1))?;
+        let stored = vault.put(new).map_err(|err| fail(err.to_string(), 1))?;
+        created = Some(stored.id);
+        credentials = vault.list().map_err(|err| fail(err.to_string(), 1))?;
+    }
+    let identifier = self_issued_identifier(&credentials, &subject)
+        .ok_or_else(|| fail(t("wallet.present.unsupported"), 1))?;
+    let publication = match &subject {
+        SubjectSyntax::DidWeb(did) => did_web_publication(&credentials, did),
+        _ => None,
+    };
+    if options.json {
+        let mut fields = vec![
+            ("subject".to_string(), Json::String(identifier)),
+            (
+                "subject_syntax_type".to_string(),
+                Json::String(subject.type_value().to_string()),
+            ),
+            (
+                "created".to_string(),
+                created.map_or(Json::Null, Json::String),
+            ),
+        ];
+        if let Some(publication) = publication {
+            fields.push((
+                "did_document_url".to_string(),
+                Json::String(publication.url),
+            ));
+            fields.push(("did_document".to_string(), publication.document));
+        }
+        println!("{}", Json::Object(fields));
+    } else {
+        if let Some(id) = &created {
+            println!(
+                "{}",
+                t_args("wallet.cli.self_issued_created", &[("id", id)])
+            );
+        }
+        println!(
+            "{}",
+            t_args("wallet.cli.subject", &[("subject", &identifier)])
+        );
+        if let Some(publication) = publication {
+            println!(
+                "{}",
+                t_args("wallet.ui.did_web_publish", &[("url", &publication.url)])
+            );
+            println!("{}", publication.document);
+        }
+    }
+    Ok(())
+}
+
 fn version_text(json: bool) -> String {
     if !json {
         return format!("oid4vc-wallet {}", version::VERSION);
@@ -1062,6 +1370,14 @@ fn usage() -> String {
         t("wallet.usage.add"),
         String::new(),
         t("wallet.usage.list"),
+        String::new(),
+        t("wallet.usage.accept"),
+        String::new(),
+        t("wallet.usage.present"),
+        String::new(),
+        t("wallet.usage.self_issued"),
+        String::new(),
+        t("wallet.usage.key_file"),
         String::new(),
         t("wallet.usage.language"),
         String::new(),
@@ -1139,5 +1455,98 @@ mod tests {
         let options = super::options_from(["--ui".to_string(), "install".to_string()]).unwrap();
         let err = super::require_ui_arguments(&options).unwrap_err();
         assert!(err.message.contains("install"));
+    }
+
+    fn parsed(args: &[&str]) -> super::Options {
+        super::options_from(args.iter().map(ToString::to_string)).unwrap()
+    }
+
+    #[test]
+    fn wallet_action_flags_are_read_with_and_without_equals() {
+        let options = parsed(&["accept", "openid-credential-offer://?x", "--tx-code=0042"]);
+        assert_eq!(options.tx_code.as_deref(), Some("0042"));
+        let options = parsed(&[
+            "present",
+            "siopv2://?x",
+            "--approve",
+            "--subject",
+            "did:jwk",
+        ]);
+        assert!(options.approve);
+        assert!(!options.refuse);
+        assert_eq!(options.subject.as_deref(), Some("did:jwk"));
+        assert!(super::options_from(["--approve=yes".to_string()]).is_err());
+        assert!(super::options_from([
+            "--tx-code".to_string(),
+            "1".to_string(),
+            "--tx-code=2".to_string()
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn a_wallet_action_flag_on_another_command_is_refused() {
+        for args in [
+            &["credentials", "--approve"][..],
+            &["inbox", "--tx-code", "1"][..],
+            &["siopv2://?x", "--refuse"][..],
+            &["--ui", "siopv2://?x", "--subject", "jwk"][..],
+        ] {
+            assert!(
+                super::reject_stray_action_flags(&parsed(args)).is_err(),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["accept", "u://", "--tx-code", "1"][..],
+            &["present", "u://", "--refuse"][..],
+            &["self-issued", "--subject", "jwk"][..],
+        ] {
+            assert!(
+                super::reject_stray_action_flags(&parsed(args)).is_ok(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn present_needs_exactly_one_answer_and_signs_nothing_otherwise() {
+        // Both refusals come before the URI is parsed or the vault opened,
+        // so nothing here reaches the network or a key store.
+        let neither = super::present(&parsed(&["present", "siopv2://?x"])).unwrap_err();
+        assert!(neither.message.contains("--approve"), "{}", neither.message);
+        let both = super::present(&parsed(&[
+            "present",
+            "siopv2://?x",
+            "--approve",
+            "--refuse",
+        ]))
+        .unwrap_err();
+        assert!(both.message.contains("--refuse"), "{}", both.message);
+    }
+
+    #[test]
+    fn each_command_refuses_the_flags_of_the_others() {
+        let accept =
+            super::wallet_action("accept", &parsed(&["accept", "u://", "--approve"])).unwrap_err();
+        assert!(accept.message.contains("present"), "{}", accept.message);
+        let present = super::wallet_action(
+            "present",
+            &parsed(&["present", "u://", "--refuse", "--tx-code", "1"]),
+        )
+        .unwrap_err();
+        assert!(present.message.contains("accept"), "{}", present.message);
+        let issued = super::wallet_action("self-issued", &parsed(&["self-issued", "--approve"]))
+            .unwrap_err();
+        assert!(issued.message.contains("--approve"), "{}", issued.message);
+    }
+
+    #[test]
+    fn accept_refuses_what_is_not_a_pre_authorized_offer_by_value() {
+        assert!(super::preauthorized_offer("siopv2://?client_id=x").is_none());
+        assert!(super::preauthorized_offer(
+            "openid-credential-offer://?credential_offer_uri=https%3A%2F%2Fi.example%2Fo"
+        )
+        .is_none());
     }
 }

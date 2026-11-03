@@ -29,6 +29,7 @@ mod http;
 mod inbox;
 mod jws;
 mod kek;
+mod key_file;
 mod key_store;
 mod kwallet;
 mod piv;
@@ -55,7 +56,10 @@ pub use consent::{
 pub use credentials::{Credential, CredentialVault, NewCredential, RotateReport, VaultError};
 pub use inbox::{Inbox, InboxEntry};
 pub use jws::signature_algorithm;
-pub use key_store::{DesktopKeyStore, EncryptionKeyStore, KeyStoreError, RetiredKey};
+pub use key_file::{uses_key_file, FileKeyStore, KEY_FILE_ENV};
+pub use key_store::{
+    DesktopKeyStore, EncryptionKeyStore, KeyStoreError, RetiredKey, WalletKeyStore,
+};
 pub use portable::{export_credentials, import_credentials, PortableError, PortableExport};
 pub use present::{
     approve_presentation, create_self_issued_credential, did_web_publication,

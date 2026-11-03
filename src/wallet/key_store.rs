@@ -253,6 +253,50 @@ impl EncryptionKeyStore for DesktopKeyStore {
     }
 }
 
+/// The store this wallet uses: the desktop key ring (or the security keys
+/// wrapping it), or a key file when `OID4VC_WALLET_KEY_FILE` names one.
+/// The variable is the only thing that selects the file; see `key_file`.
+pub enum WalletKeyStore {
+    Desktop(DesktopKeyStore),
+    File(super::key_file::FileKeyStore),
+}
+
+impl WalletKeyStore {
+    /// The key file when the environment names one, the desktop otherwise.
+    #[must_use]
+    pub fn from_environment() -> Self {
+        match super::key_file::configured_path() {
+            Some(path) => Self::File(super::key_file::FileKeyStore::new(path)),
+            None => Self::Desktop(DesktopKeyStore::wallet()),
+        }
+    }
+
+    fn inner(&self) -> &dyn EncryptionKeyStore {
+        match self {
+            Self::Desktop(store) => store,
+            Self::File(store) => store,
+        }
+    }
+}
+
+impl EncryptionKeyStore for WalletKeyStore {
+    fn load_key(&self) -> Result<Option<Aes256Key>, KeyStoreError> {
+        self.inner().load_key()
+    }
+
+    fn store_key(&self, key: &Aes256Key) -> Result<(), KeyStoreError> {
+        self.inner().store_key(key)
+    }
+
+    fn load_retired(&self) -> Result<Vec<RetiredKey>, KeyStoreError> {
+        self.inner().load_retired()
+    }
+
+    fn store_retired(&self, keys: &[RetiredKey]) -> Result<(), KeyStoreError> {
+        self.inner().store_retired(keys)
+    }
+}
+
 impl DesktopKeyStore {
     /// The desktop key ring only. FIDO mode must not call this, or a
     /// missing cache would look like a missing key.

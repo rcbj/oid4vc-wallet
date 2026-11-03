@@ -2751,6 +2751,10 @@ fn registration_options(system: bool, haip: bool) -> Options {
         document_file: None,
         lang: None,
         saw_scope: true,
+        tx_code: None,
+        approve: false,
+        refuse: false,
+        subject: None,
         positionals: Vec::new(),
     }
 }

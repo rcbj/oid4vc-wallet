@@ -32,6 +32,25 @@ An offer by reference is not fetched. An ID Token is built for a `siopv2://` req
 
 A loopback issuer (`localhost`, `127.0.0.1`, or `::1`) whose certificate is not in the system trust store is still accepted, so a local iya-sts process CA works. Any other issuer must chain to a CA the system store or the public web roots trust, or to a certificate you stored on the Trust anchors tab.
 
+## Without a window: accept, present, self-issued
+
+The window is for a person. A test job, such as the iya-sts suite (rcbj/iya-sts#694), drives the same protocol code from the command line. It needs no display, no session bus and no desktop key ring.
+
+```sh
+export OID4VC_WALLET_KEY_FILE=$HOME/.local/share/oid4vc-wallet/storage.key
+oid4vc-wallet accept 'openid-credential-offer://?credential_offer=…' --tx-code 493817
+oid4vc-wallet self-issued --subject did:key --json
+oid4vc-wallet present 'openid4vp://?client_id=…&request_uri=…' --approve --json
+oid4vc-wallet present 'siopv2://?client_id=…&request_uri=…' --refuse
+```
+
+* `accept` redeems a pre-authorized offer passed by value, the same way the Accept page does, and seals every credential the issuer returns, a batch included. An offer by reference is refused.
+* `present` answers an `openid4vp://`, `siopv2://` or `haip-vp://` request. `--approve` signs and sends. `--refuse` tells the verifier no. One of the two is required, so a missing flag never uses a key. Saved "do not ask again" choices are not read or written. The verifier's redirect is **printed, not opened**. Whoever holds the browser session follows it: for an iya-sts sign-in that is the wait page with its `response_code`. With `--json` the command prints `ok`, `answered`, `message`, `credential_id`, `stored_id` (a self-issued key created by this answer) and `redirect_uri`. The exit status is 0 when the verifier accepted the answer, or when it heard the refusal `--refuse` asked for. Otherwise it is 2.
+* `self-issued` prints the subject a `siopv2://` sign-in would present, and creates the self-issued key first if there is none. A relying party that enrolls the key before the sign-in needs that subject. For `did:web` it also prints the DID document and the URL to publish it at.
+* `--subject jwk|did:jwk|did:key|did:web:…` applies to that run only. Without it the choice saved in Settings → Security is used.
+
+**`OID4VC_WALLET_KEY_FILE` keeps the AES-256 storage key in a file instead of GNOME Keyring or KWallet.** It is for a machine with no desktop key ring, such as a container. The file is mode `0600` and its directory `0700`. A file that other users can read is refused, and a damaged file is reported without being replaced. Retired keys from a rotation are kept in the same file. Only this variable selects the file: when it is unset, nothing falls back to a file. While it is set, security-key protection cannot be changed, because the wrap would protect a key the vault does not use. Do not set it on a desktop whose credentials are already in the key ring: the vault would then look for a key that is not in the file.
+
 ## Build
 
 Install a stable Rust toolchain, `libudev-dev`, and `libpcsclite-dev`, then:
