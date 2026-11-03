@@ -169,7 +169,7 @@ If none of your credentials fit the request, the wallet tells the site, and the 
 
 An ordinary presentation sends the presentation. A request that asks for a presentation and a sign-in together sends both, after you allow it, and the sign-in uses the key of the credential you presented.
 
-The command line does not present. A link passed without `--ui` is read and stored only.
+A link passed on the command line without a command is read and stored only. To answer it from a terminal, use `present` with `--approve` or `--refuse` ([Commands](#commands)).
 
 ## Create a sign-in identity {#identity}
 
@@ -318,13 +318,13 @@ The export key is not the storage key. **Rotate encryption key** does not change
 
 Starting the wallet window again brings the open window forward and hands it the new link. A presentation link is handled from **Credentials** in that window. An offer that is ready to redeem is handled on **Accept** in that window.
 
-The command line without `--ui` does not look for an open window, and it does not present a credential or redeem an offer.
+The command line without `--ui` does not look for an open window. Its `accept` and `present` commands redeem and answer in the terminal, without the window ([Commands](#commands)).
 
 ## What the wallet leaves alone {#limits}
 
 - A link that only points at an offer is saved. The offer itself has to be inside the link before the wallet can redeem it.
 - An ordinary presentation sends the presentation. A sign-in link, and a request that asks for both a presentation and a sign-in, also send the sign-in. Those cases are described above.
-- Redeem and present run in the window. A command without `--ui` reads a link and can store it.
+- A link passed without `--ui` and without a command is read and can be stored. Redeeming and presenting happen in the window, or with the `accept` and `present` commands.
 - The private key of a credential is never shown.
 
 ## A local iya-sts {#local}
@@ -348,4 +348,17 @@ oid4vc-wallet language set fr-FR
 
 `--json` prints one JSON object. `--no-save` reads a link without writing the inbox. `credential add` stores a document you already have. `credential delete` removes one credential and leaves the storage key in place.
 
-`oid4vc-wallet help` lists the commands. None of those commands fetch an offer, redeem one, or present a credential.
+`oid4vc-wallet help` lists the commands. None of the commands above fetch an offer, redeem one, or present a credential. These three do, without the window:
+
+```sh
+oid4vc-wallet accept 'openid-credential-offer://?credential_offer=…' --tx-code 493817
+oid4vc-wallet present 'openid4vp://?client_id=…&request_uri=…' --approve
+oid4vc-wallet self-issued --subject did:key
+```
+
+- `accept` redeems an offer that is ready to redeem, the way **Redeem** does, and stores every credential the issuer returns. `--tx-code` is the transaction code. A link that only points at an offer is refused.
+- `present` answers an `openid4vp://`, `siopv2://` or `haip-vp://` link. `--approve` signs and sends the answer. `--refuse` tells the site you declined. You must give one of the two. The command does not ask, and a saved **Do not ask again** choice is neither read nor changed. The site's next page is printed, not opened: open it in the browser you were using for that site.
+- `self-issued` prints the subject a `siopv2://` sign-in sends, and creates the sign-in identity first if there is none. For `did:web` it also prints the DID document and where to publish it.
+- `--subject jwk`, `did:jwk`, `did:key` or `did:web:…` chooses the subject for that one command. Without it, the choice on **Security** is used.
+
+The wallet normally keeps its storage key in the desktop key ring. On a computer without one, such as a container, set `OID4VC_WALLET_KEY_FILE` to a file path and the key is kept in that file, readable only by you. Nothing else switches to the file. Do not set it on a desktop whose credentials are already protected by the key ring, and security-key protection cannot be changed while it is set.
