@@ -1024,9 +1024,13 @@ struct Query {
     id: String,
     vcts: Option<Vec<String>>,
     claims: Vec<ClaimAsk>,
+    /// `claim_sets`: each option is a list of claim ids (OpenID4VP 1.0
+    /// section 6.4.1).
+    claim_sets: Option<Vec<Vec<String>>>,
 }
 
 struct ClaimAsk {
+    id: Option<String>,
     path: Vec<String>,
     usable: bool,
     values: Option<Vec<Json>>,
@@ -1039,6 +1043,9 @@ struct SdJwt {
 }
 
 struct Disclosure {
+    /// The Disclosure as it appears in the SD-JWT, which is what a
+    /// presentation carries and what its digest is computed over.
+    encoded: String,
     name: String,
     value: Json,
 }
@@ -1067,6 +1074,7 @@ fn candidate_queries(dcql: &Json) -> Vec<Query> {
             id: id.to_string(),
             vcts: vct_values(credential),
             claims: claim_asks(credential),
+            claim_sets: claim_sets(credential),
         });
     }
     queries
@@ -1152,7 +1160,9 @@ fn claim_asks(query: &Json) -> Vec<ClaimAsk> {
                 .get("values")
                 .and_then(Json::as_array)
                 .map(<[Json]>::to_vec);
+            let id = claim.get("id").and_then(Json::as_str).map(str::to_string);
             ClaimAsk {
+                id,
                 path,
                 usable,
                 values,
@@ -1237,6 +1247,7 @@ fn sd_jwt(credential: &Credential) -> Option<SdJwt> {
         if items.len() == 3 {
             if let Some(name) = items[1].as_str() {
                 disclosures.push(Disclosure {
+                    encoded: part.to_string(),
                     name: name.to_string(),
                     value: items[2].clone(),
                 });
@@ -1306,7 +1317,16 @@ fn presentation_for(
     let parsed = sd_jwt(credential)?;
     let holder = Json::parse(credential.holder_key.as_deref()?).ok()?;
     let signing = holder_signing(&holder)?;
-    let disclosed = format!("{}~", parsed.issuer);
+    let selected = candidate_queries(&ready.dcql)
+        .into_iter()
+        .find(|query| query.id == query_id)
+        .map(|query| selected_disclosures(&parsed, &query))
+        .unwrap_or_default();
+    let mut disclosed = format!("{}~", parsed.issuer);
+    for one in &selected {
+        disclosed.push_str(one);
+        disclosed.push('~');
+    }
     let digest = Sha256::digest(disclosed.as_bytes());
     let sd_hash = b64::b64url_encode(&digest);
     let header = object(&[
@@ -1324,6 +1344,108 @@ fn presentation_for(
         query_id: query_id.to_string(),
         presentation: format!("{disclosed}{kb}"),
     })
+}
+
+/// The `claim_sets` of a Credential Query: each option a list of claim ids.
+fn claim_sets(query: &Json) -> Option<Vec<Vec<String>>> {
+    let sets = query.get("claim_sets").and_then(Json::as_array)?;
+    Some(
+        sets.iter()
+            .map(|option| {
+                option
+                    .as_array()
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(|id| id.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect(),
+    )
+}
+
+/// The Disclosures that reveal one claim path, outermost first, each found by
+/// its digest in the `_sd` array of the object it belongs to (RFC 9901
+/// section 7.1). A segment present in plain text needs no Disclosure. `None`
+/// when the path cannot be revealed.
+fn disclosures_for(parsed: &SdJwt, path: &[String]) -> Option<Vec<String>> {
+    let mut current = parsed.payload.clone();
+    let mut found = Vec::new();
+    for name in path {
+        if let Some(child) = current.get(name) {
+            if !matches!(child, Json::Null) {
+                current = child.clone();
+                continue;
+            }
+        }
+        let digests: Vec<String> = current
+            .get("_sd")
+            .and_then(Json::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let disclosure = parsed.disclosures.iter().find(|one| {
+            &one.name == name
+                && digests.contains(&b64::b64url_encode(&Sha256::digest(one.encoded.as_bytes())))
+        })?;
+        found.push(disclosure.encoded.clone());
+        current = disclosure.value.clone();
+    }
+    Some(found)
+}
+
+/// The Disclosures a presentation for `query` carries (OpenID4VP 1.0 section
+/// 6.4.1). No `claims`: none, only what is mandatory. `claims` without
+/// `claim_sets`: every claim listed. With `claim_sets`: the first option
+/// whose claims can all be revealed, and nothing when none can. Wallets MUST
+/// NOT send selectively disclosable claims that were not selected (6.4).
+fn selected_disclosures(parsed: &SdJwt, query: &Query) -> Vec<String> {
+    let reveal = |claims: &[&ClaimAsk]| -> Option<Vec<String>> {
+        let mut all: Vec<String> = Vec::new();
+        for claim in claims {
+            if !claim.usable {
+                return None;
+            }
+            for one in disclosures_for(parsed, &claim.path)? {
+                if !all.contains(&one) {
+                    all.push(one);
+                }
+            }
+        }
+        Some(all)
+    };
+    match &query.claim_sets {
+        None => {
+            let claims: Vec<&ClaimAsk> = query.claims.iter().collect();
+            reveal(&claims).unwrap_or_default()
+        }
+        Some(options) => {
+            for option in options {
+                let claims: Vec<&ClaimAsk> = query
+                    .claims
+                    .iter()
+                    .filter(|claim| {
+                        claim
+                            .id
+                            .as_ref()
+                            .is_some_and(|id| option.iter().any(|one| one == id))
+                    })
+                    .collect();
+                if claims.len() != option.len() {
+                    continue;
+                }
+                if let Some(found) = reveal(&claims) {
+                    return found;
+                }
+            }
+            Vec::new()
+        }
+    }
 }
 
 /// The newest stored credential whose holder key is P-256 and whose SD-JWT
@@ -2508,6 +2630,82 @@ mod tests {
             }
         }
         panic!("missing form field {name}");
+    }
+
+    // RFC 9901 section 5.1's example: two Disclosures and the SHA-256
+    // digests the RFC publishes for them, so the selection is checked against
+    // the RFC's bytes rather than against this wallet's own encoder.
+    const RFC_GIVEN_NAME: &str = "WyIyR0xDNDJzS1F2ZUNmR2ZyeU5STjl3IiwgImdpdmVuX25hbWUiLCAiSm9obiJd";
+    const RFC_GIVEN_NAME_DIGEST: &str = "jsu9yVulwQQlhFlM_3JlzMaSFzglhQG0DpfayQwLUK4";
+    const RFC_FAMILY_NAME: &str =
+        "WyJlbHVWNU9nM2dTTklJOEVZbnN4QV9BIiwgImZhbWlseV9uYW1lIiwgIkRvZSJd";
+    const RFC_FAMILY_NAME_DIGEST: &str = "TGf4oLbgwd5JQaHyKVQZU9UdGE0w5rtDsrZzfUaomLo";
+
+    fn rfc_sd_jwt() -> SdJwt {
+        let payload = format!(
+            r#"{{"iss":"https://issuer.example.com","_sd":["{RFC_GIVEN_NAME_DIGEST}","{RFC_FAMILY_NAME_DIGEST}"],"_sd_alg":"sha-256"}}"#
+        );
+        let document = format!(
+            "{}.{}.c2ln~{RFC_GIVEN_NAME}~{RFC_FAMILY_NAME}~",
+            b64::b64url_encode(br#"{"alg":"ES256"}"#),
+            b64::b64url_encode(payload.as_bytes())
+        );
+        let stored = credential(
+            "rfc",
+            "https://issuer.example.com",
+            "2026-01-01T00:00:00Z",
+            document,
+            String::new(),
+        );
+        sd_jwt(&stored).unwrap()
+    }
+
+    fn query_for(dcql_credential: &str) -> Query {
+        let dcql = Json::parse(&format!(r#"{{"credentials":[{dcql_credential}]}}"#)).unwrap();
+        candidate_queries(&dcql).remove(0)
+    }
+
+    #[test]
+    fn the_rfc_digests_link_the_disclosures() {
+        let parsed = rfc_sd_jwt();
+        assert_eq!(
+            disclosures_for(&parsed, &["given_name".to_string()]),
+            Some(vec![RFC_GIVEN_NAME.to_string()])
+        );
+        assert_eq!(
+            disclosures_for(&parsed, &["family_name".to_string()]),
+            Some(vec![RFC_FAMILY_NAME.to_string()])
+        );
+        assert_eq!(disclosures_for(&parsed, &["email".to_string()]), None);
+        // A plain claim needs no Disclosure.
+        assert_eq!(disclosures_for(&parsed, &["iss".to_string()]), Some(vec![]));
+    }
+
+    #[test]
+    fn only_the_claims_asked_for_are_disclosed() {
+        let parsed = rfc_sd_jwt();
+        let one =
+            query_for(r#"{"id":"q","format":"dc+sd-jwt","claims":[{"path":["given_name"]}]}"#);
+        assert_eq!(
+            selected_disclosures(&parsed, &one),
+            vec![RFC_GIVEN_NAME.to_string()]
+        );
+        let none = query_for(r#"{"id":"q","format":"dc+sd-jwt"}"#);
+        assert_eq!(selected_disclosures(&parsed, &none), Vec::<String>::new());
+        let sets = query_for(
+            r#"{"id":"q","format":"dc+sd-jwt","claims":[{"id":"a","path":["email"]},{"id":"b","path":["family_name"]}],"claim_sets":[["a"],["b"]]}"#,
+        );
+        assert_eq!(
+            selected_disclosures(&parsed, &sets),
+            vec![RFC_FAMILY_NAME.to_string()]
+        );
+        let unsatisfiable = query_for(
+            r#"{"id":"q","format":"dc+sd-jwt","claims":[{"id":"a","path":["email"]}],"claim_sets":[["a"]]}"#,
+        );
+        assert_eq!(
+            selected_disclosures(&parsed, &unsatisfiable),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
