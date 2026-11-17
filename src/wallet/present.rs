@@ -2691,7 +2691,7 @@ mod tests {
             vec![RFC_GIVEN_NAME.to_string()]
         );
         let none = query_for(r#"{"id":"q","format":"dc+sd-jwt"}"#);
-        assert!(selected_disclosures(&parsed, &none).is_empty());
+        assert_eq!(selected_disclosures(&parsed, &none), Vec::<String>::new());
         let sets = query_for(
             r#"{"id":"q","format":"dc+sd-jwt","claims":[{"id":"a","path":["email"]},{"id":"b","path":["family_name"]}],"claim_sets":[["a"],["b"]]}"#,
         );
@@ -2702,7 +2702,10 @@ mod tests {
         let unsatisfiable = query_for(
             r#"{"id":"q","format":"dc+sd-jwt","claims":[{"id":"a","path":["email"]}],"claim_sets":[["a"]]}"#,
         );
-        assert!(selected_disclosures(&parsed, &unsatisfiable).is_empty());
+        assert_eq!(
+            selected_disclosures(&parsed, &unsatisfiable),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
