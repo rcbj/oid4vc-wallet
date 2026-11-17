@@ -26,7 +26,7 @@ const APP_ID: &str = KEY_SERVICE;
 const STREAM: i32 = 2;
 const QUICK: Duration = Duration::from_secs(5);
 /// `open` waits while the user answers the unlock dialog.
-const UNLOCK: Duration = Duration::from_secs(120);
+const UNLOCK: Duration = Duration::from_mins(2);
 
 /// Newest first. Plasma 6 registers the 6 and 5 names on one daemon.
 const DAEMONS: [Daemon; 3] = [
