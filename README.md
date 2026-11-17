@@ -51,6 +51,15 @@ oid4vc-wallet present 'siopv2://?client_id=…&request_uri=…' --refuse
 
 **`OID4VC_WALLET_KEY_FILE` keeps the AES-256 storage key in a file instead of GNOME Keyring or KWallet.** It is for a machine with no desktop key ring, such as a container. The file is mode `0600` and its directory `0700`. A file that other users can read is refused, and a damaged file is reported without being replaced. Retired keys from a rotation are kept in the same file. Only this variable selects the file: when it is unset, nothing falls back to a file. While it is set, security-key protection cannot be changed, because the wrap would protect a key the vault does not use. Do not set it on a desktop whose credentials are already in the key ring: the vault would then look for a key that is not in the file.
 
+## Container image
+
+The `Dockerfile` at the repository root builds the command line into an image, for a test suite that drives the wallet headlessly. id-proto-debugger builds it from this repository's release tag into its private image mirror and runs `present` against its OpenID4VP Verifier page (rcbj/id-proto-debugger#364). The window is not available in a container. `OID4VC_WALLET_KEY_FILE` is set, so no desktop key ring is needed. Point `SSL_CERT_FILE` at a bundle when the issuer or Verifier uses a private root.
+
+```sh
+docker build --build-arg GIT_COMMIT=$(git rev-parse HEAD) -t oid4vc-wallet .
+docker run --rm oid4vc-wallet --version --json
+```
+
 ## Build
 
 Install a stable Rust toolchain, `libudev-dev`, and `libpcsclite-dev`, then:

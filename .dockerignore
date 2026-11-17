@@ -1,0 +1,8 @@
+# The image builds from the source alone. target/ and dist/ are local build
+# output and can be gigabytes; .git is not needed because GIT_COMMIT is
+# passed as a build argument.
+target
+dist
+.git
+.github
+docs
